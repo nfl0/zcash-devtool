@@ -332,7 +332,7 @@ pub(crate) async fn reconcile<P: Parameters>(
     let host_tip = StaticCanonicalTip(WalletCanonicalTip::from(reducer.tip()));
     let commitments = pending.commitments().collect::<Vec<_>>();
     for commitment in commitments {
-        if reducer.state().pending.get(&commitment).is_some() {
+        if reducer.state().pending.contains_key(&commitment) {
             observe_canonical_commit(&host_tip, &reducer, &mut pending, &commitment).map_err(
                 |error| anyhow!("Coppice canonical COMMIT observation failed: {error:?}"),
             )?;

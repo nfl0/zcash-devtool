@@ -371,15 +371,14 @@ impl Command {
         .await?
         {}
 
-        if !shutdown.requested() {
-            if let Some(outcome) =
+        if !shutdown.requested()
+            && let Some(outcome) =
                 crate::coppice_support::reconcile(&params, &mut client, wallet_dir.as_ref()).await?
-            {
-                info!(
-                    "Coppice synchronized to {} ({} blocks applied, {} rewound)",
-                    outcome.final_tip.height, outcome.blocks_applied, outcome.blocks_rewound,
-                );
-            }
+        {
+            info!(
+                "Coppice synchronized to {} ({} blocks applied, {} rewound)",
+                outcome.final_tip.height, outcome.blocks_applied, outcome.blocks_rewound,
+            );
         }
 
         Ok(())
