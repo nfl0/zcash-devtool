@@ -1349,6 +1349,46 @@ dependencies = [
 ]
 
 [[package]]
+name = "coppice"
+version = "0.1.0"
+dependencies = [
+ "blake2b_simd",
+ "halo2_gadgets",
+ "halo2_proofs",
+ "hex",
+ "incrementalmerkletree",
+ "orchard",
+ "pasta_curves",
+ "rand_chacha 0.3.1",
+ "rand_core 0.6.4",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "shardtree",
+ "zcash_address",
+ "zcash_note_encryption",
+ "zcash_primitives",
+ "zcash_protocol",
+]
+
+[[package]]
+name = "coppice-librustzcash"
+version = "0.1.0"
+dependencies = [
+ "coppice",
+ "incrementalmerkletree",
+ "orchard",
+ "rand_core 0.6.4",
+ "sapling-crypto",
+ "shardtree",
+ "zcash_client_backend",
+ "zcash_keys",
+ "zcash_primitives",
+ "zcash_protocol",
+ "zip321",
+]
+
+[[package]]
 name = "core-foundation"
 version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2939,9 +2979,9 @@ dependencies = [
 
 [[package]]
 name = "halo2_proofs"
-version = "0.3.3"
+version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "576d38119e960ec18628c2eb7558a3a06fcb9fd1e003a36f40f0496919a0aaa9"
+checksum = "05713f117155643ce10975e0bee44a274bcda2f4bb5ef29a999ad67c1fa8d4d3"
 dependencies = [
  "blake2b_simd",
  "ff",
@@ -4500,8 +4540,7 @@ checksum = "04744f49eae99ab78e0d5c0b603ab218f515ea8cfe5a456d7629ad883a3b6e7d"
 
 [[package]]
 name = "orchard"
-version = "0.15.0"
-source = "git+https://github.com/zcash/orchard.git?rev=3bd2b736d1273226595773265313fc3f3428af16#3bd2b736d1273226595773265313fc3f3428af16"
+version = "0.15.3"
 dependencies = [
  "aes",
  "bitvec",
@@ -9467,6 +9506,8 @@ dependencies = [
  "bs58",
  "chrono",
  "clap",
+ "coppice",
+ "coppice-librustzcash",
  "crossterm",
  "ed25519-zebra",
  "equihash 0.2.0",

@@ -13,6 +13,7 @@ use tracing_subscriber::{Layer, layer::SubscriberExt};
 
 mod commands;
 mod config;
+mod coppice_support;
 mod data;
 mod error;
 mod helpers;
