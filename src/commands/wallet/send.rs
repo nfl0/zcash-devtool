@@ -11,7 +11,7 @@ use uuid::Uuid;
 use zcash_address::ZcashAddress;
 use zcash_client_backend::{
     data_api::{
-        Account, WalletRead,
+        Account,
         wallet::{
             ConfirmationsPolicy, SpendingKeys, create_proposed_transactions,
             input_selection::{GreedyInputSelector, SpendPolicy},
@@ -19,7 +19,6 @@ use zcash_client_backend::{
         },
     },
     fees::{DustOutputPolicy, SplitPolicy, StandardFeeRule, standard::MultiOutputChangeStrategy},
-    proto::service,
     wallet::OvkPolicy,
 };
 use zcash_client_sqlite::{WalletDb, util::SystemClock};
@@ -272,27 +271,12 @@ pub(crate) async fn pay<C: PaymentContext>(
 
         let txid = *txids.first();
 
-        // Send the transaction.
+        // Send the exact transaction that construction persisted. Local
+        // lifecycle metadata must only advance after this returns success.
         println!("Sending transaction...");
-        let (txid, raw_tx) = db_data
-            .get_transaction(txid)?
-            .map(|tx| {
-                let mut raw_tx = service::RawTransaction::default();
-                tx.write(&mut raw_tx.data).unwrap();
-                (tx.txid(), raw_tx)
-            })
-            .ok_or(anyhow!("Transaction not found for id {:?}", txid))?;
-        let response = client.send_transaction(raw_tx).await?.into_inner();
-
-        if response.error_code != 0 {
-            return Err(error::Error::SendFailed {
-                code: response.error_code,
-                reason: response.error_message,
-            }
-            .into());
-        } else {
-            println!("{txid}");
-        }
+        let txid =
+            crate::submission::broadcast_stored_transaction(&db_data, &mut client, txid).await?;
+        println!("{txid}");
     } else {
         println!("Proposal rejected, aborting.");
     }

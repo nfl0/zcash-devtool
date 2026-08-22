@@ -1,5 +1,9 @@
 #![allow(deprecated)]
-use std::{num::{NonZeroU32, NonZeroUsize}, path::PathBuf, str::FromStr};
+use std::{
+    num::{NonZeroU32, NonZeroUsize},
+    path::PathBuf,
+    str::FromStr,
+};
 
 use anyhow::anyhow;
 use clap::Args;

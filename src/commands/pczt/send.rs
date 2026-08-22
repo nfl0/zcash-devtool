@@ -8,14 +8,11 @@ use tokio::{
     fs::File,
     io::{AsyncReadExt, stdin},
 };
-use zcash_client_backend::{
-    data_api::{WalletRead, wallet::extract_and_store_transaction_from_pczt},
-    proto::service,
-};
+use zcash_client_backend::data_api::wallet::extract_and_store_transaction_from_pczt;
 use zcash_client_sqlite::{WalletDb, util::SystemClock};
 use zcash_proofs::prover::LocalTxProver;
 
-use crate::{config::WalletConfig, data::get_db_paths, error, remote::ConnectionArgs};
+use crate::{config::WalletConfig, data::get_db_paths, remote::ConnectionArgs};
 
 // Options accepted for the `pczt send` command
 #[derive(Debug, Args)]
@@ -60,27 +57,11 @@ impl Command {
         )
         .map_err(|e| anyhow!("Failed to extract and store transaction from PCZT: {:?}", e))?;
 
-        // Send the transaction.
+        // Send the exact stored transaction through the shared lifecycle boundary.
         println!("Sending transaction...");
-        let (txid, raw_tx) = db_data
-            .get_transaction(txid)?
-            .map(|tx| {
-                let mut raw_tx = service::RawTransaction::default();
-                tx.write(&mut raw_tx.data).unwrap();
-                (tx.txid(), raw_tx)
-            })
-            .ok_or(anyhow!("Transaction not found for id {:?}", txid))?;
-        let response = client.send_transaction(raw_tx).await?.into_inner();
-
-        if response.error_code != 0 {
-            Err(error::Error::SendFailed {
-                code: response.error_code,
-                reason: response.error_message,
-            }
-            .into())
-        } else {
-            println!("{txid}");
-            Ok(())
-        }
+        let txid =
+            crate::submission::broadcast_stored_transaction(&db_data, &mut client, txid).await?;
+        println!("{txid}");
+        Ok(())
     }
 }

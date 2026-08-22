@@ -19,6 +19,7 @@ mod error;
 mod helpers;
 mod remote;
 mod socks;
+mod submission;
 mod ui;
 
 #[cfg(feature = "tui")]
