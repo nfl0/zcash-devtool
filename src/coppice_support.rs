@@ -17,10 +17,12 @@ use ::coppice::{
 };
 use anyhow::{Context, anyhow};
 use coppice_librustzcash::{
-    CanonicalBlockSource, CanonicalTip, FullTransactionSource, ReconcileOutcome,
+    CanonicalBlockSource, CanonicalTip, FullTransactionSource, HostCanonicalTipSource,
+    PendingRegistrationCollection, ReconcileOutcome, WalletCanonicalTip, observe_canonical_commit,
     reconcile_canonical_chain,
 };
 use tonic::{Code, transport::Channel};
+use zcash_client_backend::data_api::WalletRead;
 use zcash_client_backend::proto::{
     compact_formats::CompactBlock,
     service::{self, compact_tx_streamer_client::CompactTxStreamerClient},
@@ -30,6 +32,29 @@ use zcash_protocol::consensus::{NetworkType, Parameters};
 use crate::data::DEFAULT_WALLET_DIR;
 
 const SNAPSHOT_FILE: &str = "coppice-v1.json";
+const PENDING_FILE: &str = "coppice-pending-v1.json";
+
+#[derive(Clone, Copy)]
+pub(crate) struct StaticCanonicalTip(pub(crate) WalletCanonicalTip);
+
+impl HostCanonicalTipSource for StaticCanonicalTip {
+    type Error = std::convert::Infallible;
+
+    fn canonical_tip(&self) -> Result<WalletCanonicalTip, Self::Error> {
+        Ok(self.0)
+    }
+}
+
+pub(crate) fn wallet_tip<DbT: WalletRead>(wallet_db: &DbT) -> anyhow::Result<StaticCanonicalTip> {
+    let metadata = wallet_db
+        .block_max_scanned()
+        .map_err(|error| anyhow!("wallet canonical tip unavailable: {error:?}"))?
+        .ok_or_else(|| anyhow!("wallet has no scanned canonical tip"))?;
+    Ok(StaticCanonicalTip(WalletCanonicalTip {
+        height: metadata.block_height().into(),
+        block_hash: metadata.block_hash().0,
+    }))
+}
 
 #[derive(Debug)]
 enum NetworkSourceError {
@@ -119,7 +144,7 @@ impl FullTransactionSource for LightwalletdFullTransactionSource {
     }
 }
 
-fn deployment<P: Parameters>(params: &P) -> anyhow::Result<DeploymentParameters> {
+pub(crate) fn deployment<P: Parameters>(params: &P) -> anyhow::Result<DeploymentParameters> {
     let frozen = match params.network_type() {
         NetworkType::Test => TESTNET_V0,
         NetworkType::Regtest => REGTEST_V0,
@@ -139,6 +164,59 @@ fn deployment<P: Parameters>(params: &P) -> anyhow::Result<DeploymentParameters>
 
 fn snapshot_path(wallet_dir: Option<&String>) -> PathBuf {
     Path::new(wallet_dir.map(String::as_str).unwrap_or(DEFAULT_WALLET_DIR)).join(SNAPSHOT_FILE)
+}
+
+fn pending_path(wallet_dir: Option<&String>) -> PathBuf {
+    Path::new(wallet_dir.map(String::as_str).unwrap_or(DEFAULT_WALLET_DIR)).join(PENDING_FILE)
+}
+
+pub(crate) fn load_existing<P: Parameters>(
+    params: &P,
+    wallet_dir: Option<&String>,
+) -> anyhow::Result<Option<(V1Reducer, PendingRegistrationCollection)>> {
+    if params.network_type() == NetworkType::Main {
+        return Ok(None);
+    }
+    let deployment = deployment(params)?;
+    let reducer = match fs::read(snapshot_path(wallet_dir)) {
+        Ok(bytes) => V1Reducer::load_snapshot(deployment.clone(), &bytes)
+            .map_err(|error| anyhow!("invalid Coppice snapshot: {error:?}"))?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    let pending = match fs::read(pending_path(wallet_dir)) {
+        Ok(bytes) => PendingRegistrationCollection::load_local(&deployment, &bytes)
+            .map_err(|error| anyhow!("invalid Coppice pending-intent store: {error:?}"))?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            PendingRegistrationCollection::new()
+        }
+        Err(error) => return Err(error.into()),
+    };
+    Ok(Some((reducer, pending)))
+}
+
+pub(crate) fn persist_pending(
+    wallet_dir: Option<&String>,
+    deployment: &DeploymentParameters,
+    pending: &PendingRegistrationCollection,
+) -> anyhow::Result<()> {
+    let bytes = pending
+        .save_local(deployment)
+        .map_err(|error| anyhow!("Coppice pending-intent encoding failed: {error:?}"))?;
+    let path = pending_path(wallet_dir);
+    let temporary = path.with_extension("json.tmp");
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&temporary)?;
+    file.write_all(&bytes)?;
+    file.sync_all()?;
+    fs::rename(&temporary, path)?;
+    Ok(())
 }
 
 async fn initial_reducer<P: Parameters>(
@@ -243,5 +321,23 @@ pub(crate) async fn reconcile<P: Parameters>(
         reconcile_canonical_chain(params, &mut reducer, &mut canonical, &mut transactions)
             .map_err(|error| anyhow!("Coppice canonical reconciliation failed: {error:?}"))?;
     persist_snapshot(&path, &reducer)?;
+    let mut pending = match fs::read(pending_path(wallet_dir)) {
+        Ok(bytes) => PendingRegistrationCollection::load_local(reducer.deployment(), &bytes)
+            .map_err(|error| anyhow!("invalid Coppice pending-intent store: {error:?}"))?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            PendingRegistrationCollection::new()
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let host_tip = StaticCanonicalTip(WalletCanonicalTip::from(reducer.tip()));
+    let commitments = pending.commitments().collect::<Vec<_>>();
+    for commitment in commitments {
+        if reducer.state().pending.get(&commitment).is_some() {
+            observe_canonical_commit(&host_tip, &reducer, &mut pending, &commitment).map_err(
+                |error| anyhow!("Coppice canonical COMMIT observation failed: {error:?}"),
+            )?;
+        }
+    }
+    persist_pending(wallet_dir, reducer.deployment(), &pending)?;
     Ok(Some(outcome))
 }

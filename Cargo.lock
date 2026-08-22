@@ -1380,6 +1380,8 @@ dependencies = [
  "orchard",
  "rand_core 0.6.4",
  "sapling-crypto",
+ "serde",
+ "serde_json",
  "shardtree",
  "zcash_client_backend",
  "zcash_keys",

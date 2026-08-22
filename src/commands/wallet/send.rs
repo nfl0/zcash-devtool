@@ -13,7 +13,7 @@ use zcash_client_backend::{
     data_api::{
         Account,
         wallet::{
-            ConfirmationsPolicy, SpendingKeys, create_proposed_transactions,
+            ConfirmationsPolicy, SpendingKeys, TargetHeight, create_proposed_transactions,
             input_selection::{GreedyInputSelector, SpendPolicy},
             propose_transfer,
         },
@@ -35,6 +35,10 @@ use zip321::{Payment, TransactionRequest};
 use crate::{
     commands::select_account, config::WalletConfig, data::get_db_paths, error,
     remote::ConnectionArgs, ui::proposal::print_proposal,
+};
+use coppice_librustzcash::{
+    CoppiceProtectionMode, IronwoodViewingCapability, WalletCoppiceLockBackend,
+    with_coppice_spend_guard,
 };
 
 // Options accepted for the `send` command
@@ -224,21 +228,69 @@ pub(crate) async fn pay<C: PaymentContext>(
     );
     let input_selector = GreedyInputSelector::new();
 
-    let proposal = propose_transfer(
-        &mut db_data,
-        &params,
-        account.id(),
-        &input_selector,
-        &change_strategy,
-        request,
-        context.confirmations_policy(),
-        // Preserve the pre-upgrade behavior: transfers never spend
-        // transparent UTXOs; they must be shielded first.
-        &SpendPolicy::default(),
-        None,
-        context.tx_version(),
-    )
-    .map_err(error::Error::from)?;
+    let spend_policy = SpendPolicy::default();
+    let proposal = if let Some((reducer, pending)) =
+        crate::coppice_support::load_existing(&params, wallet_dir.as_ref())?
+    {
+        let host_tip = crate::coppice_support::wallet_tip(&db_data)?;
+        let expected_height = reducer
+            .tip()
+            .height
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("Coppice target height overflow"))?;
+        let orchard_fvk = account
+            .ufvk()
+            .and_then(|ufvk| ufvk.orchard())
+            .cloned()
+            .ok_or_else(|| anyhow!("selected account has no Orchard full viewing key"))?;
+        let mut backend = WalletCoppiceLockBackend::new(
+            &mut db_data,
+            account.id(),
+            TargetHeight::from(expected_height),
+            &orchard_fvk,
+            IronwoodViewingCapability::FullViewing,
+        );
+        let (proposal, _) = with_coppice_spend_guard(
+            CoppiceProtectionMode::Enabled,
+            &host_tip,
+            &reducer,
+            &pending,
+            IronwoodViewingCapability::FullViewing,
+            &mut backend,
+            |backend| {
+                propose_transfer(
+                    backend.wallet_db_mut(),
+                    &params,
+                    account.id(),
+                    &input_selector,
+                    &change_strategy,
+                    request,
+                    context.confirmations_policy(),
+                    // LockedInputPolicy::Exclude is preserved by the default
+                    // policy after Coppice lock reconciliation.
+                    &spend_policy,
+                    None,
+                    context.tx_version(),
+                )
+            },
+        )
+        .map_err(|error| anyhow!("Coppice spend protection failed: {error:?}"))?;
+        proposal.map_err(error::Error::from)?
+    } else {
+        propose_transfer(
+            &mut db_data,
+            &params,
+            account.id(),
+            &input_selector,
+            &change_strategy,
+            request,
+            context.confirmations_policy(),
+            &spend_policy,
+            None,
+            context.tx_version(),
+        )
+        .map_err(error::Error::from)?
+    };
 
     print_proposal("Proposed transfer", &proposal, &params);
     let confirmed = !context.require_confirmation() || {
