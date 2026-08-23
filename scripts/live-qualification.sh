@@ -4,7 +4,8 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 
 # Phase 1 qualifies the local Zakura -> Zaino -> zcash-devtool plumbing; Phase 2
-# extends that same stack with the live Coppice lifecycle and shallow reorg.
+# extends that same stack with the live Coppice lifecycle and shallow reorg;
+# Phase 3 checks fresh same-seed recovery; Phase 4 checks account isolation.
 # Every node, database, wallet, and log is disposable and lives below one
 # run-specific directory under /tmp.
 
@@ -23,13 +24,19 @@ ZAINO_GRPC_URL="http://$ZAINO_GRPC_ADDR"
 
 COPPICE_NAME_ONE="phase2-alpha"
 COPPICE_NAME_TWO="phase2-beta"
+PHASE4_NAME_ONE="phase4-account-a"
+PHASE4_NAME_TWO="phase4-account-b"
 COPPICE_BOND_VALUE=100000000
+PHASE4_ACCOUNT_FUNDING_VALUE=400000000
 # Coppice REGTEST_V0 activation in the pinned Coppice deployment.
 COPPICE_ACTIVATION_HEIGHT=10
 
 # Disposable BIP-39 zero-entropy test mnemonic (23 x "abandon" + "art").
 # Never use it for funds outside this local Regtest.
 WALLET_MNEMONIC="abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon art"
+# Separate disposable mnemonic used only to derive an external transparent
+# destination for the pre-NU6.3 bootstrap Sapling coinbase note.
+SAPLING_DISCARD_MNEMONIC="abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about"
 
 WORK_DIR="$(mktemp -d /tmp/coppice-live-qualification.XXXXXX)"
 CONFIG_DIR="$WORK_DIR/config"
@@ -38,6 +45,7 @@ ZAKURA_STATE_DIR="$STATE_DIR/zakura"
 ZAINO_STATE_DIR="$STATE_DIR/zaino"
 WALLET_DIR="$STATE_DIR/wallet"
 RECOVERY_WALLET_DIR="$STATE_DIR/recovery-wallet"
+PHASE4_RECOVERY_WALLET_DIR="$STATE_DIR/phase4-recovery-wallet"
 LOG_DIR="$WORK_DIR/logs"
 GRPC_DIR="$LOG_DIR/grpc"
 ZAKURA_CONFIG="$CONFIG_DIR/zakura.toml"
@@ -45,6 +53,7 @@ ZAINO_CONFIG="$CONFIG_DIR/zaino.toml"
 ACTIVATION_FILE="$CONFIG_DIR/activation-heights.toml"
 IDENTITY_FILE="$WALLET_DIR/identity.txt"
 RECOVERY_IDENTITY_FILE="$RECOVERY_WALLET_DIR/identity.txt"
+PHASE4_RECOVERY_IDENTITY_FILE="$PHASE4_RECOVERY_WALLET_DIR/identity.txt"
 
 mkdir -p "$CONFIG_DIR" "$ZAKURA_STATE_DIR" "$ZAINO_STATE_DIR" "$WALLET_DIR" "$LOG_DIR" "$GRPC_DIR"
 umask 077
@@ -179,6 +188,130 @@ wallet_status_logged_for() {
 
 wallet_status_logged() {
     wallet_status_logged_for "$1" "$WALLET_DIR"
+}
+
+wallet_balance_logged_for() {
+    local label=$1
+    local wallet_dir=$2
+    local account_id=$3
+
+    run_devtool_logged "$label" wallet \
+        --wallet-dir "$wallet_dir" balance --json --min-confirmations 1 "$account_id"
+}
+
+balance_json() {
+    local label=$1
+    local output
+
+    output="$(rg -a '^[{]' "$LOG_DIR/$label.log" | tail -1)"
+    [[ -n "$output" ]] || die "balance command $label did not emit JSON"
+    printf '%s\n' "$output"
+}
+
+balance_locked_value() {
+    local label=$1
+
+    # Balance.total includes values that are not currently spendable, while
+    # each pool-specific *_spendable field includes all ordinary spendable
+    # pools. Subtract every spendable pool so Sapling/other-pool value does
+    # not masquerade as an Ironwood Coppice lock.
+    jq -r '.total - (.sapling_spendable + .orchard_spendable + .ironwood_spendable + .transparent_spendable)' \
+        <<<"$(balance_json "$label")"
+}
+
+balance_spendable_value() {
+    local label=$1
+
+    jq -r '.ironwood_spendable' <<<"$(balance_json "$label")"
+}
+
+balance_total_value() {
+    local label=$1
+
+    jq -r '.total' <<<"$(balance_json "$label")"
+}
+
+account_record_for_name() {
+    local output=$1
+    local name=$2
+
+    python3 - "$output" "$name" <<'PY'
+import json
+import pathlib
+import sys
+
+path, target = sys.argv[1:]
+current = None
+for line in pathlib.Path(path).read_text().splitlines():
+    if line.startswith("Account "):
+        current = {"uuid": line.split()[1]}
+    elif line.startswith("     Name: ") and current is not None:
+        current["name"] = line.removeprefix("     Name: ")
+    elif line.startswith("     UIVK: ") and current is not None:
+        current["uivk"] = line.removeprefix("     UIVK: ")
+    elif line.startswith("     UFVK: ") and current is not None:
+        current["ufvk"] = line.removeprefix("     UFVK: ")
+    elif line.startswith("       Account index: ") and current is not None:
+        current["index"] = line.removeprefix("       Account index: ")
+        if current.get("name") == target:
+            print(json.dumps(current, sort_keys=True))
+            raise SystemExit(0)
+
+raise SystemExit(f"account {target!r} not found in {path}")
+PY
+}
+
+wallet_account_id_from_status() {
+    local label=$1
+    local account_uuid=$2
+
+    jq -er --arg uuid "$account_uuid" \
+        '.wallet_accounts[] | select(.account_uuid == $uuid) | .wallet_account_id' \
+        "$LOG_DIR/$label.log"
+}
+
+assert_pending_owner() {
+    local status_label=$1
+    local commitment=$2
+    local name=$3
+    local expected_account_id=$4
+
+    jq -e \
+        --arg commitment "$commitment" \
+        --arg name "$name" \
+        --arg account_id "$expected_account_id" \
+        '.local_registrations
+         | any(.[]; .commitment == $commitment
+                    and .name == $name
+                    and .account_id == $account_id)' \
+        "$LOG_DIR/$status_label.log" >/dev/null \
+        || die "$status_label does not bind $name/$commitment to WalletAccountId $expected_account_id"
+    printf '[PASS] pending %s is bound to FVK-derived WalletAccountId %s\n' \
+        "$name" "$expected_account_id"
+}
+
+assert_no_pending_commitment() {
+    local status_label=$1
+    local commitment=$2
+
+    jq -e --arg commitment "$commitment" \
+        'all(.local_registrations[]; .commitment != $commitment)' \
+        "$LOG_DIR/$status_label.log" >/dev/null \
+        || die "$status_label still contains completed commitment $commitment"
+}
+
+assert_account_records_match() {
+    local original_json=$1
+    local fresh_json=$2
+    local label=$3
+
+    jq -n -e --argjson original "$original_json" --argjson fresh "$fresh_json" \
+        '$original.index == $fresh.index
+         and $original.uivk == $fresh.uivk
+         and $original.ufvk == $fresh.ufvk' \
+        >/dev/null \
+        || die "$label did not recreate the same deterministic account keys"
+    printf '[PASS] %s recreated the same deterministic account index/UIVK/UFVK\n' "$label"
 }
 
 assert_coppice_status() {
@@ -753,6 +886,21 @@ else
 fi
 [[ -n "$MINER_UA" ]] || die "derive-address did not print a unified address"
 printf '[OK] derived unified miner address (%s characters)\n' "$(printf '%s' "$MINER_UA" | wc -c)"
+
+status "Derive a disposable external address for the bootstrap Sapling note"
+if "$DEVTOOL_BIN" wallet derive-address \
+    --mnemonic "$SAPLING_DISCARD_MNEMONIC" --network regtest \
+    >"$LOG_DIR/derive-sapling-discard-address.log" 2>&1; then
+    SAPLING_DISCARD_ADDRESS="$(sed -n 's/^Transparent Address: //p' \
+        "$LOG_DIR/derive-sapling-discard-address.log" | tail -1)"
+else
+    tail -80 "$LOG_DIR/derive-sapling-discard-address.log" >&2 || true
+    die "could not derive the external Sapling-discard destination"
+fi
+[[ -n "$SAPLING_DISCARD_ADDRESS" ]] \
+    || die "derive-address did not print a transparent Sapling-discard destination"
+printf '[OK] derived external transparent discard address (%s characters)\n' \
+    "$(printf '%s' "$SAPLING_DISCARD_ADDRESS" | wc -c)"
 write_configs
 printf '[INFO] Zakura config: %s\n' "$ZAKURA_CONFIG"
 printf '[INFO] Zaino config: %s\n' "$ZAINO_CONFIG"
@@ -817,7 +965,28 @@ run_devtool_logged wallet-sync wallet \
     --wallet-dir "$WALLET_DIR" sync \
     --server "$ZAINO_GRPC_ADDR" --connection direct
 
-status "Mine and index post-NU6.3 Ironwood funding blocks"
+status "Disable Coppice protection for pre-activation bootstrap cleanup"
+run_devtool_logged coppice-protection-off wallet \
+    --wallet-dir "$WALLET_DIR" coppice protection off
+rg -a -q '^Off$' "$LOG_DIR/coppice-protection-off.log" \
+    || die "Coppice protection did not enter Off mode for bootstrap cleanup"
+
+status "Discard the pre-NU6.3 bootstrap Sapling coinbase note"
+run_devtool_logged discard-bootstrap-sapling wallet \
+    --wallet-dir "$WALLET_DIR" send \
+    --identity "$IDENTITY_FILE" \
+    --address "$SAPLING_DISCARD_ADDRESS" \
+    --value 624985000 \
+    --min-confirmations 1 \
+    --server "$ZAINO_GRPC_ADDR" --connection direct
+SAPLING_DISCARD_TXID="$(rg -a -o '[0-9a-fA-F]{64}' \
+    "$LOG_DIR/discard-bootstrap-sapling.log" | tail -1 || true)"
+[[ -n "$SAPLING_DISCARD_TXID" ]] \
+    || die "bootstrap Sapling discard did not emit a transaction id"
+printf '[OK] broadcast bootstrap Sapling discard transaction %s\n' \
+    "$SAPLING_DISCARD_TXID"
+
+status "Mine and index the discarded bootstrap note plus post-NU6.3 Ironwood funding blocks"
 rpc_generate 12
 wait_for_zaino_tip 13
 
@@ -831,8 +1000,17 @@ FUNDED_BALANCE="$(rg -a '^[{]' "$LOG_DIR/balance-funded.log" | tail -1)"
 [[ -n "$FUNDED_BALANCE" ]] || die "funded balance command did not emit JSON"
 jq -e '.ironwood_spendable > 0' >/dev/null <<<"$FUNDED_BALANCE" \
     || die "wallet did not report spendable Ironwood funding: $FUNDED_BALANCE"
+jq -e '.sapling_spendable == 0' >/dev/null <<<"$FUNDED_BALANCE" \
+    || die "bootstrap Sapling note was not fully discarded: $FUNDED_BALANCE"
+run_devtool_logged discard-bootstrap-sapling-history wallet \
+    --wallet-dir "$WALLET_DIR" list-tx --json
+rg -a -q -F "$SAPLING_DISCARD_TXID" \
+    "$LOG_DIR/discard-bootstrap-sapling-history.log" \
+    || die "wallet transaction history does not contain confirmed bootstrap Sapling discard $SAPLING_DISCARD_TXID"
 printf '[PASS] wallet reports ironwood_spendable=%s zatoshi\n' \
     "$(jq -r '.ironwood_spendable' <<<"$FUNDED_BALANCE")"
+printf '[PASS] bootstrap Sapling note discarded: tx %s; sapling_spendable=0\n' \
+    "$SAPLING_DISCARD_TXID"
 
 status "Create an ordinary Ironwood receive target"
 run_devtool_logged generate-receive-address wallet \
@@ -1311,7 +1489,7 @@ jq -e '.local_registrations == []' "$LOG_DIR/phase3-break-bond-status.log" >/dev
 printf '[PASS] fresh-wallet Break Bond tx %s spent the reconstructed active bond at height %s; Released and BondSpent names remained inactive\n' \
     "$RECOVERY_BREAK_BOND_TXID" "$PHASE3_BREAK_BOND_HEIGHT_EXPECTED"
 
-printf '\n[PASS] Phase 1 + Phase 2 + Phase 3 qualification complete\n'
+printf '\n[PASS] Phase 1 + Phase 2 + Phase 3 prerequisite complete\n'
 printf '[PASS] lifecycle evidence: %s COMMIT/REVEAL/UPDATE/RELEASE, %s second COMMIT/REVEAL/Break Bond\n' \
     "$COPPICE_NAME_ONE" "$COPPICE_NAME_TWO"
 printf '[PASS] restart recovery: Zaino and fresh wallet processes reused persisted state\n'
@@ -1322,3 +1500,579 @@ printf '[PASS] Phase 3 fresh same-seed recovery: birthday=%s, sync tip=%s, Break
     "$COPPICE_ACTIVATION_HEIGHT" "$REORG_OLD_HEIGHT" "$RECOVERY_BREAK_BOND_TXID" \
     "$PHASE3_BREAK_BOND_HEIGHT_EXPECTED"
 printf '[PASS] deep reorg tests were not run\n'
+
+status "Phase 4: create a second same-seed account and map FVK-derived identities"
+wallet_sync_logged phase4-original-preparation-sync
+PHASE4_BASELINE_HEIGHT="$(zakura_tip_height)"
+wallet_status_logged phase4-original-baseline-status
+assert_coppice_status phase4-original-baseline-status \
+    "$PHASE4_BASELINE_HEIGHT" Enabled 2 0
+
+run_devtool_logged phase4-account-list-before wallet \
+    --wallet-dir "$WALLET_DIR" list-accounts
+ACCOUNT_A_RECORD="$(account_record_for_name \
+    "$LOG_DIR/phase4-account-list-before.log" phase1)"
+[[ -n "$ACCOUNT_A_RECORD" ]] || die "could not identify the original phase4 Account A"
+ACCOUNT_A_UUID="$(jq -r '.uuid' <<<"$ACCOUNT_A_RECORD")"
+ORIGINAL_ACCOUNT_A_RECORD="$ACCOUNT_A_RECORD"
+
+run_devtool_logged phase4-generate-account-b wallet \
+    --wallet-dir "$WALLET_DIR" generate-account \
+    --identity "$IDENTITY_FILE" \
+    --name phase4-account-b \
+    --server "$ZAINO_GRPC_ADDR" --connection direct
+wallet_sync_logged phase4-account-add-sync
+run_devtool_logged phase4-account-list wallet \
+    --wallet-dir "$WALLET_DIR" list-accounts
+ACCOUNT_A_RECORD="$(account_record_for_name \
+    "$LOG_DIR/phase4-account-list.log" phase1)"
+ACCOUNT_B_RECORD="$(account_record_for_name \
+    "$LOG_DIR/phase4-account-list.log" phase4-account-b)"
+ACCOUNT_A_UUID="$(jq -r '.uuid' <<<"$ACCOUNT_A_RECORD")"
+ACCOUNT_B_UUID="$(jq -r '.uuid' <<<"$ACCOUNT_B_RECORD")"
+[[ "$ACCOUNT_A_UUID" != "$ACCOUNT_B_UUID" ]] \
+    || die "the two wallet accounts unexpectedly share an AccountUuid"
+ORIGINAL_ACCOUNT_A_RECORD="$ACCOUNT_A_RECORD"
+ORIGINAL_ACCOUNT_B_RECORD="$ACCOUNT_B_RECORD"
+[[ "$(jq -r '.index' <<<"$ACCOUNT_A_RECORD")" == 0 ]] \
+    || die "phase4 Account A is not deterministic account index 0"
+[[ "$(jq -r '.index' <<<"$ACCOUNT_B_RECORD")" == 1 ]] \
+    || die "phase4 Account B is not deterministic account index 1"
+printf '[PASS] same-seed accounts: A uuid=%s index=%s; B uuid=%s index=%s\n' \
+    "$ACCOUNT_A_UUID" "$(jq -r '.index' <<<"$ACCOUNT_A_RECORD")" \
+    "$ACCOUNT_B_UUID" "$(jq -r '.index' <<<"$ACCOUNT_B_RECORD")"
+
+wallet_status_logged phase4-account-map
+assert_coppice_status phase4-account-map "$PHASE4_BASELINE_HEIGHT" Enabled 2 0
+jq -e '.wallet_accounts | length == 2' \
+    "$LOG_DIR/phase4-account-map.log" >/dev/null \
+    || die "Coppice status did not expose both wallet accounts"
+ACCOUNT_A_WALLET_ID="$(wallet_account_id_from_status phase4-account-map "$ACCOUNT_A_UUID")"
+ACCOUNT_B_WALLET_ID="$(wallet_account_id_from_status phase4-account-map "$ACCOUNT_B_UUID")"
+[[ "$ACCOUNT_A_WALLET_ID" != "$ACCOUNT_B_WALLET_ID" ]] \
+    || die "the two accounts unexpectedly share a FVK-derived WalletAccountId"
+printf '[PASS] account A WalletAccountId=%s; account B WalletAccountId=%s\n' \
+    "$ACCOUNT_A_WALLET_ID" "$ACCOUNT_B_WALLET_ID"
+
+status "Phase 4: independently fund both accounts and create separate bond notes"
+wallet_balance_logged_for phase4-baseline-balance-a "$WALLET_DIR" "$ACCOUNT_A_UUID"
+wallet_balance_logged_for phase4-baseline-balance-b "$WALLET_DIR" "$ACCOUNT_B_UUID"
+PHASE4_A_BASE_LOCKED="$(balance_locked_value phase4-baseline-balance-a)"
+PHASE4_B_BASE_LOCKED="$(balance_locked_value phase4-baseline-balance-b)"
+printf '[INFO] pre-Phase-4 locked values: account A=%s, account B=%s zatoshi\n' \
+    "$PHASE4_A_BASE_LOCKED" "$PHASE4_B_BASE_LOCKED"
+
+run_devtool_logged phase4-account-b-funding-address wallet \
+    --wallet-dir "$WALLET_DIR" generate-address "$ACCOUNT_B_UUID"
+PHASE4_B_FUNDING_ADDRESS="$(sed -n 's/^     Address: //p' \
+    "$LOG_DIR/phase4-account-b-funding-address.log" | tail -1)"
+[[ -n "$PHASE4_B_FUNDING_ADDRESS" ]] \
+    || die "could not create Account B's independent funding address"
+run_devtool_logged phase4-account-a-bond-address wallet \
+    --wallet-dir "$WALLET_DIR" generate-address "$ACCOUNT_A_UUID"
+PHASE4_A_BOND_ADDRESS="$(sed -n 's/^     Address: //p' \
+    "$LOG_DIR/phase4-account-a-bond-address.log" | tail -1)"
+[[ -n "$PHASE4_A_BOND_ADDRESS" ]] \
+    || die "could not create Account A's dedicated bond address"
+
+run_devtool_logged phase4-fund-account-b wallet \
+    --wallet-dir "$WALLET_DIR" send \
+    --identity "$IDENTITY_FILE" \
+    --address "$PHASE4_B_FUNDING_ADDRESS" \
+    --value "$PHASE4_ACCOUNT_FUNDING_VALUE" \
+    --server "$ZAINO_GRPC_ADDR" --connection direct "$ACCOUNT_A_UUID"
+PHASE4_B_FUND_TXID="$(rg -a -o '[0-9a-fA-F]{64}' \
+    "$LOG_DIR/phase4-fund-account-b.log" | tail -1 || true)"
+[[ -n "$PHASE4_B_FUND_TXID" ]] || die "Account B funding did not emit a transaction id"
+PHASE4_B_FUND_HEIGHT_EXPECTED=$(($(zakura_tip_height) + 4))
+rpc_generate 4
+wait_for_zaino_tip "$PHASE4_B_FUND_HEIGHT_EXPECTED"
+wallet_sync_logged phase4-account-b-funding-sync
+wallet_balance_logged_for phase4-account-b-funded-balance "$WALLET_DIR" "$ACCOUNT_B_UUID"
+jq -e --argjson required "$PHASE4_ACCOUNT_FUNDING_VALUE" \
+    '.ironwood_spendable >= $required' \
+    <<<"$(balance_json phase4-account-b-funded-balance)" >/dev/null \
+    || die "Account B did not receive independent spendable Ironwood funding"
+printf '[PASS] Account B independently received tx %s with spendable Ironwood value\n' \
+    "$PHASE4_B_FUND_TXID"
+
+run_devtool_logged phase4-fund-account-a-bond wallet \
+    --wallet-dir "$WALLET_DIR" send \
+    --identity "$IDENTITY_FILE" \
+    --address "$PHASE4_A_BOND_ADDRESS" \
+    --value "$COPPICE_BOND_VALUE" \
+    --server "$ZAINO_GRPC_ADDR" --connection direct "$ACCOUNT_A_UUID"
+PHASE4_A_BOND_FUND_TXID="$(rg -a -o '[0-9a-fA-F]{64}' \
+    "$LOG_DIR/phase4-fund-account-a-bond.log" | tail -1 || true)"
+[[ -n "$PHASE4_A_BOND_FUND_TXID" ]] \
+    || die "Account A bond funding did not emit a transaction id"
+PHASE4_A_BOND_FUND_HEIGHT_EXPECTED=$(($(zakura_tip_height) + 3))
+rpc_generate 3
+wait_for_zaino_tip "$PHASE4_A_BOND_FUND_HEIGHT_EXPECTED"
+wallet_sync_logged phase4-account-a-bond-funding-sync
+
+run_devtool_logged phase4-account-b-bond-address wallet \
+    --wallet-dir "$WALLET_DIR" generate-address "$ACCOUNT_B_UUID"
+PHASE4_B_BOND_ADDRESS="$(sed -n 's/^     Address: //p' \
+    "$LOG_DIR/phase4-account-b-bond-address.log" | tail -1)"
+[[ -n "$PHASE4_B_BOND_ADDRESS" ]] \
+    || die "could not create Account B's dedicated bond address"
+run_devtool_logged phase4-fund-account-b-bond wallet \
+    --wallet-dir "$WALLET_DIR" send \
+    --identity "$IDENTITY_FILE" \
+    --address "$PHASE4_B_BOND_ADDRESS" \
+    --value "$COPPICE_BOND_VALUE" \
+    --min-confirmations 1 \
+    --server "$ZAINO_GRPC_ADDR" --connection direct "$ACCOUNT_B_UUID"
+PHASE4_B_BOND_FUND_TXID="$(rg -a -o '[0-9a-fA-F]{64}' \
+    "$LOG_DIR/phase4-fund-account-b-bond.log" | tail -1 || true)"
+[[ -n "$PHASE4_B_BOND_FUND_TXID" ]] \
+    || die "Account B bond funding did not emit a transaction id"
+PHASE4_B_BOND_FUND_HEIGHT_EXPECTED=$(($(zakura_tip_height) + 3))
+rpc_generate 3
+wait_for_zaino_tip "$PHASE4_B_BOND_FUND_HEIGHT_EXPECTED"
+wallet_sync_logged phase4-independent-funding-sync
+wallet_balance_logged_for phase4-independent-funding-balance-a "$WALLET_DIR" "$ACCOUNT_A_UUID"
+wallet_balance_logged_for phase4-independent-funding-balance-b "$WALLET_DIR" "$ACCOUNT_B_UUID"
+[[ "$(balance_locked_value phase4-independent-funding-balance-a)" == "$PHASE4_A_BASE_LOCKED" ]] \
+    || die "Account A lock value changed before its Phase 4 registration"
+[[ "$(balance_locked_value phase4-independent-funding-balance-b)" == "$PHASE4_B_BASE_LOCKED" ]] \
+    || die "Account B lock value changed before its Phase 4 registration"
+printf '[PASS] both accounts have independent spendable funding and no premature Coppice lock mutation\n'
+
+status "Phase 4: create and canonicalize two account-owned registrations"
+run_devtool_logged phase4-name-a-address wallet \
+    --wallet-dir "$WALLET_DIR" generate-address "$ACCOUNT_A_UUID"
+PHASE4_UA_ONE="$(sed -n 's/^     Address: //p' \
+    "$LOG_DIR/phase4-name-a-address.log" | tail -1)"
+[[ -n "$PHASE4_UA_ONE" ]] || die "could not create Account A's Phase 4 UA"
+run_devtool_logged phase4-name-b-address wallet \
+    --wallet-dir "$WALLET_DIR" generate-address "$ACCOUNT_B_UUID"
+PHASE4_UA_TWO="$(sed -n 's/^     Address: //p' \
+    "$LOG_DIR/phase4-name-b-address.log" | tail -1)"
+[[ -n "$PHASE4_UA_TWO" ]] || die "could not create Account B's Phase 4 UA"
+
+PHASE4_A_COMMIT_HEIGHT_EXPECTED=$(($(zakura_tip_height) + 1))
+run_devtool_logged phase4-register-a wallet \
+    --wallet-dir "$WALLET_DIR" coppice register "$ACCOUNT_A_UUID" \
+    --identity "$IDENTITY_FILE" \
+    --name "$PHASE4_NAME_ONE" \
+    --address "$PHASE4_UA_ONE" \
+    --server "$ZAINO_GRPC_ADDR" --connection direct
+PHASE4_COMMITMENT_A="$(rg -a -o 'commitment=[0-9a-fA-F]{64}' \
+    "$LOG_DIR/phase4-register-a.log" | tail -1 | cut -d= -f2)"
+PHASE4_A_COMMIT_TXID="$(rg -a -o 'txid=[0-9a-fA-F]{64}' \
+    "$LOG_DIR/phase4-register-a.log" | tail -1 | cut -d= -f2)"
+[[ -n "$PHASE4_COMMITMENT_A" && -n "$PHASE4_A_COMMIT_TXID" ]] \
+    || die "Account A COMMIT did not emit commitment and transaction id"
+rpc_generate 1
+wait_for_zaino_tip "$PHASE4_A_COMMIT_HEIGHT_EXPECTED"
+wallet_sync_logged phase4-a-commit-sync
+run_devtool_logged phase4-observe-commit-a wallet \
+    --wallet-dir "$WALLET_DIR" coppice observe-commit "$PHASE4_COMMITMENT_A"
+[[ "$(tail -1 "$LOG_DIR/phase4-observe-commit-a.log" | tr -d '\r')" == \
+    "$PHASE4_A_COMMIT_HEIGHT_EXPECTED" ]] \
+    || die "Account A COMMIT was not observed at its canonical height"
+wallet_status_logged phase4-a-commit-status
+assert_coppice_status phase4-a-commit-status \
+    "$PHASE4_A_COMMIT_HEIGHT_EXPECTED" Enabled 2 1
+assert_pending_owner phase4-a-commit-status "$PHASE4_COMMITMENT_A" \
+    "$PHASE4_NAME_ONE" "$ACCOUNT_A_WALLET_ID"
+wallet_balance_logged_for phase4-a-pending-balance-a "$WALLET_DIR" "$ACCOUNT_A_UUID"
+wallet_balance_logged_for phase4-a-pending-balance-b "$WALLET_DIR" "$ACCOUNT_B_UUID"
+PHASE4_A_PENDING_LOCKED="$(balance_locked_value phase4-a-pending-balance-a)"
+PHASE4_B_PENDING_AFTER_A="$(balance_locked_value phase4-a-pending-balance-b)"
+(( PHASE4_A_PENDING_LOCKED == PHASE4_A_BASE_LOCKED + COPPICE_BOND_VALUE )) \
+    || die "Account A pending registration did not lock exactly its own bond"
+(( PHASE4_B_PENDING_AFTER_A == PHASE4_B_BASE_LOCKED )) \
+    || die "Account A pending registration changed Account B's lock value"
+printf '[PASS] Account A pending bond lock is account-scoped at %s zatoshi\n' \
+    "$PHASE4_A_PENDING_LOCKED"
+
+PHASE4_B_COMMIT_HEIGHT_EXPECTED=$(($(zakura_tip_height) + 1))
+run_devtool_logged phase4-register-b wallet \
+    --wallet-dir "$WALLET_DIR" coppice register "$ACCOUNT_B_UUID" \
+    --identity "$IDENTITY_FILE" \
+    --name "$PHASE4_NAME_TWO" \
+    --address "$PHASE4_UA_TWO" \
+    --server "$ZAINO_GRPC_ADDR" --connection direct
+PHASE4_COMMITMENT_B="$(rg -a -o 'commitment=[0-9a-fA-F]{64}' \
+    "$LOG_DIR/phase4-register-b.log" | tail -1 | cut -d= -f2)"
+PHASE4_B_COMMIT_TXID="$(rg -a -o 'txid=[0-9a-fA-F]{64}' \
+    "$LOG_DIR/phase4-register-b.log" | tail -1 | cut -d= -f2)"
+[[ -n "$PHASE4_COMMITMENT_B" && -n "$PHASE4_B_COMMIT_TXID" ]] \
+    || die "Account B COMMIT did not emit commitment and transaction id"
+rpc_generate 1
+wait_for_zaino_tip "$PHASE4_B_COMMIT_HEIGHT_EXPECTED"
+wallet_sync_logged phase4-b-commit-sync
+run_devtool_logged phase4-observe-commit-b wallet \
+    --wallet-dir "$WALLET_DIR" coppice observe-commit "$PHASE4_COMMITMENT_B"
+[[ "$(tail -1 "$LOG_DIR/phase4-observe-commit-b.log" | tr -d '\r')" == \
+    "$PHASE4_B_COMMIT_HEIGHT_EXPECTED" ]] \
+    || die "Account B COMMIT was not observed at its canonical height"
+wallet_status_logged phase4-both-commit-status
+assert_coppice_status phase4-both-commit-status \
+    "$PHASE4_B_COMMIT_HEIGHT_EXPECTED" Enabled 2 2
+assert_pending_owner phase4-both-commit-status "$PHASE4_COMMITMENT_A" \
+    "$PHASE4_NAME_ONE" "$ACCOUNT_A_WALLET_ID"
+assert_pending_owner phase4-both-commit-status "$PHASE4_COMMITMENT_B" \
+    "$PHASE4_NAME_TWO" "$ACCOUNT_B_WALLET_ID"
+wallet_balance_logged_for phase4-both-pending-balance-a "$WALLET_DIR" "$ACCOUNT_A_UUID"
+wallet_balance_logged_for phase4-both-pending-balance-b "$WALLET_DIR" "$ACCOUNT_B_UUID"
+[[ "$(balance_locked_value phase4-both-pending-balance-a)" == "$PHASE4_A_PENDING_LOCKED" ]] \
+    || die "Account B COMMIT mutated Account A's pending lock"
+PHASE4_B_PENDING_LOCKED="$(balance_locked_value phase4-both-pending-balance-b)"
+(( PHASE4_B_PENDING_LOCKED == PHASE4_B_BASE_LOCKED + COPPICE_BOND_VALUE )) \
+    || die "Account B pending registration did not lock exactly its own bond"
+printf '[PASS] Account B pending bond lock is account-scoped at %s zatoshi\n' \
+    "$PHASE4_B_PENDING_LOCKED"
+
+PHASE4_A_REVEAL_HEIGHT_EXPECTED=$(($(zakura_tip_height) + 1))
+run_devtool_logged phase4-reveal-a wallet \
+    --wallet-dir "$WALLET_DIR" coppice reveal \
+    --identity "$IDENTITY_FILE" "$ACCOUNT_A_UUID" "$PHASE4_COMMITMENT_A" \
+    --server "$ZAINO_GRPC_ADDR" --connection direct
+PHASE4_A_REVEAL_TXID="$(rg -a -o 'txid=[0-9a-fA-F]{64}' \
+    "$LOG_DIR/phase4-reveal-a.log" | tail -1 | cut -d= -f2)"
+[[ -n "$PHASE4_A_REVEAL_TXID" ]] || die "Account A REVEAL did not emit a transaction id"
+rpc_generate 1
+wait_for_zaino_tip "$PHASE4_A_REVEAL_HEIGHT_EXPECTED"
+wallet_sync_logged phase4-a-reveal-sync
+wallet_status_logged phase4-a-reveal-status
+assert_coppice_status phase4-a-reveal-status \
+    "$PHASE4_A_REVEAL_HEIGHT_EXPECTED" Enabled 3 1
+assert_snapshot_status "$PHASE4_NAME_ONE" Active "$PHASE4_A_REVEAL_HEIGHT_EXPECTED"
+assert_resolved_address phase4-resolve-a "$PHASE4_NAME_ONE" "$PHASE4_UA_ONE"
+assert_pending_owner phase4-a-reveal-status "$PHASE4_COMMITMENT_A" \
+    "$PHASE4_NAME_ONE" "$ACCOUNT_A_WALLET_ID"
+assert_pending_owner phase4-a-reveal-status "$PHASE4_COMMITMENT_B" \
+    "$PHASE4_NAME_TWO" "$ACCOUNT_B_WALLET_ID"
+wallet_balance_logged_for phase4-a-reveal-balance-a "$WALLET_DIR" "$ACCOUNT_A_UUID"
+wallet_balance_logged_for phase4-a-reveal-balance-b "$WALLET_DIR" "$ACCOUNT_B_UUID"
+[[ "$(balance_locked_value phase4-a-reveal-balance-a)" == "$PHASE4_A_PENDING_LOCKED" ]] \
+    || die "Account A REVEAL changed its own protected bond value"
+[[ "$(balance_locked_value phase4-a-reveal-balance-b)" == "$PHASE4_B_PENDING_LOCKED" ]] \
+    || die "Account A REVEAL changed Account B's pending lock value"
+printf '[PASS] Account A REVEAL activated %s while Account B remains pending and locked\n' \
+    "$PHASE4_NAME_ONE"
+
+status "Phase 4: reject cross-account completion and complete Account A only"
+run_devtool_expect_failure phase4-wrong-complete-a wallet \
+    --wallet-dir "$WALLET_DIR" coppice complete \
+    "$ACCOUNT_B_UUID" "$PHASE4_COMMITMENT_A"
+rg -a -qi 'does not own|own the Coppice registration' \
+    "$LOG_DIR/phase4-wrong-complete-a.log" \
+    || die "wrong-account completion failed without the ownership guard diagnostic"
+wallet_status_logged phase4-after-wrong-complete-status
+assert_coppice_status phase4-after-wrong-complete-status \
+    "$PHASE4_A_REVEAL_HEIGHT_EXPECTED" Enabled 3 1
+assert_pending_owner phase4-after-wrong-complete-status "$PHASE4_COMMITMENT_A" \
+    "$PHASE4_NAME_ONE" "$ACCOUNT_A_WALLET_ID"
+assert_pending_owner phase4-after-wrong-complete-status "$PHASE4_COMMITMENT_B" \
+    "$PHASE4_NAME_TWO" "$ACCOUNT_B_WALLET_ID"
+wallet_balance_logged_for phase4-after-wrong-complete-balance-a "$WALLET_DIR" "$ACCOUNT_A_UUID"
+wallet_balance_logged_for phase4-after-wrong-complete-balance-b "$WALLET_DIR" "$ACCOUNT_B_UUID"
+[[ "$(balance_locked_value phase4-after-wrong-complete-balance-a)" == "$PHASE4_A_PENDING_LOCKED" ]] \
+    || die "wrong-account completion mutated Account A's lock"
+[[ "$(balance_locked_value phase4-after-wrong-complete-balance-b)" == "$PHASE4_B_PENDING_LOCKED" ]] \
+    || die "wrong-account completion mutated Account B's lock"
+
+run_devtool_logged phase4-complete-a wallet \
+    --wallet-dir "$WALLET_DIR" coppice complete \
+    "$ACCOUNT_A_UUID" "$PHASE4_COMMITMENT_A"
+wallet_status_logged phase4-complete-a-status
+assert_coppice_status phase4-complete-a-status \
+    "$PHASE4_A_REVEAL_HEIGHT_EXPECTED" Enabled 3 1
+assert_no_pending_commitment phase4-complete-a-status "$PHASE4_COMMITMENT_A"
+assert_pending_owner phase4-complete-a-status "$PHASE4_COMMITMENT_B" \
+    "$PHASE4_NAME_TWO" "$ACCOUNT_B_WALLET_ID"
+assert_snapshot_status "$PHASE4_NAME_ONE" Active "$PHASE4_A_REVEAL_HEIGHT_EXPECTED"
+assert_resolved_address phase4-complete-a-resolve "$PHASE4_NAME_ONE" "$PHASE4_UA_ONE"
+wallet_balance_logged_for phase4-complete-a-balance-a "$WALLET_DIR" "$ACCOUNT_A_UUID"
+wallet_balance_logged_for phase4-complete-a-balance-b "$WALLET_DIR" "$ACCOUNT_B_UUID"
+[[ "$(balance_locked_value phase4-complete-a-balance-a)" == "$PHASE4_A_PENDING_LOCKED" ]] \
+    || die "completing Account A changed its active bond lock"
+[[ "$(balance_locked_value phase4-complete-a-balance-b)" == "$PHASE4_B_PENDING_LOCKED" ]] \
+    || die "completing Account A changed Account B's pending bond lock"
+printf '[PASS] completing Account A removed only Account A pending metadata and preserved both locks\n'
+
+PHASE4_B_REVEAL_HEIGHT_EXPECTED=$(($(zakura_tip_height) + 1))
+run_devtool_logged phase4-reveal-b wallet \
+    --wallet-dir "$WALLET_DIR" coppice reveal \
+    --identity "$IDENTITY_FILE" "$ACCOUNT_B_UUID" "$PHASE4_COMMITMENT_B" \
+    --server "$ZAINO_GRPC_ADDR" --connection direct
+PHASE4_B_REVEAL_TXID="$(rg -a -o 'txid=[0-9a-fA-F]{64}' \
+    "$LOG_DIR/phase4-reveal-b.log" | tail -1 | cut -d= -f2)"
+[[ -n "$PHASE4_B_REVEAL_TXID" ]] || die "Account B REVEAL did not emit a transaction id"
+rpc_generate 1
+wait_for_zaino_tip "$PHASE4_B_REVEAL_HEIGHT_EXPECTED"
+wallet_sync_logged phase4-b-reveal-sync
+wallet_status_logged phase4-b-reveal-status
+assert_coppice_status phase4-b-reveal-status \
+    "$PHASE4_B_REVEAL_HEIGHT_EXPECTED" Enabled 4 0
+assert_snapshot_status "$PHASE4_NAME_ONE" Active "$PHASE4_B_REVEAL_HEIGHT_EXPECTED"
+assert_snapshot_status "$PHASE4_NAME_TWO" Active "$PHASE4_B_REVEAL_HEIGHT_EXPECTED"
+assert_resolved_address phase4-resolve-a-after-b "$PHASE4_NAME_ONE" "$PHASE4_UA_ONE"
+assert_resolved_address phase4-resolve-b "$PHASE4_NAME_TWO" "$PHASE4_UA_TWO"
+assert_pending_owner phase4-b-reveal-status "$PHASE4_COMMITMENT_B" \
+    "$PHASE4_NAME_TWO" "$ACCOUNT_B_WALLET_ID"
+wallet_balance_logged_for phase4-b-reveal-balance-a "$WALLET_DIR" "$ACCOUNT_A_UUID"
+wallet_balance_logged_for phase4-b-reveal-balance-b "$WALLET_DIR" "$ACCOUNT_B_UUID"
+[[ "$(balance_locked_value phase4-b-reveal-balance-a)" == "$PHASE4_A_PENDING_LOCKED" ]] \
+    || die "Account B REVEAL changed Account A's active bond lock"
+[[ "$(balance_locked_value phase4-b-reveal-balance-b)" == "$PHASE4_B_PENDING_LOCKED" ]] \
+    || die "Account B REVEAL changed its own protected bond value"
+
+run_devtool_logged phase4-complete-b wallet \
+    --wallet-dir "$WALLET_DIR" coppice complete \
+    "$ACCOUNT_B_UUID" "$PHASE4_COMMITMENT_B"
+wallet_status_logged phase4-complete-b-status
+assert_coppice_status phase4-complete-b-status \
+    "$PHASE4_B_REVEAL_HEIGHT_EXPECTED" Enabled 4 0
+[[ "$(jq -r '.local_registrations | length' "$LOG_DIR/phase4-complete-b-status.log")" == 0 ]] \
+    || die "completing Account B did not clear only the remaining local registration"
+assert_snapshot_status "$PHASE4_NAME_ONE" Active "$PHASE4_B_REVEAL_HEIGHT_EXPECTED"
+assert_snapshot_status "$PHASE4_NAME_TWO" Active "$PHASE4_B_REVEAL_HEIGHT_EXPECTED"
+assert_resolved_address phase4-complete-b-resolve-a "$PHASE4_NAME_ONE" "$PHASE4_UA_ONE"
+assert_resolved_address phase4-complete-b-resolve-b "$PHASE4_NAME_TWO" "$PHASE4_UA_TWO"
+wallet_balance_logged_for phase4-active-balance-a "$WALLET_DIR" "$ACCOUNT_A_UUID"
+wallet_balance_logged_for phase4-active-balance-b "$WALLET_DIR" "$ACCOUNT_B_UUID"
+PHASE4_A_ACTIVE_LOCKED="$(balance_locked_value phase4-active-balance-a)"
+PHASE4_B_ACTIVE_LOCKED="$(balance_locked_value phase4-active-balance-b)"
+(( PHASE4_A_ACTIVE_LOCKED == PHASE4_A_BASE_LOCKED + COPPICE_BOND_VALUE )) \
+    || die "Account A active bond lock value is incorrect"
+(( PHASE4_B_ACTIVE_LOCKED == PHASE4_B_BASE_LOCKED + COPPICE_BOND_VALUE )) \
+    || die "Account B active bond lock value is incorrect"
+printf '[PASS] both active names resolve and both account-scoped bonds remain protected\n'
+
+status "Phase 4: reject lifecycle and ordinary spends that cross account ownership"
+run_devtool_expect_failure phase4-wrong-break-bond wallet \
+    --wallet-dir "$WALLET_DIR" coppice break-bond \
+    "$ACCOUNT_B_UUID" \
+    --identity "$IDENTITY_FILE" \
+    --name "$PHASE4_NAME_ONE" \
+    --address "$PHASE4_UA_TWO" \
+    --value 1000000 \
+    --server "$ZAINO_GRPC_ADDR" --connection direct
+rg -a -qi 'bond|owned|missing|account' "$LOG_DIR/phase4-wrong-break-bond.log" \
+    || die "wrong-account Break Bond failed without an ownership/bond diagnostic"
+
+run_devtool_logged phase4-ordinary-probe-address-a wallet \
+    --wallet-dir "$WALLET_DIR" generate-address "$ACCOUNT_A_UUID"
+PHASE4_PROBE_ADDRESS_A="$(sed -n 's/^     Address: //p' \
+    "$LOG_DIR/phase4-ordinary-probe-address-a.log" | tail -1)"
+run_devtool_logged phase4-ordinary-probe-address-b wallet \
+    --wallet-dir "$WALLET_DIR" generate-address "$ACCOUNT_B_UUID"
+PHASE4_PROBE_ADDRESS_B="$(sed -n 's/^     Address: //p' \
+    "$LOG_DIR/phase4-ordinary-probe-address-b.log" | tail -1)"
+PHASE4_A_TOTAL="$(balance_total_value phase4-active-balance-a)"
+PHASE4_B_TOTAL="$(balance_total_value phase4-active-balance-b)"
+run_devtool_expect_failure phase4-ordinary-send-a wallet \
+    --wallet-dir "$WALLET_DIR" send \
+    --identity "$IDENTITY_FILE" \
+    --address "$PHASE4_PROBE_ADDRESS_A" \
+    --value "$((PHASE4_A_TOTAL - 1))" \
+    --min-confirmations 1 \
+    --server "$ZAINO_GRPC_ADDR" --connection direct "$ACCOUNT_A_UUID"
+run_devtool_expect_failure phase4-ordinary-send-b wallet \
+    --wallet-dir "$WALLET_DIR" send \
+    --identity "$IDENTITY_FILE" \
+    --address "$PHASE4_PROBE_ADDRESS_B" \
+    --value "$((PHASE4_B_TOTAL - 1))" \
+    --min-confirmations 1 \
+    --server "$ZAINO_GRPC_ADDR" --connection direct "$ACCOUNT_B_UUID"
+for ordinary_failure in phase4-ordinary-send-a phase4-ordinary-send-b; do
+    rg -a -qi 'insufficient|not enough|Coppice spend protection|locked|unavailable' \
+        "$LOG_DIR/$ordinary_failure.log" \
+        || die "$ordinary_failure did not report protected-value rejection"
+done
+wallet_balance_logged_for phase4-after-ordinary-balance-a "$WALLET_DIR" "$ACCOUNT_A_UUID"
+wallet_balance_logged_for phase4-after-ordinary-balance-b "$WALLET_DIR" "$ACCOUNT_B_UUID"
+[[ "$(balance_locked_value phase4-after-ordinary-balance-a)" == "$PHASE4_A_ACTIVE_LOCKED" ]] \
+    || die "Account A ordinary-send rejection changed its bond lock"
+[[ "$(balance_locked_value phase4-after-ordinary-balance-b)" == "$PHASE4_B_ACTIVE_LOCKED" ]] \
+    || die "Account B ordinary-send rejection changed its bond lock"
+printf '[PASS] wrong-account lifecycle and ordinary sends could not consume either protected bond\n'
+
+status "Phase 4: restart Zaino and reopen the persisted two-account wallet"
+if [[ -n "$ZAINO_PID" ]]; then
+    kill -TERM "$ZAINO_PID" 2>/dev/null || true
+    wait "$ZAINO_PID" 2>/dev/null || true
+    ZAINO_PID=""
+fi
+ZAINOLOG_COLOR=0 RUST_LOG=info "$ZAINO_BIN" start --config "$ZAINO_CONFIG" \
+    >"$LOG_DIR/zainod-phase4-restart.log" 2>&1 &
+ZAINO_PID=$!
+printf '[INFO] Phase 4 restarted zainod pid=%s with the same indexer database\n' "$ZAINO_PID"
+wait_for_grpc_ready
+wallet_sync_logged phase4-persisted-wallet-sync
+PHASE4_PERSISTED_HEIGHT="$(zakura_tip_height)"
+wallet_status_logged phase4-persisted-wallet-status
+assert_coppice_status phase4-persisted-wallet-status \
+    "$PHASE4_PERSISTED_HEIGHT" Enabled 4 0
+assert_snapshot_status "$PHASE4_NAME_ONE" Active "$PHASE4_PERSISTED_HEIGHT"
+assert_snapshot_status "$PHASE4_NAME_TWO" Active "$PHASE4_PERSISTED_HEIGHT"
+assert_resolved_address phase4-persisted-resolve-a "$PHASE4_NAME_ONE" "$PHASE4_UA_ONE"
+assert_resolved_address phase4-persisted-resolve-b "$PHASE4_NAME_TWO" "$PHASE4_UA_TWO"
+[[ "$(wallet_account_id_from_status phase4-persisted-wallet-status "$ACCOUNT_A_UUID")" == \
+    "$ACCOUNT_A_WALLET_ID" ]] \
+    || die "persisted restart changed Account A's FVK-derived WalletAccountId"
+[[ "$(wallet_account_id_from_status phase4-persisted-wallet-status "$ACCOUNT_B_UUID")" == \
+    "$ACCOUNT_B_WALLET_ID" ]] \
+    || die "persisted restart changed Account B's FVK-derived WalletAccountId"
+run_devtool_logged phase4-persisted-account-list wallet \
+    --wallet-dir "$WALLET_DIR" list-accounts
+assert_account_records_match "$ORIGINAL_ACCOUNT_A_RECORD" \
+    "$(account_record_for_name "$LOG_DIR/phase4-persisted-account-list.log" phase1)" \
+    "persisted Account A"
+assert_account_records_match "$ORIGINAL_ACCOUNT_B_RECORD" \
+    "$(account_record_for_name "$LOG_DIR/phase4-persisted-account-list.log" phase4-account-b)" \
+    "persisted Account B"
+wallet_balance_logged_for phase4-persisted-balance-a "$WALLET_DIR" "$ACCOUNT_A_UUID"
+wallet_balance_logged_for phase4-persisted-balance-b "$WALLET_DIR" "$ACCOUNT_B_UUID"
+[[ "$(balance_locked_value phase4-persisted-balance-a)" == "$PHASE4_A_ACTIVE_LOCKED" ]] \
+    || die "persisted restart did not recover Account A's active bond lock"
+[[ "$(balance_locked_value phase4-persisted-balance-b)" == "$PHASE4_B_ACTIVE_LOCKED" ]] \
+    || die "persisted restart did not recover Account B's active bond lock"
+printf '[PASS] persisted two-account restart recovered both canonical names, IDs, and locks\n'
+
+status "Phase 4: fresh same-seed two-account recovery with no copied local state"
+[[ ! -e "$PHASE4_RECOVERY_WALLET_DIR" ]] \
+    || die "Phase 4 fresh recovery wallet directory already exists"
+mkdir "$PHASE4_RECOVERY_WALLET_DIR"
+if [[ -n "$(find "$PHASE4_RECOVERY_WALLET_DIR" -mindepth 1 -print -quit)" ]]; then
+    die "Phase 4 fresh recovery directory was not empty"
+fi
+printf '[PASS] Phase 4 fresh recovery directory began empty\n'
+
+if {
+    printf '%s\n' "$WALLET_MNEMONIC" | timeout 240 "$DEVTOOL_BIN" wallet \
+        --wallet-dir "$PHASE4_RECOVERY_WALLET_DIR" init \
+        --name phase4-fresh-a \
+        --identity "$PHASE4_RECOVERY_IDENTITY_FILE" \
+        --network regtest \
+        --birthday "$COPPICE_ACTIVATION_HEIGHT" \
+        --activation-heights "$ACTIVATION_FILE" \
+        --server "$ZAINO_GRPC_ADDR" \
+        --connection direct
+} >"$LOG_DIR/phase4-fresh-wallet-init.log" 2>&1; then
+    printf '[PASS] fresh two-account wallet initialized from the deterministic mnemonic at birthday %s\n' \
+        "$COPPICE_ACTIVATION_HEIGHT"
+else
+    status_code=$?
+    printf '[FAIL] phase4-fresh-wallet-init (exit %d); see %s\n' \
+        "$status_code" "$LOG_DIR/phase4-fresh-wallet-init.log" >&2
+    tail -100 "$LOG_DIR/phase4-fresh-wallet-init.log" >&2 || true
+    exit "$status_code"
+fi
+for forbidden_state in \
+    "$PHASE4_RECOVERY_WALLET_DIR/coppice-v1.json" \
+    "$PHASE4_RECOVERY_WALLET_DIR/coppice-pending-v1.json" \
+    "$PHASE4_RECOVERY_WALLET_DIR/coppice-protection.json"; do
+    [[ ! -e "$forbidden_state" ]] \
+        || die "fresh Phase 4 init unexpectedly copied Coppice state: $forbidden_state"
+done
+
+run_devtool_logged phase4-fresh-generate-account-b wallet \
+    --wallet-dir "$PHASE4_RECOVERY_WALLET_DIR" generate-account \
+    --identity "$PHASE4_RECOVERY_IDENTITY_FILE" \
+    --name phase4-fresh-b \
+    --server "$ZAINO_GRPC_ADDR" --connection direct
+run_devtool_logged phase4-fresh-account-list wallet \
+    --wallet-dir "$PHASE4_RECOVERY_WALLET_DIR" list-accounts
+FRESH_ACCOUNT_A_RECORD="$(account_record_for_name \
+    "$LOG_DIR/phase4-fresh-account-list.log" phase4-fresh-a)"
+FRESH_ACCOUNT_B_RECORD="$(account_record_for_name \
+    "$LOG_DIR/phase4-fresh-account-list.log" phase4-fresh-b)"
+FRESH_ACCOUNT_A_UUID="$(jq -r '.uuid' <<<"$FRESH_ACCOUNT_A_RECORD")"
+FRESH_ACCOUNT_B_UUID="$(jq -r '.uuid' <<<"$FRESH_ACCOUNT_B_RECORD")"
+assert_account_records_match "$ORIGINAL_ACCOUNT_A_RECORD" \
+    "$FRESH_ACCOUNT_A_RECORD" "fresh Account A"
+assert_account_records_match "$ORIGINAL_ACCOUNT_B_RECORD" \
+    "$FRESH_ACCOUNT_B_RECORD" "fresh Account B"
+[[ "$FRESH_ACCOUNT_A_UUID" != "$FRESH_ACCOUNT_B_UUID" ]] \
+    || die "fresh recovery accounts unexpectedly share an AccountUuid"
+
+wallet_sync_logged_for phase4-fresh-wallet-sync "$PHASE4_RECOVERY_WALLET_DIR"
+wallet_status_logged_for phase4-fresh-wallet-status "$PHASE4_RECOVERY_WALLET_DIR"
+assert_coppice_status phase4-fresh-wallet-status \
+    "$PHASE4_PERSISTED_HEIGHT" Enabled 4 0
+assert_snapshot_status_for "$PHASE4_RECOVERY_WALLET_DIR" \
+    "$PHASE4_NAME_ONE" Active "$PHASE4_PERSISTED_HEIGHT"
+assert_snapshot_status_for "$PHASE4_RECOVERY_WALLET_DIR" \
+    "$PHASE4_NAME_TWO" Active "$PHASE4_PERSISTED_HEIGHT"
+assert_resolved_address_for phase4-fresh-resolve-a \
+    "$PHASE4_RECOVERY_WALLET_DIR" "$PHASE4_NAME_ONE" "$PHASE4_UA_ONE"
+assert_resolved_address_for phase4-fresh-resolve-b \
+    "$PHASE4_RECOVERY_WALLET_DIR" "$PHASE4_NAME_TWO" "$PHASE4_UA_TWO"
+[[ "$(jq -r '.local_registrations | length' "$LOG_DIR/phase4-fresh-wallet-status.log")" == 0 ]] \
+    || die "fresh two-account recovery recreated stale local pending metadata"
+[[ -f "$PHASE4_RECOVERY_WALLET_DIR/coppice-pending-v1.json" ]] \
+    || die "fresh two-account recovery did not create the normal empty pending store"
+jq -e '.registrations == []' \
+    "$PHASE4_RECOVERY_WALLET_DIR/coppice-pending-v1.json" >/dev/null \
+    || die "fresh two-account recovery pending store is not empty"
+FRESH_ACCOUNT_A_WALLET_ID="$(wallet_account_id_from_status \
+    phase4-fresh-wallet-status "$FRESH_ACCOUNT_A_UUID")"
+FRESH_ACCOUNT_B_WALLET_ID="$(wallet_account_id_from_status \
+    phase4-fresh-wallet-status "$FRESH_ACCOUNT_B_UUID")"
+[[ "$FRESH_ACCOUNT_A_WALLET_ID" == "$ACCOUNT_A_WALLET_ID" ]] \
+    || die "fresh Account A did not reconstruct its FVK-derived WalletAccountId"
+[[ "$FRESH_ACCOUNT_B_WALLET_ID" == "$ACCOUNT_B_WALLET_ID" ]] \
+    || die "fresh Account B did not reconstruct its FVK-derived WalletAccountId"
+wallet_balance_logged_for phase4-fresh-balance-a \
+    "$PHASE4_RECOVERY_WALLET_DIR" "$FRESH_ACCOUNT_A_UUID"
+wallet_balance_logged_for phase4-fresh-balance-b \
+    "$PHASE4_RECOVERY_WALLET_DIR" "$FRESH_ACCOUNT_B_UUID"
+PHASE4_FRESH_A_LOCKED="$(balance_locked_value phase4-fresh-balance-a)"
+PHASE4_FRESH_B_LOCKED="$(balance_locked_value phase4-fresh-balance-b)"
+(( PHASE4_FRESH_A_LOCKED == COPPICE_BOND_VALUE )) \
+    || die "fresh recovery did not reconstruct Account A's Phase 4 active bond lock"
+(( PHASE4_FRESH_B_LOCKED == COPPICE_BOND_VALUE )) \
+    || die "fresh recovery did not reconstruct Account B's Phase 4 active bond lock"
+printf '[PASS] fresh sync reconstructed both active registrations, both FVK-derived IDs, and both independent locks\n'
+
+run_devtool_logged phase4-fresh-probe-address-a wallet \
+    --wallet-dir "$PHASE4_RECOVERY_WALLET_DIR" generate-address "$FRESH_ACCOUNT_A_UUID"
+PHASE4_FRESH_PROBE_ADDRESS_A="$(sed -n 's/^     Address: //p' \
+    "$LOG_DIR/phase4-fresh-probe-address-a.log" | tail -1)"
+run_devtool_logged phase4-fresh-probe-address-b wallet \
+    --wallet-dir "$PHASE4_RECOVERY_WALLET_DIR" generate-address "$FRESH_ACCOUNT_B_UUID"
+PHASE4_FRESH_PROBE_ADDRESS_B="$(sed -n 's/^     Address: //p' \
+    "$LOG_DIR/phase4-fresh-probe-address-b.log" | tail -1)"
+FRESH_ACCOUNT_A_TOTAL="$(balance_total_value phase4-fresh-balance-a)"
+FRESH_ACCOUNT_B_TOTAL="$(balance_total_value phase4-fresh-balance-b)"
+run_devtool_expect_failure phase4-fresh-ordinary-send-a wallet \
+    --wallet-dir "$PHASE4_RECOVERY_WALLET_DIR" send \
+    --identity "$PHASE4_RECOVERY_IDENTITY_FILE" \
+    --address "$PHASE4_FRESH_PROBE_ADDRESS_A" \
+    --value "$((FRESH_ACCOUNT_A_TOTAL - 1))" \
+    --min-confirmations 1 \
+    --server "$ZAINO_GRPC_ADDR" --connection direct "$FRESH_ACCOUNT_A_UUID"
+run_devtool_expect_failure phase4-fresh-ordinary-send-b wallet \
+    --wallet-dir "$PHASE4_RECOVERY_WALLET_DIR" send \
+    --identity "$PHASE4_RECOVERY_IDENTITY_FILE" \
+    --address "$PHASE4_FRESH_PROBE_ADDRESS_B" \
+    --value "$((FRESH_ACCOUNT_B_TOTAL - 1))" \
+    --min-confirmations 1 \
+    --server "$ZAINO_GRPC_ADDR" --connection direct "$FRESH_ACCOUNT_B_UUID"
+for fresh_ordinary_failure in phase4-fresh-ordinary-send-a phase4-fresh-ordinary-send-b; do
+    rg -a -qi 'insufficient|not enough|Coppice spend protection|locked|unavailable' \
+        "$LOG_DIR/$fresh_ordinary_failure.log" \
+        || die "$fresh_ordinary_failure did not report protected-value rejection"
+done
+printf '[PASS] fresh reconstructed locks protected both accounts from ordinary spending\n'
+
+printf '\n[PASS] Phase 1 + Phase 2 + Phase 3 + Phase 4 qualification complete\n'
+printf '[PASS] Phase 4 account A: uuid=%s WalletAccountId=%s name=%s commitment=%s active_height=%s\n' \
+    "$ACCOUNT_A_UUID" "$ACCOUNT_A_WALLET_ID" "$PHASE4_NAME_ONE" \
+    "$PHASE4_COMMITMENT_A" "$PHASE4_A_REVEAL_HEIGHT_EXPECTED"
+printf '[PASS] Phase 4 account B: uuid=%s WalletAccountId=%s name=%s commitment=%s active_height=%s\n' \
+    "$ACCOUNT_B_UUID" "$ACCOUNT_B_WALLET_ID" "$PHASE4_NAME_TWO" \
+    "$PHASE4_COMMITMENT_B" "$PHASE4_B_REVEAL_HEIGHT_EXPECTED"
+printf '[PASS] Phase 4 per-account locks: A=%s, B=%s zatoshi; pending/complete/restart isolation held\n' \
+    "$PHASE4_FRESH_A_LOCKED" "$PHASE4_FRESH_B_LOCKED"
+printf '[PASS] Phase 4 persisted restart: tip=%s, both names Active, pending metadata empty\n' \
+    "$PHASE4_PERSISTED_HEIGHT"
+printf '[PASS] Phase 4 fresh recovery: account indexes 0/1, activation birthday=%s, both names Active, both locks reconstructed\n' \
+    "$COPPICE_ACTIVATION_HEIGHT"

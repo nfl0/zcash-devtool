@@ -22,7 +22,7 @@ use uuid::Uuid;
 use zcash_address::ZcashAddress;
 use zcash_client_backend::{
     data_api::{
-        Account, InputSource,
+        Account, InputSource, WalletRead,
         wallet::{
             ConfirmationsPolicy, LockRequest, SpendingKeys, TargetHeight,
             create_proposed_transactions,
@@ -249,8 +249,26 @@ impl Protection {
 impl Status {
     fn run(self, wallet_dir: Option<String>) -> anyhow::Result<()> {
         let config = WalletConfig::read(wallet_dir.as_ref())?;
-        let mode = crate::coppice_support::protection_mode(&config.network(), wallet_dir.as_ref())?;
-        let state = crate::coppice_support::load_existing(&config.network(), wallet_dir.as_ref())?;
+        let params = config.network();
+        let mode = crate::coppice_support::protection_mode(&params, wallet_dir.as_ref())?;
+        let (_, db_path) = get_db_paths(wallet_dir.as_ref());
+        let db = WalletDb::for_path(db_path, params, (), ())?;
+        let mut wallet_accounts = Vec::new();
+        for account_id in db.get_account_ids()? {
+            let account = db
+                .get_account(account_id)?
+                .ok_or_else(|| anyhow!("wallet account disappeared during Coppice status"))?;
+            let wallet_account_id = account
+                .ufvk()
+                .and_then(|ufvk| ufvk.orchard())
+                .map(|fvk| hex::encode(WalletAccountId::from_orchard_fvk(fvk).to_bytes()));
+            wallet_accounts.push(serde_json::json!({
+                "account_uuid": account.id().expose_uuid().to_string(),
+                "name": account.name(),
+                "wallet_account_id": wallet_account_id,
+            }));
+        }
+        let state = crate::coppice_support::load_existing(&params, wallet_dir.as_ref())?;
         let output = match state {
             Some((_, reducer, pending)) => serde_json::json!({
                 "protection": format!("{mode:?}"),
@@ -258,16 +276,21 @@ impl Status {
                 "tip_hash": hex::encode(reducer.tip().block_hash),
                 "names": reducer.state().names.len(),
                 "pending_protocol_commits": reducer.state().pending.len(),
+                "wallet_accounts": wallet_accounts,
                 "local_registrations": pending.commitments().map(|commitment| {
                     let registration = pending.get(&commitment).expect("enumerated commitment exists");
                     serde_json::json!({
                         "commitment": hex::encode(commitment),
                         "name": registration.name(),
+                        "account_id": hex::encode(registration.account_id().to_bytes()),
                         "stage": format!("{:?}", registration_stage(registration)),
                     })
                 }).collect::<Vec<_>>(),
             }),
-            None => serde_json::json!({ "protection": format!("{mode:?}") }),
+            None => serde_json::json!({
+                "protection": format!("{mode:?}"),
+                "wallet_accounts": wallet_accounts,
+            }),
         };
         println!("{}", serde_json::to_string_pretty(&output)?);
         Ok(())
@@ -702,6 +725,16 @@ fn lifecycle_remove(
         .cloned()
         .ok_or_else(|| anyhow!("selected account has no Orchard full viewing key"))?;
     let (_, reducer, mut pending) = require_coppice(&params, wallet_dir.as_ref())?;
+    let commitment = hex32(commitment)?;
+    let selected_wallet_account_id = WalletAccountId::from_orchard_fvk(&orchard_fvk);
+    let pending_registration = pending
+        .get(&commitment)
+        .ok_or_else(|| anyhow!("unknown Coppice registration commitment"))?;
+    if pending_registration.account_id() != selected_wallet_account_id {
+        return Err(anyhow!(
+            "selected wallet account does not own the Coppice registration"
+        ));
+    }
     let host = crate::coppice_support::wallet_tip(&db)?;
     let mut backend = WalletCoppiceLockBackend::new(
         &mut db,
@@ -710,7 +743,6 @@ fn lifecycle_remove(
         &orchard_fvk,
         IronwoodViewingCapability::FullViewing,
     );
-    let commitment = hex32(commitment)?;
     if complete {
         complete_registration(
             &host,
