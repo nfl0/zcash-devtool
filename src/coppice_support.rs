@@ -13,7 +13,7 @@ use std::{
 
 use ::coppice::{
     bond_tag,
-    config::{DeploymentParameters, REGTEST_V0, TESTNET_V0},
+    config::{DeploymentParameters, REGTEST, TESTNET},
     reducer::{ActivationCheckpoint, Reducer},
 };
 use anyhow::{Context, anyhow};
@@ -181,8 +181,8 @@ impl FullTransactionSource for LightwalletdFullTransactionSource {
 
 pub(crate) fn deployment<P: Parameters>(params: &P) -> anyhow::Result<DeploymentParameters> {
     let frozen = match params.network_type() {
-        NetworkType::Test => TESTNET_V0,
-        NetworkType::Regtest => REGTEST_V0,
+        NetworkType::Test => TESTNET,
+        NetworkType::Regtest => REGTEST,
         NetworkType::Main => return Err(anyhow!("Coppice v1 has no Mainnet deployment")),
     };
     Ok(DeploymentParameters {
