@@ -7,6 +7,8 @@ IFS=$'\n\t'
 # extends that same stack with the live Coppice lifecycle and shallow reorg;
 # Phase 3 checks fresh same-seed recovery; Phase 4 checks account isolation;
 # Phase 5 attacks every wallet-backed Ironwood spend boundary and protection mode.
+# Phase 6 dispatches to the deterministic Coppice/coppice-librustzcash deep
+# reorg qualification and deliberately does not launch the live stack.
 # Every node, database, wallet, and log is disposable and lives below one
 # run-specific directory under /tmp.
 
@@ -16,7 +18,8 @@ Usage: live-qualification.sh [--phase N] [--keep-state]
        live-qualification.sh --resume RUN_DIR --phase 5 [--keep-state]
 
 Options:
-  --phase N       Run a fresh stack through phase N (1-5). The default is 5.
+  --phase N       Run a fresh stack through phase N (1-5), or run the
+                  deterministic Phase 6 qualification. The default is 5.
   --resume DIR   Reuse a Phase 4 checkpoint and run only Phase 5. The directory
                   must have been produced with --phase 4 --keep-state.
   --keep-state   Preserve the disposable run directory after success. This is
@@ -27,6 +30,7 @@ Examples:
   ./scripts/live-qualification.sh --phase 1
   ./scripts/live-qualification.sh --phase 4 --keep-state
   ./scripts/live-qualification.sh --resume /tmp/coppice-live-qualification.X --phase 5
+  ./scripts/live-qualification.sh --phase 6
 EOF
 }
 
@@ -63,8 +67,8 @@ while (($# > 0)); do
     esac
 done
 
-[[ "$TARGET_PHASE" =~ ^[1-5]$ ]] || {
-    printf '[FAIL] --phase must be an integer from 1 through 5\n' >&2
+[[ "$TARGET_PHASE" =~ ^[1-6]$ ]] || {
+    printf '[FAIL] --phase must be an integer from 1 through 6\n' >&2
     exit 2
 }
 if [[ -n "$RESUME_DIR" ]]; then
@@ -88,6 +92,19 @@ fi
 
 SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)"
 ROOT_DIR="$(CDPATH= cd -- "$SCRIPT_DIR/../.." && pwd -P)"
+
+if [[ "$TARGET_PHASE" == 6 ]]; then
+    [[ -z "$RESUME_DIR" ]] || {
+        printf '[FAIL] Phase 6 is deterministic and does not accept --resume\n' >&2
+        exit 2
+    }
+    PHASE6_ARGS=()
+    if (( KEEP_STATE == 1 )); then
+        PHASE6_ARGS+=(--keep-state)
+    fi
+    exec "$SCRIPT_DIR/phase6-deep-reorg.sh" "${PHASE6_ARGS[@]}"
+fi
+
 BIN_DIR="$ROOT_DIR/bin"
 ZAKURA_BIN="$BIN_DIR/zakurad"
 ZAINO_BIN="$BIN_DIR/zainod"

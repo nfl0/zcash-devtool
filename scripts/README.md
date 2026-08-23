@@ -85,9 +85,24 @@ only Phase 5 on later runs:
 ```
 
 The first command prints the actual run directory and the exact resume command.
-The default invocation still runs all five phases. Phase 5 cannot be resumed
+The default invocation still runs all five live phases. Phase 5 cannot be resumed
 from a Phase 1–3 checkpoint because its adversarial fixture depends on the
 canonical two-account state produced by Phase 4.
+
+Phase 6 is intentionally separate from the live stack. It constructs a
+deterministic Coppice/coppice-librustzcash chain, exercises the 121-block
+retention horizon with a 15-block retained fork and a deeper 135-block fork,
+verifies the rebuild signal and atomicity, compares replacement replay with an
+independent clean replay, and reconstructs only Active-bond locks:
+
+```sh
+./zcash-devtool/scripts/live-qualification.sh --phase 6
+```
+
+It does not launch Zakura or Zaino and does not manufacture a large live
+Regtest reorganization. Failed Phase 6 logs are preserved under
+`/tmp/coppice-phase6-deep-reorg.*`; use `--keep-state` to preserve them after
+success.
 
 The harness creates an isolated disposable Regtest stack and runs:
 
@@ -103,6 +118,10 @@ The harness creates an isolated disposable Regtest stack and runs:
 - Phase 5: adversarial wallet/PCZT spend-path rejection under Enabled and
   GuardOnly, exact-owner Break Bond, Off-mode lock cleanup, foreign-lock
   preservation, and an unsynchronized ordinary Off-mode send.
+
+The separate Phase 6 entry point runs deterministic retained reorg, deep-fork
+`NeedsRebuild`-equivalent signaling, activation-checkpoint rebuild equivalence,
+and post-rebuild bond lock reconstruction.
 
 On success, temporary state and logs are removed. On failure, the run directory
 under `/tmp/coppice-live-qualification.*` is preserved and printed so the
