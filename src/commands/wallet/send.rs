@@ -37,8 +37,7 @@ use crate::{
     remote::ConnectionArgs, ui::proposal::print_proposal,
 };
 use coppice_librustzcash::{
-    CoppiceProtectionMode, IronwoodViewingCapability, WalletCoppiceLockBackend,
-    with_coppice_spend_guard,
+    IronwoodViewingCapability, WalletCoppiceLockBackend, with_coppice_spend_guard,
 };
 
 // Options accepted for the `send` command
@@ -229,7 +228,7 @@ pub(crate) async fn pay<C: PaymentContext>(
     let input_selector = GreedyInputSelector::new();
 
     let spend_policy = SpendPolicy::default();
-    let proposal = if let Some((reducer, pending)) =
+    let proposal = if let Some((protection_mode, reducer, pending)) =
         crate::coppice_support::load_existing(&params, wallet_dir.as_ref())?
     {
         let host_tip = crate::coppice_support::wallet_tip(&db_data)?;
@@ -251,7 +250,7 @@ pub(crate) async fn pay<C: PaymentContext>(
             IronwoodViewingCapability::FullViewing,
         );
         let (proposal, _) = with_coppice_spend_guard(
-            CoppiceProtectionMode::Enabled,
+            protection_mode,
             &host_tip,
             &reducer,
             &pending,

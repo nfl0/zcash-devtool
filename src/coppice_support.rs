@@ -17,22 +17,52 @@ use ::coppice::{
 };
 use anyhow::{Context, anyhow};
 use coppice_librustzcash::{
-    CanonicalBlockSource, CanonicalTip, FullTransactionSource, HostCanonicalTipSource,
-    PendingRegistrationCollection, ReconcileOutcome, WalletCanonicalTip, observe_canonical_commit,
-    reconcile_canonical_chain,
+    CanonicalBlockSource, CanonicalTip, CoppiceProtectionMode, FullTransactionSource,
+    HostCanonicalTipSource, IronwoodViewingCapability, PendingRegistrationCollection,
+    ReconcileError, ReconcileOutcome, WalletCanonicalTip, WalletCoppiceLockBackend,
+    active_canonical_bond_tags, reconcile_canonical_chain_with_progress,
+    reconcile_canonical_commit_cache, reconcile_locks, with_coppice_spend_guard,
 };
+use rand::rngs::OsRng;
+use serde::{Deserialize, Serialize};
 use tonic::{Code, transport::Channel};
-use zcash_client_backend::data_api::WalletRead;
+use zcash_client_backend::data_api::{Account, WalletRead, wallet::TargetHeight};
 use zcash_client_backend::proto::{
     compact_formats::CompactBlock,
     service::{self, compact_tx_streamer_client::CompactTxStreamerClient},
 };
+use zcash_client_sqlite::{WalletDb, util::SystemClock};
 use zcash_protocol::consensus::{NetworkType, Parameters};
 
 use crate::data::DEFAULT_WALLET_DIR;
 
 const SNAPSHOT_FILE: &str = "coppice-v1.json";
 const PENDING_FILE: &str = "coppice-pending-v1.json";
+const PROTECTION_FILE: &str = "coppice-protection.json";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum StoredProtectionMode {
+    Enabled,
+    GuardOnly,
+    Off,
+}
+
+impl StoredProtectionMode {
+    pub(crate) fn runtime(self) -> CoppiceProtectionMode {
+        match self {
+            Self::Enabled => CoppiceProtectionMode::Enabled,
+            Self::GuardOnly => CoppiceProtectionMode::GuardOnly,
+            Self::Off => CoppiceProtectionMode::Off,
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct StoredProtection {
+    format_version: u32,
+    mode: StoredProtectionMode,
+}
 
 #[derive(Clone, Copy)]
 pub(crate) struct StaticCanonicalTip(pub(crate) WalletCanonicalTip);
@@ -170,18 +200,77 @@ fn pending_path(wallet_dir: Option<&String>) -> PathBuf {
     Path::new(wallet_dir.map(String::as_str).unwrap_or(DEFAULT_WALLET_DIR)).join(PENDING_FILE)
 }
 
+fn protection_path(wallet_dir: Option<&String>) -> PathBuf {
+    Path::new(wallet_dir.map(String::as_str).unwrap_or(DEFAULT_WALLET_DIR)).join(PROTECTION_FILE)
+}
+
+pub(crate) fn protection_mode<P: Parameters>(
+    params: &P,
+    wallet_dir: Option<&String>,
+) -> anyhow::Result<StoredProtectionMode> {
+    match fs::read(protection_path(wallet_dir)) {
+        Ok(bytes) => {
+            let stored: StoredProtection =
+                serde_json::from_slice(&bytes).context("invalid Coppice protection setting")?;
+            if stored.format_version != 1 {
+                return Err(anyhow!("unsupported Coppice protection setting format"));
+            }
+            Ok(stored.mode)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Ok(if params.network_type() == NetworkType::Main {
+                StoredProtectionMode::Off
+            } else {
+                // Existing Testnet/Regtest wallets fail closed. Deliberate Off
+                // must be persisted explicitly and cannot be inferred from a
+                // missing reducer snapshot.
+                StoredProtectionMode::Enabled
+            })
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+pub(crate) fn set_protection_mode(
+    wallet_dir: Option<&String>,
+    mode: StoredProtectionMode,
+) -> anyhow::Result<()> {
+    let path = protection_path(wallet_dir);
+    let temporary = path.with_extension("json.tmp");
+    let bytes = serde_json::to_vec(&StoredProtection {
+        format_version: 1,
+        mode,
+    })?;
+    let mut file = fs::File::create(&temporary)?;
+    file.write_all(&bytes)?;
+    file.sync_all()?;
+    fs::rename(temporary, path)?;
+    Ok(())
+}
+
 pub(crate) fn load_existing<P: Parameters>(
     params: &P,
     wallet_dir: Option<&String>,
-) -> anyhow::Result<Option<(V1Reducer, PendingRegistrationCollection)>> {
-    if params.network_type() == NetworkType::Main {
+) -> anyhow::Result<
+    Option<(
+        CoppiceProtectionMode,
+        V1Reducer,
+        PendingRegistrationCollection,
+    )>,
+> {
+    let mode = protection_mode(params, wallet_dir)?;
+    if mode == StoredProtectionMode::Off {
         return Ok(None);
     }
     let deployment = deployment(params)?;
     let reducer = match fs::read(snapshot_path(wallet_dir)) {
         Ok(bytes) => V1Reducer::load_snapshot(deployment.clone(), &bytes)
             .map_err(|error| anyhow!("invalid Coppice snapshot: {error:?}"))?,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(anyhow!(
+                "Coppice protection is active but canonical state is unavailable; sync/rebuild is required"
+            ));
+        }
         Err(error) => return Err(error.into()),
     };
     let pending = match fs::read(pending_path(wallet_dir)) {
@@ -192,7 +281,96 @@ pub(crate) fn load_existing<P: Parameters>(
         }
         Err(error) => return Err(error.into()),
     };
-    Ok(Some((reducer, pending)))
+    Ok(Some((mode.runtime(), reducer, pending)))
+}
+
+pub(crate) fn reconcile_wallet_locks<P: Parameters + Clone>(
+    reducer: &V1Reducer,
+    pending: &PendingRegistrationCollection,
+    wallet_db: &mut WalletDb<rusqlite::Connection, P, SystemClock, OsRng>,
+) -> anyhow::Result<()> {
+    let host_tip = wallet_tip(wallet_db)?;
+    if host_tip.0 != WalletCanonicalTip::from(reducer.tip()) {
+        return Err(anyhow!(
+            "wallet and Coppice canonical tips differ after sync"
+        ));
+    }
+    let target = reducer
+        .tip()
+        .height
+        .checked_add(1)
+        .ok_or_else(|| anyhow!("Coppice target height overflow"))?;
+    let active = active_canonical_bond_tags(reducer);
+    for account_id in wallet_db
+        .get_account_ids()
+        .map_err(|error| anyhow!("wallet account inventory failed: {error:?}"))?
+    {
+        let account = wallet_db
+            .get_account(account_id)
+            .map_err(|error| anyhow!("wallet account lookup failed: {error:?}"))?
+            .ok_or_else(|| anyhow!("wallet account disappeared during lock reconciliation"))?;
+        let Some(orchard_fvk) = account.ufvk().and_then(|ufvk| ufvk.orchard()).cloned() else {
+            continue;
+        };
+        let mut backend = WalletCoppiceLockBackend::new(
+            wallet_db,
+            account_id,
+            TargetHeight::from(target),
+            &orchard_fvk,
+            IronwoodViewingCapability::FullViewing,
+        );
+        reconcile_locks(
+            &active,
+            pending,
+            IronwoodViewingCapability::FullViewing,
+            &mut backend,
+        )
+        .map_err(|error| anyhow!("Coppice lock reconstruction failed: {error:?}"))?;
+    }
+    Ok(())
+}
+
+pub(crate) fn with_spend_protection<P, R, E>(
+    params: &P,
+    wallet_dir: Option<&String>,
+    wallet_db: &mut WalletDb<rusqlite::Connection, P, SystemClock, OsRng>,
+    account_id: zcash_client_sqlite::AccountUuid,
+    orchard_fvk: &orchard::keys::FullViewingKey,
+    operation: impl FnOnce(&mut WalletDb<rusqlite::Connection, P, SystemClock, OsRng>) -> Result<R, E>,
+) -> anyhow::Result<Result<R, E>>
+where
+    P: Parameters + Clone,
+    E: std::fmt::Debug,
+{
+    match load_existing(params, wallet_dir)? {
+        None => Ok(operation(wallet_db)),
+        Some((mode, reducer, pending)) => {
+            let host_tip = wallet_tip(wallet_db)?;
+            let target = reducer
+                .tip()
+                .height
+                .checked_add(1)
+                .ok_or_else(|| anyhow!("Coppice target height overflow"))?;
+            let mut backend = WalletCoppiceLockBackend::new(
+                wallet_db,
+                account_id,
+                TargetHeight::from(target),
+                orchard_fvk,
+                IronwoodViewingCapability::FullViewing,
+            );
+            let (result, _) = with_coppice_spend_guard(
+                mode,
+                &host_tip,
+                &reducer,
+                &pending,
+                IronwoodViewingCapability::FullViewing,
+                &mut backend,
+                |backend| operation(backend.wallet_db_mut()),
+            )
+            .map_err(|error| anyhow!("Coppice spend protection failed: {error:?}"))?;
+            Ok(result)
+        }
+    }
 }
 
 pub(crate) fn persist_pending(
@@ -293,6 +471,10 @@ pub(crate) async fn reconcile<P: Parameters>(
     if params.network_type() == NetworkType::Main {
         return Ok(None);
     }
+    let mode = protection_mode(params, wallet_dir)?;
+    if mode == StoredProtectionMode::Off {
+        return Ok(None);
+    }
     let deployment = deployment(params)?;
     let host_tip = client
         .get_latest_block(service::ChainSpec::default())
@@ -303,10 +485,18 @@ pub(crate) async fn reconcile<P: Parameters>(
     }
     let path = snapshot_path(wallet_dir);
     let mut reducer = match fs::read(&path) {
-        Ok(bytes) => V1Reducer::load_snapshot(deployment.clone(), &bytes)
-            .map_err(|error| anyhow!("invalid Coppice snapshot: {error:?}"))?,
+        Ok(bytes) => match V1Reducer::load_snapshot(deployment.clone(), &bytes) {
+            Ok(reducer) => reducer,
+            Err(error) => {
+                tracing::warn!(
+                    ?error,
+                    "Coppice snapshot unusable; rebuilding from activation"
+                );
+                initial_reducer(params, client, deployment.clone()).await?
+            }
+        },
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            initial_reducer(params, client, deployment).await?
+            initial_reducer(params, client, deployment.clone()).await?
         }
         Err(error) => return Err(error.into()),
     };
@@ -317,9 +507,47 @@ pub(crate) async fn reconcile<P: Parameters>(
     let mut transactions = LightwalletdFullTransactionSource {
         client: client.clone(),
     };
+    let mut persistence_error = None;
+    let mut outcome = reconcile_canonical_chain_with_progress(
+        params,
+        &mut reducer,
+        &mut canonical,
+        &mut transactions,
+        |progress| match persist_snapshot(&path, progress) {
+            Ok(()) => true,
+            Err(error) => {
+                persistence_error = Some(error);
+                false
+            }
+        },
+    );
+    if matches!(outcome, Err(ReconcileError::NoRetainedCommonAncestor)) {
+        reducer = initial_reducer(params, client, deployment.clone()).await?;
+        canonical = LightwalletdCanonicalSource {
+            client: client.clone(),
+        };
+        transactions = LightwalletdFullTransactionSource {
+            client: client.clone(),
+        };
+        outcome = reconcile_canonical_chain_with_progress(
+            params,
+            &mut reducer,
+            &mut canonical,
+            &mut transactions,
+            |progress| match persist_snapshot(&path, progress) {
+                Ok(()) => true,
+                Err(error) => {
+                    persistence_error = Some(error);
+                    false
+                }
+            },
+        );
+    }
+    if let Some(error) = persistence_error {
+        return Err(error.context("persisting incremental Coppice replay progress"));
+    }
     let outcome =
-        reconcile_canonical_chain(params, &mut reducer, &mut canonical, &mut transactions)
-            .map_err(|error| anyhow!("Coppice canonical reconciliation failed: {error:?}"))?;
+        outcome.map_err(|error| anyhow!("Coppice canonical reconciliation failed: {error:?}"))?;
     persist_snapshot(&path, &reducer)?;
     let mut pending = match fs::read(pending_path(wallet_dir)) {
         Ok(bytes) => PendingRegistrationCollection::load_local(reducer.deployment(), &bytes)
@@ -329,15 +557,9 @@ pub(crate) async fn reconcile<P: Parameters>(
         }
         Err(error) => return Err(error.into()),
     };
-    let host_tip = StaticCanonicalTip(WalletCanonicalTip::from(reducer.tip()));
-    let commitments = pending.commitments().collect::<Vec<_>>();
-    for commitment in commitments {
-        if reducer.state().pending.contains_key(&commitment) {
-            observe_canonical_commit(&host_tip, &reducer, &mut pending, &commitment).map_err(
-                |error| anyhow!("Coppice canonical COMMIT observation failed: {error:?}"),
-            )?;
-        }
-    }
+    reconcile_canonical_commit_cache(&reducer, &mut pending)
+        .map_err(|error| anyhow!("Coppice canonical COMMIT cache failed: {error:?}"))?;
     persist_pending(wallet_dir, reducer.deployment(), &pending)?;
+    set_protection_mode(wallet_dir, mode)?;
     Ok(Some(outcome))
 }

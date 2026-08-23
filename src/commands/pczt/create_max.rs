@@ -65,6 +65,11 @@ impl Command {
         let (_, db_data) = get_db_paths(wallet_dir.as_ref());
         let mut db_data = WalletDb::for_path(db_data, params, SystemClock, OsRng)?;
         let account = select_account(&db_data, self.account_id)?;
+        let orchard_fvk = account
+            .ufvk()
+            .and_then(|ufvk| ufvk.orchard())
+            .cloned()
+            .ok_or_else(|| anyhow!("selected account has no Orchard full viewing key"))?;
 
         let recipient =
             ZcashAddress::from_str(&self.address).map_err(|_| error::Error::InvalidRecipient)?;
@@ -80,23 +85,35 @@ impl Command {
         };
 
         // Create the PCZT.
-        let proposal = propose_send_max_transfer(
-            &mut db_data,
+        let proposal = crate::coppice_support::with_spend_protection(
             &params,
+            wallet_dir.as_ref(),
+            &mut db_data,
             account.id(),
-            &[
-                ShieldedPool::Sapling,
-                ShieldedPool::Orchard,
-                ShieldedPool::Ironwood,
-            ],
-            &StandardFeeRule::Zip317,
-            recipient,
-            memo,
-            mode,
-            ConfirmationsPolicy::new_symmetrical(NonZeroU32::new(1).expect("one is nonzero"), true),
-            &LockedInputPolicy::Exclude,
-            None,
-        )
+            &orchard_fvk,
+            |db| {
+                propose_send_max_transfer(
+                    db,
+                    &params,
+                    account.id(),
+                    &[
+                        ShieldedPool::Sapling,
+                        ShieldedPool::Orchard,
+                        ShieldedPool::Ironwood,
+                    ],
+                    &StandardFeeRule::Zip317,
+                    recipient,
+                    memo,
+                    mode,
+                    ConfirmationsPolicy::new_symmetrical(
+                        NonZeroU32::new(1).expect("one is nonzero"),
+                        true,
+                    ),
+                    &LockedInputPolicy::Exclude,
+                    None,
+                )
+            },
+        )?
         .map_err(error::Error::SendMax)?;
 
         let pczt = create_pczt_from_proposal(

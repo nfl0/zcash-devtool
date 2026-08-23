@@ -70,6 +70,11 @@ impl Command {
             ),
         );
         let input_selector = GreedyInputSelector::new();
+        let orchard_fvk = account
+            .ufvk()
+            .and_then(|ufvk| ufvk.orchard())
+            .cloned()
+            .ok_or_else(|| anyhow!("selected account has no Orchard full viewing key"))?;
 
         let request = TransactionRequest::new(vec![Payment::without_memo(
             ZcashAddress::from_str(&self.address).map_err(|_| error::Error::InvalidRecipient)?,
@@ -77,20 +82,27 @@ impl Command {
         )])
         .map_err(error::Error::from)?;
 
-        let proposal = propose_transfer(
-            &mut db_data,
+        let proposal = crate::coppice_support::with_spend_protection(
             &params,
+            wallet_dir.as_ref(),
+            &mut db_data,
             account.id(),
-            &input_selector,
-            &change_strategy,
-            request,
-            ConfirmationsPolicy::default(),
-            // Preserve the pre-upgrade behavior: transfers never spend
-            // transparent UTXOs; they must be shielded first.
-            &SpendPolicy::default(),
-            None,
-            None,
-        )
+            &orchard_fvk,
+            |db| {
+                propose_transfer(
+                    db,
+                    &params,
+                    account.id(),
+                    &input_selector,
+                    &change_strategy,
+                    request,
+                    ConfirmationsPolicy::default(),
+                    &SpendPolicy::default(),
+                    None,
+                    None,
+                )
+            },
+        )?
         .map_err(error::Error::from)?;
 
         // Display the proposal
