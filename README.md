@@ -70,6 +70,9 @@ RUST_LOG=debug cargo run --release -- wallet -w <wallet_dir> <command>
 
 ## Coppice wallet integration
 
+The configured Coppice Testnet and Regtest values are qualification/development
+parameters; no public Coppice Testnet or Mainnet deployment has been announced.
+
 Testnet and regtest wallets default to fail-closed Coppice protection. A
 missing, corrupt, or stale Coppice snapshot is not interpreted as an opt-out:
 ordinary sends and PCZT proposal creation remain blocked until `wallet sync`

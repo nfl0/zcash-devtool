@@ -124,7 +124,7 @@ PHASE5_NAME_PENDING="phase5-pending"
 COPPICE_BOND_VALUE=100000000
 PHASE4_ACCOUNT_FUNDING_VALUE=400000000
 PHASE5_PENDING_FUNDING_VALUE=150000000
-# Coppice Regtest activation in the pinned Coppice deployment.
+# Coppice Regtest qualification activation height in the pinned parameters.
 COPPICE_ACTIVATION_HEIGHT=10
 
 # Disposable BIP-39 zero-entropy test mnemonic (23 x "abandon" + "art").
