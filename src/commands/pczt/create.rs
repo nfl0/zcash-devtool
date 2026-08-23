@@ -149,6 +149,12 @@ impl Command {
         )
         .map_err(error::Error::from)?;
 
+        crate::coppice_support::ensure_external_pczt_respects_coppice(
+            &params,
+            wallet_dir.as_ref(),
+            &pczt,
+        )?;
+
         let pczt_bytes = pczt
             .serialize()
             .map_err(|e| anyhow!("Failed to serialize PCZT: {:?}", e))?;

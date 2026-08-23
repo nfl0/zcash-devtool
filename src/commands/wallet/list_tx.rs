@@ -75,7 +75,10 @@ impl Command {
                 received_note_count,
                 memo_count,
                 block_time,
-                expired_unmined,
+                -- The upstream wallet view can yield NULL when an unmined
+                -- transaction has no expiry height. Treat that as false;
+                -- the CLI field is a boolean, not tri-state.
+                COALESCE(expired_unmined, 0) AS expired_unmined,
                 -- Fallback order for transaction history ordering:
                 COALESCE(
                     -- Block height the transaction was mined at (if mined and known).

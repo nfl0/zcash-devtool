@@ -68,6 +68,27 @@ After a successful build:
 ./zcash-devtool/scripts/live-qualification.sh
 ```
 
+For a shorter targeted run, stop after a requested phase:
+
+```sh
+./zcash-devtool/scripts/live-qualification.sh --phase 1
+./zcash-devtool/scripts/live-qualification.sh --phase 2
+```
+
+When iterating on Phase 5, preserve the Phase 4 checkpoint once, then resume
+only Phase 5 on later runs:
+
+```sh
+./zcash-devtool/scripts/live-qualification.sh --phase 4 --keep-state
+./zcash-devtool/scripts/live-qualification.sh \
+  --resume /tmp/coppice-live-qualification.XXXXXX --phase 5
+```
+
+The first command prints the actual run directory and the exact resume command.
+The default invocation still runs all five phases. Phase 5 cannot be resumed
+from a Phase 1–3 checkpoint because its adversarial fixture depends on the
+canonical two-account state produced by Phase 4.
+
 The harness creates an isolated disposable Regtest stack and runs:
 
 - Phase 1: Ironwood `GetSubtreeRoots`, wallet sync, and an ordinary Ironwood
@@ -79,6 +100,9 @@ The harness creates an isolated disposable Regtest stack and runs:
   and fresh-wallet Break Bond.
 - Phase 4: same-seed multi-account registration and lock isolation, persisted
   restart recovery, and fresh two-account recovery.
+- Phase 5: adversarial wallet/PCZT spend-path rejection under Enabled and
+  GuardOnly, exact-owner Break Bond, Off-mode lock cleanup, foreign-lock
+  preservation, and an unsynchronized ordinary Off-mode send.
 
 On success, temporary state and logs are removed. On failure, the run directory
 under `/tmp/coppice-live-qualification.*` is preserved and printed so the

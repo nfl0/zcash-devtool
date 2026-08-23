@@ -215,7 +215,7 @@ fn main() -> Result<(), anyhow::Error> {
                 commands::pczt::Command::Sign(command) => command.run(wallet_dir).await,
                 commands::pczt::Command::UpdateWithSignature(command) => command.run().await,
                 commands::pczt::Command::Combine(command) => command.run().await,
-                commands::pczt::Command::Extract(command) => command.run().await,
+                commands::pczt::Command::Extract(command) => command.run(wallet_dir).await,
                 commands::pczt::Command::Send(command) => command.run(wallet_dir).await,
                 commands::pczt::Command::SendWithoutStoring(command) => {
                     command.run(wallet_dir).await

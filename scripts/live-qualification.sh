@@ -5,9 +5,86 @@ IFS=$'\n\t'
 
 # Phase 1 qualifies the local Zakura -> Zaino -> zcash-devtool plumbing; Phase 2
 # extends that same stack with the live Coppice lifecycle and shallow reorg;
-# Phase 3 checks fresh same-seed recovery; Phase 4 checks account isolation.
+# Phase 3 checks fresh same-seed recovery; Phase 4 checks account isolation;
+# Phase 5 attacks every wallet-backed Ironwood spend boundary and protection mode.
 # Every node, database, wallet, and log is disposable and lives below one
 # run-specific directory under /tmp.
+
+usage() {
+    cat <<'EOF'
+Usage: live-qualification.sh [--phase N] [--keep-state]
+       live-qualification.sh --resume RUN_DIR --phase 5 [--keep-state]
+
+Options:
+  --phase N       Run a fresh stack through phase N (1-5). The default is 5.
+  --resume DIR   Reuse a Phase 4 checkpoint and run only Phase 5. The directory
+                  must have been produced with --phase 4 --keep-state.
+  --keep-state   Preserve the disposable run directory after success. This is
+                  required when creating a checkpoint for --resume.
+  -h, --help     Show this help.
+
+Examples:
+  ./scripts/live-qualification.sh --phase 1
+  ./scripts/live-qualification.sh --phase 4 --keep-state
+  ./scripts/live-qualification.sh --resume /tmp/coppice-live-qualification.X --phase 5
+EOF
+}
+
+TARGET_PHASE=5
+RESUME_DIR=""
+KEEP_STATE=0
+PHASE_ARGUMENT_GIVEN=0
+while (($# > 0)); do
+    case "$1" in
+        --phase|--through)
+            (($# >= 2)) || { usage >&2; exit 2; }
+            TARGET_PHASE=$2
+            PHASE_ARGUMENT_GIVEN=1
+            shift 2
+            ;;
+        --resume)
+            (($# >= 2)) || { usage >&2; exit 2; }
+            RESUME_DIR=$2
+            shift 2
+            ;;
+        --keep-state)
+            KEEP_STATE=1
+            shift
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        *)
+            printf '[FAIL] unknown option: %s\n' "$1" >&2
+            usage >&2
+            exit 2
+            ;;
+    esac
+done
+
+[[ "$TARGET_PHASE" =~ ^[1-5]$ ]] || {
+    printf '[FAIL] --phase must be an integer from 1 through 5\n' >&2
+    exit 2
+}
+if [[ -n "$RESUME_DIR" ]]; then
+    (( PHASE_ARGUMENT_GIVEN == 1 )) || {
+        printf '[FAIL] --resume requires an explicit --phase 5\n' >&2
+        exit 2
+    }
+    [[ "$TARGET_PHASE" == 5 ]] || {
+        printf '[FAIL] --resume currently supports only --phase 5\n' >&2
+        exit 2
+    }
+    RESUME_DIR="$(CDPATH= cd -- "$RESUME_DIR" && pwd -P)"
+    [[ "$RESUME_DIR" == /tmp/coppice-live-qualification.* ]] || {
+        printf '[FAIL] --resume must point to a generated /tmp/coppice-live-qualification.* run\n' >&2
+        exit 2
+    }
+    START_PHASE=5
+else
+    START_PHASE=1
+fi
 
 SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)"
 ROOT_DIR="$(CDPATH= cd -- "$SCRIPT_DIR/../.." && pwd -P)"
@@ -26,8 +103,10 @@ COPPICE_NAME_ONE="phase2-alpha"
 COPPICE_NAME_TWO="phase2-beta"
 PHASE4_NAME_ONE="phase4-account-a"
 PHASE4_NAME_TWO="phase4-account-b"
+PHASE5_NAME_PENDING="phase5-pending"
 COPPICE_BOND_VALUE=100000000
 PHASE4_ACCOUNT_FUNDING_VALUE=400000000
+PHASE5_PENDING_FUNDING_VALUE=150000000
 # Coppice REGTEST_V0 activation in the pinned Coppice deployment.
 COPPICE_ACTIVATION_HEIGHT=10
 
@@ -38,7 +117,11 @@ WALLET_MNEMONIC="abandon abandon abandon abandon abandon abandon abandon abandon
 # destination for the pre-NU6.3 bootstrap Sapling coinbase note.
 SAPLING_DISCARD_MNEMONIC="abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about"
 
-WORK_DIR="$(mktemp -d /tmp/coppice-live-qualification.XXXXXX)"
+if [[ -n "$RESUME_DIR" ]]; then
+    WORK_DIR="$RESUME_DIR"
+else
+    WORK_DIR="$(mktemp -d /tmp/coppice-live-qualification.XXXXXX)"
+fi
 CONFIG_DIR="$WORK_DIR/config"
 STATE_DIR="$WORK_DIR/state"
 ZAKURA_STATE_DIR="$STATE_DIR/zakura"
@@ -46,16 +129,59 @@ ZAINO_STATE_DIR="$STATE_DIR/zaino"
 WALLET_DIR="$STATE_DIR/wallet"
 RECOVERY_WALLET_DIR="$STATE_DIR/recovery-wallet"
 PHASE4_RECOVERY_WALLET_DIR="$STATE_DIR/phase4-recovery-wallet"
-LOG_DIR="$WORK_DIR/logs"
-GRPC_DIR="$LOG_DIR/grpc"
+PHASE5_OFF_WALLET_DIR="$STATE_DIR/phase5-off-wallet"
+PHASE5_PCZT_DIR="$STATE_DIR/phase5-pczt"
 ZAKURA_CONFIG="$CONFIG_DIR/zakura.toml"
 ZAINO_CONFIG="$CONFIG_DIR/zaino.toml"
 ACTIVATION_FILE="$CONFIG_DIR/activation-heights.toml"
 IDENTITY_FILE="$WALLET_DIR/identity.txt"
 RECOVERY_IDENTITY_FILE="$RECOVERY_WALLET_DIR/identity.txt"
 PHASE4_RECOVERY_IDENTITY_FILE="$PHASE4_RECOVERY_WALLET_DIR/identity.txt"
+PHASE5_OFF_IDENTITY_FILE="$PHASE5_OFF_WALLET_DIR/identity.txt"
+PHASE4_CHECKPOINT="$WORK_DIR/phase4.env"
 
-mkdir -p "$CONFIG_DIR" "$ZAKURA_STATE_DIR" "$ZAINO_STATE_DIR" "$WALLET_DIR" "$LOG_DIR" "$GRPC_DIR"
+if [[ -n "$RESUME_DIR" ]]; then
+    [[ -d "$WORK_DIR" ]] || {
+        printf '[FAIL] resume run directory does not exist: %s\n' "$WORK_DIR" >&2
+        exit 1
+    }
+    [[ -f "$PHASE4_CHECKPOINT" ]] || {
+        printf '[FAIL] missing Phase 4 checkpoint: %s\n' "$PHASE4_CHECKPOINT" >&2
+        exit 1
+    }
+    # This file is written by this script and contains only shell-quoted
+    # deterministic wallet/account values needed by the Phase 5 continuation.
+    # shellcheck disable=SC1090
+    source "$PHASE4_CHECKPOINT"
+    for checkpoint_var in \
+        MINER_UA ACCOUNT_A_UUID ACCOUNT_B_UUID ACCOUNT_A_WALLET_ID \
+        ACCOUNT_B_WALLET_ID PHASE4_UA_ONE PHASE4_UA_TWO \
+        PHASE4_COMMITMENT_A PHASE4_COMMITMENT_B \
+        PHASE4_A_REVEAL_HEIGHT_EXPECTED PHASE4_B_REVEAL_HEIGHT_EXPECTED \
+        PHASE4_A_ACTIVE_LOCKED PHASE4_B_ACTIVE_LOCKED; do
+        [[ -n "${!checkpoint_var:-}" ]] || {
+            printf '[FAIL] checkpoint is missing %s\n' "$checkpoint_var" >&2
+            exit 1
+        }
+    done
+    for required_path in "$CONFIG_DIR" "$ZAKURA_STATE_DIR" "$ZAINO_STATE_DIR" \
+        "$WALLET_DIR" "$IDENTITY_FILE"; do
+        [[ -e "$required_path" ]] || {
+            printf '[FAIL] checkpoint path is missing: %s\n' "$required_path" >&2
+            exit 1
+        }
+    done
+fi
+
+if [[ -n "$RESUME_DIR" ]]; then
+    LOG_DIR="$WORK_DIR/logs/phase${TARGET_PHASE}-resume"
+else
+    LOG_DIR="$WORK_DIR/logs"
+fi
+GRPC_DIR="$LOG_DIR/grpc"
+
+mkdir -p "$CONFIG_DIR" "$ZAKURA_STATE_DIR" "$ZAINO_STATE_DIR" "$WALLET_DIR" \
+    "$PHASE5_PCZT_DIR" "$LOG_DIR" "$GRPC_DIR"
 umask 077
 
 ZAKURA_PID=""
@@ -81,9 +207,15 @@ cleanup() {
         wait "$ZAKURA_PID" 2>/dev/null || true
     fi
 
-    if (( status == 0 )); then
+    if (( status == 0 && KEEP_STATE == 0 )); then
         rm -rf -- "$WORK_DIR"
         printf '\n[CLEAN] removed %s\n' "$WORK_DIR"
+    elif (( status == 0 )); then
+        printf '\n[KEEP] preserved %s\n' "$WORK_DIR"
+        if [[ -f "$PHASE4_CHECKPOINT" ]]; then
+            printf '[KEEP] resume Phase 5 with: %q --resume %q --phase 5\n' \
+                "$0" "$WORK_DIR"
+        fi
     else
         printf '\n[FAIL] stage=%s exit=%d\n' "$CURRENT_STAGE" "$status" >&2
         printf '[FAIL] logs and disposable state preserved at %s\n' "$WORK_DIR" >&2
@@ -110,6 +242,41 @@ status() {
 die() {
     printf '[FAIL] %s\n' "$*" >&2
     exit 1
+}
+
+write_phase4_checkpoint() {
+    local checkpoint_tmp="$PHASE4_CHECKPOINT.tmp"
+
+    {
+        printf '# Generated by live-qualification.sh; do not edit.\n'
+        printf 'MINER_UA=%q\n' "$MINER_UA"
+        printf 'ACCOUNT_A_UUID=%q\n' "$ACCOUNT_A_UUID"
+        printf 'ACCOUNT_B_UUID=%q\n' "$ACCOUNT_B_UUID"
+        printf 'ACCOUNT_A_WALLET_ID=%q\n' "$ACCOUNT_A_WALLET_ID"
+        printf 'ACCOUNT_B_WALLET_ID=%q\n' "$ACCOUNT_B_WALLET_ID"
+        printf 'PHASE4_UA_ONE=%q\n' "$PHASE4_UA_ONE"
+        printf 'PHASE4_UA_TWO=%q\n' "$PHASE4_UA_TWO"
+        printf 'PHASE4_COMMITMENT_A=%q\n' "$PHASE4_COMMITMENT_A"
+        printf 'PHASE4_COMMITMENT_B=%q\n' "$PHASE4_COMMITMENT_B"
+        printf 'PHASE4_A_REVEAL_HEIGHT_EXPECTED=%q\n' \
+            "$PHASE4_A_REVEAL_HEIGHT_EXPECTED"
+        printf 'PHASE4_B_REVEAL_HEIGHT_EXPECTED=%q\n' \
+            "$PHASE4_B_REVEAL_HEIGHT_EXPECTED"
+        printf 'PHASE4_A_ACTIVE_LOCKED=%q\n' "$PHASE4_A_ACTIVE_LOCKED"
+        printf 'PHASE4_B_ACTIVE_LOCKED=%q\n' "$PHASE4_B_ACTIVE_LOCKED"
+    } >"$checkpoint_tmp"
+    mv -- "$checkpoint_tmp" "$PHASE4_CHECKPOINT"
+    printf '[OK] wrote Phase 4 continuation checkpoint %s\n' "$PHASE4_CHECKPOINT"
+}
+
+finish_phase_if_requested() {
+    local completed_phase=$1
+
+    if (( TARGET_PHASE == completed_phase )); then
+        printf '\n[PASS] requested qualification through Phase %s complete\n' \
+            "$completed_phase"
+        exit 0
+    fi
 }
 
 require_command() {
@@ -149,6 +316,46 @@ run_devtool_logged() {
     local label=$1
     shift
     run_logged "$label" timeout 240 "$DEVTOOL_BIN" "$@"
+}
+
+run_devtool_stdin_logged() {
+    local label=$1
+    local input=$2
+    shift 2
+    local output="$LOG_DIR/$label.log"
+
+    printf '[RUN]'
+    for arg in timeout 240 "$DEVTOOL_BIN" "$@"; do
+        printf ' %q' "$arg"
+    done
+    printf ' < %q\n' "$input"
+    if timeout 240 "$DEVTOOL_BIN" "$@" <"$input" >"$output" 2>&1; then
+        printf '[OK] %s\n' "$label"
+    else
+        local status=$?
+        printf '[FAIL] %s (exit %d); see %s\n' "$label" "$status" "$output" >&2
+        tail -80 "$output" >&2 || true
+        return "$status"
+    fi
+}
+
+run_devtool_stdin_expect_failure() {
+    local label=$1
+    local input=$2
+    shift 2
+    local output="$LOG_DIR/$label.log"
+
+    printf '[RUN]'
+    for arg in timeout 240 "$DEVTOOL_BIN" "$@"; do
+        printf ' %q' "$arg"
+    done
+    printf ' < %q\n' "$input"
+    if timeout 240 "$DEVTOOL_BIN" "$@" <"$input" >"$output" 2>&1; then
+        printf '[FAIL] %s unexpectedly succeeded; see %s\n' "$label" "$output" >&2
+        tail -80 "$output" >&2 || true
+        return 1
+    fi
+    printf '[PASS] %s failed as expected\n' "$label"
 }
 
 run_devtool_expect_failure() {
@@ -825,7 +1032,7 @@ Canopy = 1
 [state]
 cache_dir = "$ZAKURA_STATE_DIR/chain"
 ephemeral = false
-should_backup_non_finalized_state = false
+should_backup_non_finalized_state = true
 delete_old_database = true
 storage_mode = "archive"
 
@@ -848,7 +1055,7 @@ EOF
     cat >"$ZAINO_CONFIG" <<EOF
 backend = "rpc"
 zebra_db_path = "$ZAINO_STATE_DIR/zebra-db"
-ephemeral_finalised_state = true
+ephemeral_finalised_state = false
 network = "Regtest"
 
 [grpc_settings]
@@ -865,8 +1072,8 @@ path = "$ZAINO_STATE_DIR/database"
 EOF
 }
 
-status "Check Phase 1 prerequisites"
-for command in curl jq python3 rg timeout; do
+status "Check prerequisites for requested Phase $TARGET_PHASE"
+for command in curl jq python3 rg sha256sum timeout cargo; do
     require_command "$command"
 done
 require_executable "$ZAKURA_BIN"
@@ -875,32 +1082,37 @@ require_executable "$DEVTOOL_BIN"
 printf '[INFO] binaries: %s, %s, %s\n' "$ZAKURA_BIN" "$ZAINO_BIN" "$DEVTOOL_BIN"
 printf '[INFO] disposable run directory: %s\n' "$WORK_DIR"
 
-status "Derive the deterministic Regtest miner/wallet address"
-if "$DEVTOOL_BIN" wallet derive-address \
-    --mnemonic "$WALLET_MNEMONIC" --network regtest \
-    >"$LOG_DIR/derive-address.log" 2>&1; then
-    MINER_UA="$(sed -n 's/^Unified Address: //p' "$LOG_DIR/derive-address.log")"
-else
-    tail -80 "$LOG_DIR/derive-address.log" >&2 || true
-    die "could not derive the deterministic Regtest unified address"
-fi
-[[ -n "$MINER_UA" ]] || die "derive-address did not print a unified address"
-printf '[OK] derived unified miner address (%s characters)\n' "$(printf '%s' "$MINER_UA" | wc -c)"
+if [[ -z "$RESUME_DIR" ]]; then
+    status "Derive the deterministic Regtest miner/wallet address"
+    if "$DEVTOOL_BIN" wallet derive-address \
+        --mnemonic "$WALLET_MNEMONIC" --network regtest \
+        >"$LOG_DIR/derive-address.log" 2>&1; then
+        MINER_UA="$(sed -n 's/^Unified Address: //p' "$LOG_DIR/derive-address.log")"
+    else
+        tail -80 "$LOG_DIR/derive-address.log" >&2 || true
+        die "could not derive the deterministic Regtest unified address"
+    fi
+    [[ -n "$MINER_UA" ]] || die "derive-address did not print a unified address"
+    printf '[OK] derived unified miner address (%s characters)\n' \
+        "$(printf '%s' "$MINER_UA" | wc -c)"
 
-status "Derive a disposable external address for the bootstrap Sapling note"
-if "$DEVTOOL_BIN" wallet derive-address \
-    --mnemonic "$SAPLING_DISCARD_MNEMONIC" --network regtest \
-    >"$LOG_DIR/derive-sapling-discard-address.log" 2>&1; then
-    SAPLING_DISCARD_ADDRESS="$(sed -n 's/^Transparent Address: //p' \
-        "$LOG_DIR/derive-sapling-discard-address.log" | tail -1)"
+    status "Derive a disposable external address for the bootstrap Sapling note"
+    if "$DEVTOOL_BIN" wallet derive-address \
+        --mnemonic "$SAPLING_DISCARD_MNEMONIC" --network regtest \
+        >"$LOG_DIR/derive-sapling-discard-address.log" 2>&1; then
+        SAPLING_DISCARD_ADDRESS="$(sed -n 's/^Transparent Address: //p' \
+            "$LOG_DIR/derive-sapling-discard-address.log" | tail -1)"
+    else
+        tail -80 "$LOG_DIR/derive-sapling-discard-address.log" >&2 || true
+        die "could not derive the external Sapling-discard destination"
+    fi
+    [[ -n "$SAPLING_DISCARD_ADDRESS" ]] \
+        || die "derive-address did not print a transparent Sapling-discard destination"
+    printf '[OK] derived external transparent discard address (%s characters)\n' \
+        "$(printf '%s' "$SAPLING_DISCARD_ADDRESS" | wc -c)"
 else
-    tail -80 "$LOG_DIR/derive-sapling-discard-address.log" >&2 || true
-    die "could not derive the external Sapling-discard destination"
+    printf '[SKIP] Phase 1 address derivation and Sapling bootstrap; using Phase 4 checkpoint\n'
 fi
-[[ -n "$SAPLING_DISCARD_ADDRESS" ]] \
-    || die "derive-address did not print a transparent Sapling-discard destination"
-printf '[OK] derived external transparent discard address (%s characters)\n' \
-    "$(printf '%s' "$SAPLING_DISCARD_ADDRESS" | wc -c)"
 write_configs
 printf '[INFO] Zakura config: %s\n' "$ZAKURA_CONFIG"
 printf '[INFO] Zaino config: %s\n' "$ZAINO_CONFIG"
@@ -920,25 +1132,26 @@ ZAINO_PID=$!
 printf '[INFO] zainod pid=%s grpc=%s\n' "$ZAINO_PID" "$ZAINO_GRPC_URL"
 wait_for_grpc_ready
 
-status "Explicitly qualify GetSubtreeRoots(Ironwood) through Zaino"
-if grpc_call GetSubtreeRoots 1002 ironwood-subtree-roots; then
-    printf '[PASS] GetSubtreeRoots(Ironwood) returned grpc-status 0\n'
-else
-    if grpc_error_contains ironwood-subtree-roots; then
-        die "GetSubtreeRoots(Ironwood) returned Invalid shielded protocol value"
+if (( START_PHASE <= 1 )); then
+    status "Explicitly qualify GetSubtreeRoots(Ironwood) through Zaino"
+    if grpc_call GetSubtreeRoots 1002 ironwood-subtree-roots; then
+        printf '[PASS] GetSubtreeRoots(Ironwood) returned grpc-status 0\n'
+    else
+        if grpc_error_contains ironwood-subtree-roots; then
+            die "GetSubtreeRoots(Ironwood) returned Invalid shielded protocol value"
+        fi
+        printf '[INFO] Ironwood subtree trace:\n' >&2
+        tail -100 "$GRPC_DIR/ironwood-subtree-roots.trace" >&2 || true
+        die "GetSubtreeRoots(Ironwood) did not return grpc-status 0"
     fi
-    printf '[INFO] Ironwood subtree trace:\n' >&2
-    tail -100 "$GRPC_DIR/ironwood-subtree-roots.trace" >&2 || true
-    die "GetSubtreeRoots(Ironwood) did not return grpc-status 0"
-fi
 
-status "Bootstrap the first block needed by devtool wallet birthday initialization"
-# zcash-devtool clamps a Regtest birthday to Sapling activation at height 1 and
-# asks the server for block 1 when the birthday is exactly that activation. One
-# non-funding qualification block makes that CLI path valid; all funding below
-# happens after NU6.3 activation at height 2.
-rpc_generate 1
-wait_for_zaino_tip 1
+    status "Bootstrap the first block needed by devtool wallet birthday initialization"
+    # zcash-devtool clamps a Regtest birthday to Sapling activation at height 1 and
+    # asks the server for block 1 when the birthday is exactly that activation. One
+    # non-funding qualification block makes that CLI path valid; all funding below
+    # happens after NU6.3 activation at height 2.
+    rpc_generate 1
+    wait_for_zaino_tip 1
 
 status "Initialize a fresh Regtest zcash-devtool wallet against Zaino"
 if {
@@ -1053,7 +1266,8 @@ jq -e '.ironwood_spendable > 0' >/dev/null <<<"$FINAL_BALANCE" \
 printf '\n[PASS] Phase 1 infrastructure qualification complete\n'
 printf '[PASS] Ironwood subtree-root serving: yes (explicit gRPC GetSubtreeRoots, enum value 2)\n'
 printf '[PASS] ordinary Ironwood wallet receive/spend: yes (mined tx %s)\n' "$TXID"
-printf '[PASS] Phase 1 completed before Phase 2 Coppice lifecycle qualification\n'
+    printf '[PASS] Phase 1 completed before Phase 2 Coppice lifecycle qualification\n'
+finish_phase_if_requested 1
 
 status "Phase 2: enable Coppice protection and create a confirmed bond note"
 
@@ -1362,6 +1576,9 @@ assert_resolve_inactive coppice-reorg-resolve-first "$COPPICE_NAME_ONE"
 printf '[PASS] Coppice replay rewound the removed BondSpent transition and followed replacement h=%s\n' \
     "$REORG_OLD_HEIGHT"
 
+printf '\n[PASS] Phase 2 lifecycle, restart recovery, and shallow reorg qualification complete\n'
+finish_phase_if_requested 2
+
 status "Phase 3: fresh same-seed wallet recovery from Coppice activation"
 [[ ! -e "$RECOVERY_WALLET_DIR" ]] \
     || die "fresh recovery wallet directory already exists"
@@ -1499,6 +1716,7 @@ printf '[PASS] Phase 3 fresh same-seed recovery: birthday=%s, sync tip=%s, Break
     "$COPPICE_ACTIVATION_HEIGHT" "$REORG_OLD_HEIGHT" "$RECOVERY_BREAK_BOND_TXID" \
     "$PHASE3_BREAK_BOND_HEIGHT_EXPECTED"
 printf '[PASS] deep reorg tests were not run\n'
+finish_phase_if_requested 3
 
 status "Phase 4: create a second same-seed account and map FVK-derived identities"
 wallet_sync_logged phase4-original-preparation-sync
@@ -2062,16 +2280,549 @@ for fresh_ordinary_failure in phase4-fresh-ordinary-send-a phase4-fresh-ordinary
 done
 printf '[PASS] fresh reconstructed locks protected both accounts from ordinary spending\n'
 
-printf '\n[PASS] Phase 1 + Phase 2 + Phase 3 + Phase 4 qualification complete\n'
+write_phase4_checkpoint
+printf '\n[PASS] Phase 4 multi-account isolation, restart recovery, and fresh recovery qualification complete\n'
+finish_phase_if_requested 4
+fi
+
+status "Phase 5: create one active-and-one-pending adversarial protection fixture"
+# Phase 4 leaves the two original lifecycle names plus both account-isolation
+# names in the canonical registry. Phase 5 adds only one pending COMMIT.
+PHASE5_EXPECTED_NAME_COUNT=4
+PHASE5_PREP_HEIGHT=$(($(zakura_tip_height) + 4))
+rpc_generate 4
+wait_for_zaino_tip "$PHASE5_PREP_HEIGHT"
+wallet_sync_logged phase5-preparation-sync
+
+run_devtool_logged phase5-pending-funding-address wallet \
+    --wallet-dir "$WALLET_DIR" generate-address "$ACCOUNT_A_UUID"
+PHASE5_PENDING_FUNDING_ADDRESS="$(sed -n 's/^     Address: //p' \
+    "$LOG_DIR/phase5-pending-funding-address.log" | tail -1)"
+[[ -n "$PHASE5_PENDING_FUNDING_ADDRESS" ]] \
+    || die "could not create the Phase 5 pending-bond funding address"
+run_devtool_logged phase5-pending-funding wallet \
+    --wallet-dir "$WALLET_DIR" send \
+    --identity "$IDENTITY_FILE" \
+    --address "$PHASE5_PENDING_FUNDING_ADDRESS" \
+    --value "$PHASE5_PENDING_FUNDING_VALUE" \
+    --min-confirmations 1 \
+    --server "$ZAINO_GRPC_ADDR" --connection direct "$ACCOUNT_A_UUID"
+PHASE5_PENDING_FUNDING_TXID="$(rg -a -o '[0-9a-fA-F]{64}' \
+    "$LOG_DIR/phase5-pending-funding.log" | tail -1 || true)"
+[[ -n "$PHASE5_PENDING_FUNDING_TXID" ]] \
+    || die "Phase 5 pending-bond funding did not emit a transaction id"
+PHASE5_PENDING_FUNDING_HEIGHT=$(($(zakura_tip_height) + 3))
+rpc_generate 3
+wait_for_zaino_tip "$PHASE5_PENDING_FUNDING_HEIGHT"
+wallet_sync_logged phase5-pending-funding-sync
+run_devtool_logged phase5-pending-funding-history wallet \
+    --wallet-dir "$WALLET_DIR" list-tx --json
+PHASE5_PENDING_FUNDING_MINED_HEIGHT="$(jq -r --arg txid "$PHASE5_PENDING_FUNDING_TXID" \
+    '.[] | select(.txid == $txid) | .mined_height' \
+    "$LOG_DIR/phase5-pending-funding-history.log" | tail -1)"
+[[ "$PHASE5_PENDING_FUNDING_MINED_HEIGHT" =~ ^[0-9]+$ ]] \
+    || die "Phase 5 pending-bond funding tx $PHASE5_PENDING_FUNDING_TXID has no mined height"
+
+run_devtool_logged phase5-pending-name-address wallet \
+    --wallet-dir "$WALLET_DIR" generate-address "$ACCOUNT_A_UUID"
+PHASE5_PENDING_UA="$(sed -n 's/^     Address: //p' \
+    "$LOG_DIR/phase5-pending-name-address.log" | tail -1)"
+[[ -n "$PHASE5_PENDING_UA" ]] || die "could not create the Phase 5 pending registration UA"
+
+PHASE5_COMMIT_HEIGHT_EXPECTED=$(($(zakura_tip_height) + 1))
+run_devtool_logged phase5-register-pending wallet \
+    --wallet-dir "$WALLET_DIR" coppice register "$ACCOUNT_A_UUID" \
+    --identity "$IDENTITY_FILE" \
+    --name "$PHASE5_NAME_PENDING" \
+    --address "$PHASE5_PENDING_UA" \
+    --server "$ZAINO_GRPC_ADDR" --connection direct
+PHASE5_COMMITMENT="$(rg -a -o 'commitment=[0-9a-fA-F]{64}' \
+    "$LOG_DIR/phase5-register-pending.log" | tail -1 | cut -d= -f2)"
+PHASE5_COMMIT_TXID="$(rg -a -o 'txid=[0-9a-fA-F]{64}' \
+    "$LOG_DIR/phase5-register-pending.log" | tail -1 | cut -d= -f2)"
+[[ -n "$PHASE5_COMMITMENT" && -n "$PHASE5_COMMIT_TXID" ]] \
+    || die "Phase 5 pending COMMIT did not emit commitment and transaction id"
+rpc_generate 1
+wait_for_zaino_tip "$PHASE5_COMMIT_HEIGHT_EXPECTED"
+wallet_sync_logged phase5-pending-commit-sync
+run_devtool_logged phase5-observe-pending-commit wallet \
+    --wallet-dir "$WALLET_DIR" coppice observe-commit "$PHASE5_COMMITMENT"
+[[ "$(tail -1 "$LOG_DIR/phase5-observe-pending-commit.log" | tr -d '\r')" == \
+    "$PHASE5_COMMIT_HEIGHT_EXPECTED" ]] \
+    || die "Phase 5 pending COMMIT was not observed at its canonical height"
+wallet_status_logged phase5-pending-status
+PHASE5_TIP="$(zakura_tip_height)"
+assert_coppice_status phase5-pending-status "$PHASE5_TIP" Enabled \
+    "$PHASE5_EXPECTED_NAME_COUNT" 1
+assert_snapshot_status "$PHASE4_NAME_ONE" Active "$PHASE5_TIP"
+assert_snapshot_status "$PHASE4_NAME_TWO" Active "$PHASE5_TIP"
+assert_pending_owner phase5-pending-status "$PHASE5_COMMITMENT" \
+    "$PHASE5_NAME_PENDING" "$ACCOUNT_A_WALLET_ID"
+wallet_balance_logged_for phase5-pending-balance-a "$WALLET_DIR" "$ACCOUNT_A_UUID"
+wallet_balance_logged_for phase5-pending-balance-b "$WALLET_DIR" "$ACCOUNT_B_UUID"
+PHASE5_A_LOCKED="$(balance_locked_value phase5-pending-balance-a)"
+PHASE5_B_LOCKED="$(balance_locked_value phase5-pending-balance-b)"
+(( PHASE5_A_LOCKED == PHASE4_A_ACTIVE_LOCKED + PHASE5_PENDING_FUNDING_VALUE )) \
+    || die "Phase 5 pending registration did not lock the dedicated Account A bond note"
+(( PHASE5_B_LOCKED == PHASE4_B_ACTIVE_LOCKED )) \
+    || die "Phase 5 pending registration changed Account B's active-bond lock"
+printf '[PASS] active bonds plus pending registration: A locked=%s, B locked=%s, pending=%s\n' \
+    "$PHASE5_A_LOCKED" "$PHASE5_B_LOCKED" "$PHASE5_COMMITMENT"
+
+phase5_assert_fixture_unchanged() {
+    local label=$1
+    local expected_mode=$2
+    local digest
+
+    wallet_status_logged "$label-status"
+    assert_coppice_status "$label-status" "$PHASE5_TIP" "$expected_mode" \
+        "$PHASE5_EXPECTED_NAME_COUNT" 1
+    assert_snapshot_status "$PHASE4_NAME_ONE" Active "$PHASE5_TIP"
+    assert_snapshot_status "$PHASE4_NAME_TWO" Active "$PHASE5_TIP"
+    assert_pending_owner "$label-status" "$PHASE5_COMMITMENT" \
+        "$PHASE5_NAME_PENDING" "$ACCOUNT_A_WALLET_ID"
+    digest="$(sha256sum "$WALLET_DIR/coppice-v1.json" \
+        "$WALLET_DIR/coppice-pending-v1.json")"
+    [[ "$digest" == "$PHASE5_STATE_DIGEST" ]] \
+        || die "$label changed Coppice snapshot or pending metadata"
+    wallet_balance_logged_for "$label-balance-a" "$WALLET_DIR" "$ACCOUNT_A_UUID"
+    wallet_balance_logged_for "$label-balance-b" "$WALLET_DIR" "$ACCOUNT_B_UUID"
+    [[ "$(balance_locked_value "$label-balance-a")" == "$PHASE5_A_LOCKED" ]] \
+        || die "$label changed Account A's protected lock value"
+    [[ "$(balance_locked_value "$label-balance-b")" == "$PHASE5_B_LOCKED" ]] \
+        || die "$label changed Account B's protected lock value"
+    printf '[PASS] %s left canonical state, pending metadata, and both locks unchanged\n' "$label"
+}
+
+phase5_assert_rejected_diagnostic() {
+    local label=$1
+
+    rg -a -qi 'Coppice|protected|bond|locked|insufficient|not enough|ineligible|unavailable|spend protection' \
+        "$LOG_DIR/$label.log" \
+        || die "$label failed without a protected-spend diagnostic"
+}
+
+status "Phase 5: reject wrong-account REVEAL, ABANDON, COMPLETE, and Break Bond"
+PHASE5_STATE_DIGEST="$(sha256sum "$WALLET_DIR/coppice-v1.json" \
+    "$WALLET_DIR/coppice-pending-v1.json")"
+run_devtool_expect_failure phase5-wrong-account-reveal wallet \
+    --wallet-dir "$WALLET_DIR" coppice reveal "$ACCOUNT_B_UUID" \
+    --identity "$IDENTITY_FILE" "$PHASE5_COMMITMENT" \
+    --server "$ZAINO_GRPC_ADDR" --connection direct
+phase5_assert_rejected_diagnostic phase5-wrong-account-reveal
+phase5_assert_fixture_unchanged phase5-wrong-account-reveal Enabled
+
+run_devtool_expect_failure phase5-wrong-account-abandon wallet \
+    --wallet-dir "$WALLET_DIR" coppice abandon "$ACCOUNT_B_UUID" "$PHASE5_COMMITMENT"
+phase5_assert_rejected_diagnostic phase5-wrong-account-abandon
+phase5_assert_fixture_unchanged phase5-wrong-account-abandon Enabled
+
+run_devtool_expect_failure phase5-wrong-account-complete wallet \
+    --wallet-dir "$WALLET_DIR" coppice complete "$ACCOUNT_B_UUID" "$PHASE5_COMMITMENT"
+phase5_assert_rejected_diagnostic phase5-wrong-account-complete
+phase5_assert_fixture_unchanged phase5-wrong-account-complete Enabled
+
+run_devtool_logged phase5-wrong-break-bond-address wallet \
+    --wallet-dir "$WALLET_DIR" generate-address "$ACCOUNT_B_UUID"
+PHASE5_WRONG_BREAK_ADDRESS="$(sed -n 's/^     Address: //p' \
+    "$LOG_DIR/phase5-wrong-break-bond-address.log" | tail -1)"
+[[ -n "$PHASE5_WRONG_BREAK_ADDRESS" ]] \
+    || die "could not create the wrong-account Break Bond destination"
+run_devtool_expect_failure phase5-wrong-account-break-bond wallet \
+    --wallet-dir "$WALLET_DIR" coppice break-bond "$ACCOUNT_B_UUID" \
+    --identity "$IDENTITY_FILE" \
+    --name "$PHASE4_NAME_ONE" \
+    --address "$PHASE5_WRONG_BREAK_ADDRESS" \
+    --value 1000000 \
+    --server "$ZAINO_GRPC_ADDR" --connection direct
+phase5_assert_rejected_diagnostic phase5-wrong-account-break-bond
+phase5_assert_fixture_unchanged phase5-wrong-account-break-bond Enabled
+printf '[PASS] wrong-account lifecycle and Break Bond attempts were rejected without mutation\n'
+
+status "Phase 5: build a fully signed adversarial Ironwood PCZT while protection is Off"
+run_devtool_logged phase5-adversarial-address wallet \
+    --wallet-dir "$WALLET_DIR" generate-address "$ACCOUNT_B_UUID"
+PHASE5_ADVERSARIAL_ADDRESS="$(sed -n 's/^     Address: //p' \
+    "$LOG_DIR/phase5-adversarial-address.log" | tail -1)"
+[[ -n "$PHASE5_ADVERSARIAL_ADDRESS" ]] \
+    || die "could not create the adversarial PCZT destination"
+run_devtool_logged phase5-protection-off wallet \
+    --wallet-dir "$WALLET_DIR" coppice protection off
+rg -a -q '^Off$' "$LOG_DIR/phase5-protection-off.log" \
+    || die "Phase 5 wallet protection did not become Off"
+wallet_balance_logged_for phase5-off-balance-a "$WALLET_DIR" "$ACCOUNT_A_UUID"
+wallet_balance_logged_for phase5-off-balance-b "$WALLET_DIR" "$ACCOUNT_B_UUID"
+PHASE5_A_OFF_RESIDUAL=$((PHASE4_A_ACTIVE_LOCKED - COPPICE_BOND_VALUE))
+PHASE5_B_OFF_RESIDUAL=$((PHASE4_B_ACTIVE_LOCKED - COPPICE_BOND_VALUE))
+[[ "$(balance_locked_value phase5-off-balance-a)" == "$PHASE5_A_OFF_RESIDUAL" ]] \
+    || die "switching protection Off did not remove Account A's Coppice-owned locks"
+[[ "$(balance_locked_value phase5-off-balance-b)" == "$PHASE5_B_OFF_RESIDUAL" ]] \
+    || die "switching protection Off did not remove Account B's Coppice-owned locks"
+[[ "$(sha256sum "$WALLET_DIR/coppice-v1.json" \
+    "$WALLET_DIR/coppice-pending-v1.json")" == "$PHASE5_STATE_DIGEST" ]] \
+    || die "switching protection Off changed canonical or pending Coppice state"
+printf '[PASS] Off removed both Coppice-owned advisory lock sets; residual non-Coppice values A=%s, B=%s\n' \
+    "$PHASE5_A_OFF_RESIDUAL" "$PHASE5_B_OFF_RESIDUAL"
+
+PHASE5_RAW_PCZT="$PHASE5_PCZT_DIR/protected-spend.raw.pczt"
+PHASE5_PROVED_PCZT="$PHASE5_PCZT_DIR/protected-spend.proved.pczt"
+PHASE5_SIGNED_PCZT="$PHASE5_PCZT_DIR/protected-spend.signed.pczt"
+run_devtool_logged phase5-pczt-create-max-off pczt \
+    --wallet-dir "$WALLET_DIR" create-max "$ACCOUNT_A_UUID" \
+    --address "$PHASE5_ADVERSARIAL_ADDRESS" \
+    --only-spendable \
+    --output "$PHASE5_RAW_PCZT"
+[[ -s "$PHASE5_RAW_PCZT" ]] || die "Off-mode create-max did not write an adversarial PCZT"
+run_devtool_logged phase5-pczt-inspect-off pczt \
+    --wallet-dir "$WALLET_DIR" inspect "$PHASE5_RAW_PCZT"
+rg -a -qi 'Ironwood' "$LOG_DIR/phase5-pczt-inspect-off.log" \
+    || die "adversarial PCZT does not contain an Ironwood bundle"
+run_devtool_logged phase5-pczt-prove-off pczt \
+    --wallet-dir "$WALLET_DIR" prove \
+    --identity "$IDENTITY_FILE" \
+    --output "$PHASE5_PROVED_PCZT" "$PHASE5_RAW_PCZT"
+run_devtool_logged phase5-pczt-sign-off pczt \
+    --wallet-dir "$WALLET_DIR" sign \
+    --identity "$IDENTITY_FILE" \
+    --output "$PHASE5_SIGNED_PCZT" "$PHASE5_PROVED_PCZT"
+[[ -s "$PHASE5_SIGNED_PCZT" ]] || die "Off-mode PCZT signing did not write a signed PCZT"
+run_devtool_stdin_logged phase5-pczt-extract-off "$PHASE5_SIGNED_PCZT" \
+    pczt --wallet-dir "$WALLET_DIR" extract
+PHASE5_ADVERSARIAL_TXID="$(rg -a -o '[0-9a-fA-F]{64}' \
+    "$LOG_DIR/phase5-pczt-extract-off.log" | tail -1 || true)"
+[[ -n "$PHASE5_ADVERSARIAL_TXID" ]] \
+    || die "Off-mode PCZT extraction did not produce a transaction id"
+printf '[PASS] built fully signed adversarial Ironwood PCZT %s without broadcasting it\n' \
+    "$PHASE5_ADVERSARIAL_TXID"
+
+status "Phase 5: restore Enabled and reconstitute the protected fixture"
+run_devtool_logged phase5-protection-reenabled wallet \
+    --wallet-dir "$WALLET_DIR" coppice protection enabled
+rg -a -q '^Enabled$' "$LOG_DIR/phase5-protection-reenabled.log" \
+    || die "Phase 5 wallet protection did not become Enabled"
+wallet_sync_logged phase5-reenabled-sync
+PHASE5_TIP="$(zakura_tip_height)"
+wallet_status_logged phase5-reenabled-status
+assert_coppice_status phase5-reenabled-status "$PHASE5_TIP" Enabled \
+    "$PHASE5_EXPECTED_NAME_COUNT" 1
+assert_snapshot_status "$PHASE4_NAME_ONE" Active "$PHASE5_TIP"
+assert_snapshot_status "$PHASE4_NAME_TWO" Active "$PHASE5_TIP"
+assert_pending_owner phase5-reenabled-status "$PHASE5_COMMITMENT" \
+    "$PHASE5_NAME_PENDING" "$ACCOUNT_A_WALLET_ID"
+wallet_balance_logged_for phase5-reenabled-balance-a "$WALLET_DIR" "$ACCOUNT_A_UUID"
+wallet_balance_logged_for phase5-reenabled-balance-b "$WALLET_DIR" "$ACCOUNT_B_UUID"
+PHASE5_A_LOCKED="$(balance_locked_value phase5-reenabled-balance-a)"
+PHASE5_B_LOCKED="$(balance_locked_value phase5-reenabled-balance-b)"
+PHASE5_STATE_DIGEST="$(sha256sum "$WALLET_DIR/coppice-v1.json" \
+    "$WALLET_DIR/coppice-pending-v1.json")"
+printf '[PASS] Enabled replay reconstructed active/pending state and locks: A=%s, B=%s\n' \
+    "$PHASE5_A_LOCKED" "$PHASE5_B_LOCKED"
+
+status "Phase 5: reject Enabled ordinary send, proposal, create, sign, extract, and submission paths"
+PHASE5_A_TOTAL="$(balance_total_value phase5-reenabled-balance-a)"
+PHASE5_PROTECTED_SEND_VALUE=$((PHASE5_A_TOTAL - 1))
+(( PHASE5_PROTECTED_SEND_VALUE > 0 )) || die "Phase 5 Account A total balance is unusable"
+PHASE5_PROTECTED_SEND_ZEC_WHOLE=$((PHASE5_PROTECTED_SEND_VALUE / 100000000))
+PHASE5_PROTECTED_SEND_ZEC_FRACTION=$(printf '%08d' "$((PHASE5_PROTECTED_SEND_VALUE % 100000000))")
+PHASE5_PROTECTED_SEND_AMOUNT_ZEC="${PHASE5_PROTECTED_SEND_ZEC_WHOLE}.${PHASE5_PROTECTED_SEND_ZEC_FRACTION}"
+
+run_devtool_expect_failure phase5-enabled-wallet-send wallet \
+    --wallet-dir "$WALLET_DIR" send \
+    --identity "$IDENTITY_FILE" \
+    --address "$PHASE5_ADVERSARIAL_ADDRESS" \
+    --value "$PHASE5_PROTECTED_SEND_VALUE" \
+    --min-confirmations 1 \
+    --server "$ZAINO_GRPC_ADDR" --connection direct "$ACCOUNT_A_UUID"
+phase5_assert_rejected_diagnostic phase5-enabled-wallet-send
+phase5_assert_fixture_unchanged phase5-enabled-wallet-send Enabled
+
+run_devtool_expect_failure phase5-enabled-wallet-propose wallet \
+    --wallet-dir "$WALLET_DIR" propose "$ACCOUNT_A_UUID" \
+    --address "$PHASE5_ADVERSARIAL_ADDRESS" \
+    --value "$PHASE5_PROTECTED_SEND_VALUE"
+phase5_assert_rejected_diagnostic phase5-enabled-wallet-propose
+phase5_assert_fixture_unchanged phase5-enabled-wallet-propose Enabled
+
+run_devtool_expect_failure phase5-enabled-wallet-pay wallet \
+    --wallet-dir "$WALLET_DIR" pay "$ACCOUNT_A_UUID" \
+    --identity "$IDENTITY_FILE" \
+    --payment-uri "zcash:${PHASE5_ADVERSARIAL_ADDRESS}?amount=${PHASE5_PROTECTED_SEND_AMOUNT_ZEC}" \
+    --server "$ZAINO_GRPC_ADDR" --connection direct
+phase5_assert_rejected_diagnostic phase5-enabled-wallet-pay
+phase5_assert_fixture_unchanged phase5-enabled-wallet-pay Enabled
+
+PHASE5_ENABLED_CREATE_PCZT="$PHASE5_PCZT_DIR/enabled-create.pczt"
+run_devtool_expect_failure phase5-enabled-pczt-create pczt \
+    --wallet-dir "$WALLET_DIR" create "$ACCOUNT_A_UUID" \
+    --address "$PHASE5_ADVERSARIAL_ADDRESS" \
+    --value "$PHASE5_PROTECTED_SEND_VALUE" \
+    --output "$PHASE5_ENABLED_CREATE_PCZT"
+phase5_assert_rejected_diagnostic phase5-enabled-pczt-create
+phase5_assert_fixture_unchanged phase5-enabled-pczt-create Enabled
+
+PHASE5_ENABLED_MAX_PCZT="$PHASE5_PCZT_DIR/enabled-max.pczt"
+run_devtool_expect_failure phase5-enabled-pczt-create-max pczt \
+    --wallet-dir "$WALLET_DIR" create-max "$ACCOUNT_A_UUID" \
+    --address "$PHASE5_ADVERSARIAL_ADDRESS" \
+    --output "$PHASE5_ENABLED_MAX_PCZT"
+phase5_assert_rejected_diagnostic phase5-enabled-pczt-create-max
+phase5_assert_fixture_unchanged phase5-enabled-pczt-create-max Enabled
+
+run_devtool_expect_failure phase5-enabled-pczt-prove pczt \
+    --wallet-dir "$WALLET_DIR" prove \
+    --identity "$IDENTITY_FILE" \
+    --output "$PHASE5_PCZT_DIR/rejected-prove.pczt" "$PHASE5_RAW_PCZT"
+phase5_assert_rejected_diagnostic phase5-enabled-pczt-prove
+phase5_assert_fixture_unchanged phase5-enabled-pczt-prove Enabled
+
+run_devtool_expect_failure phase5-enabled-pczt-sign pczt \
+    --wallet-dir "$WALLET_DIR" sign \
+    --identity "$IDENTITY_FILE" \
+    --output "$PHASE5_PCZT_DIR/rejected-sign.pczt" "$PHASE5_RAW_PCZT"
+phase5_assert_rejected_diagnostic phase5-enabled-pczt-sign
+phase5_assert_fixture_unchanged phase5-enabled-pczt-sign Enabled
+
+run_devtool_stdin_expect_failure phase5-enabled-pczt-extract "$PHASE5_SIGNED_PCZT" \
+    pczt --wallet-dir "$WALLET_DIR" extract
+phase5_assert_rejected_diagnostic phase5-enabled-pczt-extract
+phase5_assert_fixture_unchanged phase5-enabled-pczt-extract Enabled
+
+run_devtool_expect_failure phase5-enabled-pczt-send pczt \
+    --wallet-dir "$WALLET_DIR" send \
+    --server "$ZAINO_GRPC_ADDR" --connection direct "$PHASE5_SIGNED_PCZT"
+phase5_assert_rejected_diagnostic phase5-enabled-pczt-send
+phase5_assert_fixture_unchanged phase5-enabled-pczt-send Enabled
+
+run_devtool_expect_failure phase5-enabled-pczt-send-without-storing pczt \
+    --wallet-dir "$WALLET_DIR" send-without-storing \
+    --server "$ZAINO_GRPC_ADDR" --connection direct "$PHASE5_SIGNED_PCZT"
+phase5_assert_rejected_diagnostic phase5-enabled-pczt-send-without-storing
+phase5_assert_fixture_unchanged phase5-enabled-pczt-send-without-storing Enabled
+printf '[PASS] Enabled rejected ordinary, proposal/create, PCZT prove/sign/extract, stored-submit, and direct-submit attempts\n'
+
+status "Phase 5: GuardOnly retains replay, resolver, and every spend guard"
+run_devtool_logged phase5-protection-guard-only wallet \
+    --wallet-dir "$WALLET_DIR" coppice protection guard-only
+rg -a -q '^GuardOnly$' "$LOG_DIR/phase5-protection-guard-only.log" \
+    || die "Phase 5 wallet protection did not become GuardOnly"
+phase5_assert_fixture_unchanged phase5-guard-only GuardOnly
+assert_resolved_address phase5-guard-only-resolve "$PHASE4_NAME_ONE" "$PHASE4_UA_ONE"
+
+run_devtool_expect_failure phase5-guard-only-wallet-send wallet \
+    --wallet-dir "$WALLET_DIR" send \
+    --identity "$IDENTITY_FILE" \
+    --address "$PHASE5_ADVERSARIAL_ADDRESS" \
+    --value "$PHASE5_PROTECTED_SEND_VALUE" \
+    --min-confirmations 1 \
+    --server "$ZAINO_GRPC_ADDR" --connection direct "$ACCOUNT_A_UUID"
+phase5_assert_rejected_diagnostic phase5-guard-only-wallet-send
+phase5_assert_fixture_unchanged phase5-guard-only-wallet-send GuardOnly
+
+run_devtool_expect_failure phase5-guard-only-pczt-send pczt \
+    --wallet-dir "$WALLET_DIR" send \
+    --server "$ZAINO_GRPC_ADDR" --connection direct "$PHASE5_SIGNED_PCZT"
+phase5_assert_rejected_diagnostic phase5-guard-only-pczt-send
+phase5_assert_fixture_unchanged phase5-guard-only-pczt-send GuardOnly
+printf '[PASS] GuardOnly preserved canonical replay/resolution and protected active plus pending bonds; management UI was not used in guard-only mode\n'
+
+status "Phase 5: Off cleanup, foreign-lock regression, and unsynchronized ordinary send"
+run_logged phase5-foreign-lock-regression cargo \
+    test --manifest-path "$ROOT_DIR/coppice/Cargo.toml" --locked \
+    -p coppice-librustzcash --lib off_transition_cleanup_removes_only_coppice_owned_locks
+rg -a -q 'test .*off_transition_cleanup_removes_only_coppice_owned_locks .*ok' \
+    "$LOG_DIR/phase5-foreign-lock-regression.log" \
+    || die "foreign-lock cleanup regression did not pass"
+printf '[PASS] exact-owner Off cleanup regression preserved a foreign lock\n'
+
+run_devtool_logged phase5-protection-off-main wallet \
+    --wallet-dir "$WALLET_DIR" coppice protection off
+rg -a -q '^Off$' "$LOG_DIR/phase5-protection-off-main.log" \
+    || die "main wallet protection did not become Off"
+wallet_balance_logged_for phase5-off-main-balance-a "$WALLET_DIR" "$ACCOUNT_A_UUID"
+wallet_balance_logged_for phase5-off-main-balance-b "$WALLET_DIR" "$ACCOUNT_B_UUID"
+[[ "$(balance_locked_value phase5-off-main-balance-a)" == "$PHASE5_A_OFF_RESIDUAL" ]] \
+    || die "main Off transition left Account A's Coppice lock"
+[[ "$(balance_locked_value phase5-off-main-balance-b)" == "$PHASE5_B_OFF_RESIDUAL" ]] \
+    || die "main Off transition left Account B's Coppice lock"
+[[ "$(sha256sum "$WALLET_DIR/coppice-v1.json" \
+    "$WALLET_DIR/coppice-pending-v1.json")" == "$PHASE5_STATE_DIGEST" ]] \
+    || die "main Off transition changed canonical or pending state"
+printf '[PASS] main Off transition removed only Coppice-owned lock values (residual A/B=%s/%s)\n' \
+    "$PHASE5_A_OFF_RESIDUAL" "$PHASE5_B_OFF_RESIDUAL"
+
+PHASE5_OFF_BIRTHDAY="$(zakura_tip_height)"
+[[ ! -e "$PHASE5_OFF_WALLET_DIR" ]] \
+    || die "Phase 5 Off wallet directory already exists"
+mkdir "$PHASE5_OFF_WALLET_DIR"
+[[ -z "$(find "$PHASE5_OFF_WALLET_DIR" -mindepth 1 -print -quit)" ]] \
+    || die "Phase 5 Off wallet directory was not empty"
+if {
+    printf '%s\n' "$WALLET_MNEMONIC" | timeout 240 "$DEVTOOL_BIN" wallet \
+        --wallet-dir "$PHASE5_OFF_WALLET_DIR" init \
+        --name phase5-off \
+        --identity "$PHASE5_OFF_IDENTITY_FILE" \
+        --network regtest \
+        --birthday "$PHASE5_OFF_BIRTHDAY" \
+        --activation-heights "$ACTIVATION_FILE" \
+        --server "$ZAINO_GRPC_ADDR" \
+        --connection direct
+} >"$LOG_DIR/phase5-off-wallet-init.log" 2>&1; then
+    printf '[PASS] fresh Off wallet initialized at birthday %s\n' "$PHASE5_OFF_BIRTHDAY"
+else
+    status_code=$?
+    printf '[FAIL] phase5-off-wallet-init (exit %d); see %s\n' \
+        "$status_code" "$LOG_DIR/phase5-off-wallet-init.log" >&2
+    tail -100 "$LOG_DIR/phase5-off-wallet-init.log" >&2 || true
+    exit "$status_code"
+fi
+for forbidden_state in \
+    "$PHASE5_OFF_WALLET_DIR/coppice-v1.json" \
+    "$PHASE5_OFF_WALLET_DIR/coppice-pending-v1.json"; do
+    [[ ! -e "$forbidden_state" ]] \
+        || die "fresh Off wallet init unexpectedly created Coppice state: $forbidden_state"
+done
+run_devtool_logged phase5-off-wallet-protection wallet \
+    --wallet-dir "$PHASE5_OFF_WALLET_DIR" coppice protection off
+rg -a -q '^Off$' "$LOG_DIR/phase5-off-wallet-protection.log" \
+    || die "fresh Off wallet did not enter Off mode"
+PHASE5_OFF_MINED_HEIGHT=$(($(zakura_tip_height) + 4))
+rpc_generate 4
+wait_for_zaino_tip "$PHASE5_OFF_MINED_HEIGHT"
+wallet_sync_logged_for phase5-off-wallet-sync "$PHASE5_OFF_WALLET_DIR"
+run_devtool_logged phase5-off-wallet-balance wallet \
+    --wallet-dir "$PHASE5_OFF_WALLET_DIR" balance --json --min-confirmations 1
+PHASE5_OFF_BALANCE="$(balance_json phase5-off-wallet-balance)"
+jq -e '.ironwood_spendable > 0' >/dev/null <<<"$PHASE5_OFF_BALANCE" \
+    || die "fresh Off wallet did not receive spendable Ironwood value"
+for forbidden_state in \
+    "$PHASE5_OFF_WALLET_DIR/coppice-v1.json" \
+    "$PHASE5_OFF_WALLET_DIR/coppice-pending-v1.json"; do
+    [[ ! -e "$forbidden_state" ]] \
+        || die "Off-mode sync unexpectedly created Coppice state: $forbidden_state"
+done
+run_devtool_logged phase5-off-wallet-receive-address wallet \
+    --wallet-dir "$PHASE5_OFF_WALLET_DIR" generate-address
+PHASE5_OFF_RECEIVE_ADDRESS="$(sed -n 's/^     Address: //p' \
+    "$LOG_DIR/phase5-off-wallet-receive-address.log" | tail -1)"
+[[ -n "$PHASE5_OFF_RECEIVE_ADDRESS" ]] \
+    || die "fresh Off wallet did not generate an ordinary receive address"
+run_devtool_logged phase5-off-wallet-send wallet \
+    --wallet-dir "$PHASE5_OFF_WALLET_DIR" send \
+    --identity "$PHASE5_OFF_IDENTITY_FILE" \
+    --address "$PHASE5_OFF_RECEIVE_ADDRESS" \
+    --value 1000000 \
+    --min-confirmations 1 \
+    --server "$ZAINO_GRPC_ADDR" --connection direct
+PHASE5_OFF_SEND_TXID="$(rg -a -o '[0-9a-fA-F]{64}' \
+    "$LOG_DIR/phase5-off-wallet-send.log" | tail -1 || true)"
+[[ -n "$PHASE5_OFF_SEND_TXID" ]] \
+    || die "fresh Off wallet ordinary send did not emit a transaction id"
+PHASE5_OFF_SEND_HEIGHT=$(($(zakura_tip_height) + 1))
+rpc_generate 1
+wait_for_zaino_tip "$PHASE5_OFF_SEND_HEIGHT"
+wallet_sync_logged_for phase5-off-wallet-resync "$PHASE5_OFF_WALLET_DIR"
+run_devtool_logged phase5-off-wallet-history wallet \
+    --wallet-dir "$PHASE5_OFF_WALLET_DIR" list-tx --json
+PHASE5_OFF_SEND_MINED_HEIGHT="$(jq -r --arg txid "$PHASE5_OFF_SEND_TXID" \
+    '.[] | select(.txid == $txid) | .mined_height' \
+    "$LOG_DIR/phase5-off-wallet-history.log" | tail -1)"
+[[ "$PHASE5_OFF_SEND_MINED_HEIGHT" =~ ^[0-9]+$ ]] \
+    || die "fresh Off ordinary send $PHASE5_OFF_SEND_TXID has no mined height"
+printf '[PASS] Off wallet sent ordinary Ironwood tx %s at height %s without Coppice state or sync\n' \
+    "$PHASE5_OFF_SEND_TXID" "$PHASE5_OFF_SEND_MINED_HEIGHT"
+
+status "Phase 5: restore main protection and execute the owner-scoped Break Bond exception"
+run_devtool_logged phase5-final-protection-enabled wallet \
+    --wallet-dir "$WALLET_DIR" coppice protection enabled
+rg -a -q '^Enabled$' "$LOG_DIR/phase5-final-protection-enabled.log" \
+    || die "main wallet protection did not return to Enabled"
+wallet_sync_logged phase5-final-main-sync
+PHASE5_TIP="$(zakura_tip_height)"
+wallet_status_logged phase5-final-pending-status
+assert_coppice_status phase5-final-pending-status "$PHASE5_TIP" Enabled \
+    "$PHASE5_EXPECTED_NAME_COUNT" 1
+assert_snapshot_status "$PHASE4_NAME_ONE" Active "$PHASE5_TIP"
+assert_snapshot_status "$PHASE4_NAME_TWO" Active "$PHASE5_TIP"
+assert_pending_owner phase5-final-pending-status "$PHASE5_COMMITMENT" \
+    "$PHASE5_NAME_PENDING" "$ACCOUNT_A_WALLET_ID"
+wallet_balance_logged_for phase5-final-pending-balance-a "$WALLET_DIR" "$ACCOUNT_A_UUID"
+wallet_balance_logged_for phase5-final-pending-balance-b "$WALLET_DIR" "$ACCOUNT_B_UUID"
+[[ "$(balance_locked_value phase5-final-pending-balance-a)" == "$PHASE5_A_LOCKED" ]] \
+    || die "Enabled recovery did not reconstruct Account A's active plus pending locks"
+[[ "$(balance_locked_value phase5-final-pending-balance-b)" == "$PHASE5_B_LOCKED" ]] \
+    || die "Enabled recovery did not reconstruct Account B's active lock"
+
+run_devtool_logged phase5-abandon-pending wallet \
+    --wallet-dir "$WALLET_DIR" coppice abandon "$ACCOUNT_A_UUID" "$PHASE5_COMMITMENT"
+wallet_status_logged phase5-abandon-pending-status
+assert_coppice_status phase5-abandon-pending-status "$PHASE5_TIP" Enabled \
+    "$PHASE5_EXPECTED_NAME_COUNT" 1
+assert_snapshot_status "$PHASE4_NAME_ONE" Active "$PHASE5_TIP"
+assert_snapshot_status "$PHASE4_NAME_TWO" Active "$PHASE5_TIP"
+jq -e '.local_registrations == []' "$LOG_DIR/phase5-abandon-pending-status.log" >/dev/null \
+    || die "correct Phase 5 abandonment did not clear the pending local registration"
+wallet_balance_logged_for phase5-after-abandon-balance-a "$WALLET_DIR" "$ACCOUNT_A_UUID"
+wallet_balance_logged_for phase5-after-abandon-balance-b "$WALLET_DIR" "$ACCOUNT_B_UUID"
+[[ "$(balance_locked_value phase5-after-abandon-balance-a)" == "$PHASE4_A_ACTIVE_LOCKED" ]] \
+    || die "correct Phase 5 abandonment did not release only the pending bond lock"
+[[ "$(balance_locked_value phase5-after-abandon-balance-b)" == "$PHASE4_B_ACTIVE_LOCKED" ]] \
+    || die "correct Phase 5 abandonment changed Account B's active lock"
+printf '[PASS] correct owner abandonment removed pending metadata/lock while preserving both active bonds\n'
+
+run_devtool_logged phase5-break-bond-address wallet \
+    --wallet-dir "$WALLET_DIR" generate-address "$ACCOUNT_B_UUID"
+PHASE5_BREAK_BOND_ADDRESS="$(sed -n 's/^     Address: //p' \
+    "$LOG_DIR/phase5-break-bond-address.log" | tail -1)"
+[[ -n "$PHASE5_BREAK_BOND_ADDRESS" ]] \
+    || die "could not create the intentional Phase 5 Break Bond destination"
+PHASE5_BREAK_BOND_HEIGHT_EXPECTED=$(($(zakura_tip_height) + 1))
+run_devtool_logged phase5-break-bond wallet \
+    --wallet-dir "$WALLET_DIR" coppice break-bond "$ACCOUNT_B_UUID" \
+    --identity "$IDENTITY_FILE" \
+    --name "$PHASE4_NAME_TWO" \
+    --address "$PHASE5_BREAK_BOND_ADDRESS" \
+    --value 1000000 \
+    --server "$ZAINO_GRPC_ADDR" --connection direct
+PHASE5_BREAK_BOND_TXID="$(rg -a -o '[0-9a-fA-F]{64}' \
+    "$LOG_DIR/phase5-break-bond.log" | tail -1 || true)"
+[[ -n "$PHASE5_BREAK_BOND_TXID" ]] \
+    || die "intentional owner-scoped Phase 5 Break Bond did not emit a transaction id"
+rpc_generate 1
+wait_for_zaino_tip "$PHASE5_BREAK_BOND_HEIGHT_EXPECTED"
+wallet_sync_logged phase5-break-bond-sync
+PHASE5_TIP="$(zakura_tip_height)"
+wallet_status_logged phase5-final-status
+assert_coppice_status phase5-final-status "$PHASE5_TIP" Enabled \
+    "$PHASE5_EXPECTED_NAME_COUNT" 1
+assert_snapshot_status "$PHASE4_NAME_ONE" Active "$PHASE5_TIP"
+assert_snapshot_status "$PHASE4_NAME_TWO" BondSpent "$PHASE5_TIP"
+assert_resolved_address phase5-final-resolve-a "$PHASE4_NAME_ONE" "$PHASE4_UA_ONE"
+assert_resolve_inactive phase5-final-resolve-b "$PHASE4_NAME_TWO"
+jq -e '.local_registrations == []' "$LOG_DIR/phase5-final-status.log" >/dev/null \
+    || die "Phase 5 final status recreated stale pending metadata"
+wallet_balance_logged_for phase5-final-balance-a "$WALLET_DIR" "$ACCOUNT_A_UUID"
+wallet_balance_logged_for phase5-final-balance-b "$WALLET_DIR" "$ACCOUNT_B_UUID"
+[[ "$(balance_locked_value phase5-final-balance-a)" == "$PHASE4_A_ACTIVE_LOCKED" ]] \
+    || die "Phase 5 Break Bond changed Account A's active lock"
+[[ "$(balance_locked_value phase5-final-balance-b)" == 0 ]] \
+    || die "Phase 5 Break Bond did not release Account B's spent bond lock"
+printf '[PASS] owner-scoped Break Bond tx %s spent only Account B bond at height %s; Account A stayed Active/protected\n' \
+    "$PHASE5_BREAK_BOND_TXID" "$PHASE5_BREAK_BOND_HEIGHT_EXPECTED"
+
+printf '\n[PASS] Phase 1 + Phase 2 + Phase 3 + Phase 4 + Phase 5 qualification complete\n'
 printf '[PASS] Phase 4 account A: uuid=%s WalletAccountId=%s name=%s commitment=%s active_height=%s\n' \
     "$ACCOUNT_A_UUID" "$ACCOUNT_A_WALLET_ID" "$PHASE4_NAME_ONE" \
     "$PHASE4_COMMITMENT_A" "$PHASE4_A_REVEAL_HEIGHT_EXPECTED"
 printf '[PASS] Phase 4 account B: uuid=%s WalletAccountId=%s name=%s commitment=%s active_height=%s\n' \
     "$ACCOUNT_B_UUID" "$ACCOUNT_B_WALLET_ID" "$PHASE4_NAME_TWO" \
     "$PHASE4_COMMITMENT_B" "$PHASE4_B_REVEAL_HEIGHT_EXPECTED"
-printf '[PASS] Phase 4 per-account locks: A=%s, B=%s zatoshi; pending/complete/restart isolation held\n' \
-    "$PHASE4_FRESH_A_LOCKED" "$PHASE4_FRESH_B_LOCKED"
-printf '[PASS] Phase 4 persisted restart: tip=%s, both names Active, pending metadata empty\n' \
-    "$PHASE4_PERSISTED_HEIGHT"
-printf '[PASS] Phase 4 fresh recovery: account indexes 0/1, activation birthday=%s, both names Active, both locks reconstructed\n' \
-    "$COPPICE_ACTIVATION_HEIGHT"
+printf '[PASS] Phase 5 fixture: active=%s, pending=%s, A/B locks before adversarial tests=%s/%s zatoshi\n' \
+    "$PHASE4_NAME_ONE" "$PHASE5_COMMITMENT" "$PHASE5_A_LOCKED" "$PHASE5_B_LOCKED"
+printf '[PASS] Phase 5 rejection paths: wallet send/pay/propose, PCZT create/create-max/prove/sign/extract/send/send-without-storing\n'
+printf '[PASS] Phase 5 modes: Enabled and GuardOnly rejected protected spends; Off removed Coppice locks and unsynchronized Off send=%s mined at h=%s\n' \
+    "$PHASE5_OFF_SEND_TXID" "$PHASE5_OFF_SEND_MINED_HEIGHT"
+printf '[PASS] Phase 5 owner exception: Break Bond tx=%s at h=%s; final %s=Active, %s=BondSpent/inactive\n' \
+    "$PHASE5_BREAK_BOND_TXID" "$PHASE5_BREAK_BOND_HEIGHT_EXPECTED" \
+    "$PHASE4_NAME_ONE" "$PHASE4_NAME_TWO"
+printf '[PASS] Phase 5 wrong-account attempts and rejected-operation state invariants held; foreign-lock unit regression passed\n'
+printf '[PASS] deep reorg tests were not run\n'

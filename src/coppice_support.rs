@@ -25,6 +25,7 @@ use coppice_librustzcash::{
     reconcile_canonical_chain_with_progress, reconcile_canonical_commit_cache, reconcile_locks,
     with_coppice_spend_guard,
 };
+use pczt::Pczt;
 use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
 use tonic::{Code, transport::Channel};
@@ -38,7 +39,7 @@ use zcash_client_sqlite::{WalletDb, util::SystemClock};
 use zcash_primitives::transaction::Transaction;
 use zcash_protocol::consensus::{NetworkType, Parameters};
 
-use crate::data::DEFAULT_WALLET_DIR;
+use crate::data::{DEFAULT_WALLET_DIR, get_db_paths};
 
 const SNAPSHOT_FILE: &str = "coppice-v1.json";
 const PENDING_FILE: &str = "coppice-pending-v1.json";
@@ -603,6 +604,42 @@ pub(crate) fn ensure_external_ironwood_nullifiers_respect_coppice<P: Parameters>
         ));
     }
     Ok(())
+}
+
+/// Applies the external Ironwood-spend gate to a wallet-backed PCZT operation.
+///
+/// PCZT proving, signing, and extraction do not all have a concrete transaction
+/// yet, but they do expose the public Ironwood spend nullifiers. Checking those
+/// nullifiers before the role mutates or finalizes the PCZT prevents a wallet
+/// process from preparing a protected bond spend through an alternate PCZT
+/// entry point. A PCZT operation without a wallet context remains an external
+/// artifact operation and is checked when it reaches a wallet submission path.
+pub(crate) fn ensure_external_pczt_respects_coppice<P: Parameters + Clone>(
+    params: &P,
+    wallet_dir: Option<&String>,
+    pczt: &Pczt,
+) -> anyhow::Result<()> {
+    let nullifiers = pczt
+        .ironwood()
+        .actions()
+        .iter()
+        .map(|action| *action.spend().nullifier())
+        .collect::<Vec<_>>();
+    if nullifiers.is_empty() {
+        return Ok(());
+    }
+
+    let Some(wallet_dir) = wallet_dir else {
+        return Ok(());
+    };
+    let (_, db_path) = get_db_paths(Some(wallet_dir));
+    let wallet_db = WalletDb::for_path(db_path, params.clone(), SystemClock, OsRng)?;
+    ensure_external_ironwood_nullifiers_respect_coppice(
+        params,
+        Some(wallet_dir),
+        &wallet_db,
+        nullifiers,
+    )
 }
 
 pub(crate) fn persist_pending(

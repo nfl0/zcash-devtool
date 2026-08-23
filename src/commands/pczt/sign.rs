@@ -51,6 +51,12 @@ impl Command {
 
         let pczt = Pczt::parse(&buf).map_err(|e| anyhow!("Failed to read PCZT: {:?}", e))?;
 
+        crate::coppice_support::ensure_external_pczt_respects_coppice(
+            &params,
+            wallet_dir.as_ref(),
+            &pczt,
+        )?;
+
         // Decrypt the mnemonic to access the seed.
         let identities = age::IdentityFile::from_file(self.identity)?.into_identities()?;
 

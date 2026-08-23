@@ -174,14 +174,19 @@ impl Command {
 
         // Send the transaction.
         println!("Sending transaction...");
-        let (txid, raw_tx) = db_data
+        let transaction = db_data
             .get_transaction(txid)?
-            .map(|tx| {
-                let mut raw_tx = service::RawTransaction::default();
-                tx.write(&mut raw_tx.data).unwrap();
-                (tx.txid(), raw_tx)
-            })
             .ok_or(anyhow!("Transaction not found for id {:?}", txid))?;
+        crate::coppice_support::ensure_external_transaction_respects_coppice(
+            &params,
+            wallet_dir.as_ref(),
+            &db_data,
+            &transaction,
+        )?;
+        let mut raw_tx = service::RawTransaction::default();
+        transaction
+            .write(&mut raw_tx.data)
+            .map_err(|error| anyhow!("failed to serialize shielding transaction: {error}"))?;
         let response = client.send_transaction(raw_tx).await?.into_inner();
 
         if response.error_code != 0 {
