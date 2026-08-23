@@ -126,22 +126,24 @@ impl Command {
             let (_chain_tip, tip_hash) = update_chain_tip(client, db_data).await?;
 
             // The wallet's `update_chain_tip` intentionally does nothing when the
-            // reported tip is below our maximum scanned height: it leaves reorg
+            // reported tip is at or below our maximum scanned height: it leaves reorg
             // detection to the scanner's block-continuity check. But when we are
-            // already fully synced there are no ranges left to scan, so a reorg
-            // that shortens the chain below our scanned height would go unnoticed
-            // until the chain grew back past it (as zecd, which is reactive-only,
-            // also would). Detect that case here — but only for a *genuine* reorg.
+            // already fully synced there are no ranges left to scan, so a reorg that
+            // shortens the chain below our scanned height, or replaces the tip at the
+            // same height, would go unnoticed until the chain grew past it (as zecd,
+            // which is reactive-only, also would). Detect those cases here — but only
+            // for a *genuine* reorg.
             //
-            // A reported tip below our scanned height is either a real reorg (the
-            // chain was rolled back) or merely a node that is lagging / briefly
-            // disagreeing (common when a light client hops between servers during
-            // a reorg). Distinguish them by comparing the node's tip hash against
-            // our stored hash at that height: a bare height comparison rewinds on
-            // a lagging node too, which ratchets the wallet backwards. Only rewind
-            // when the hashes actually differ (or we no longer hold that block).
+            // A reported tip at or below our scanned height is either a real reorg
+            // (the chain was rolled back or replaced) or merely a node that is
+            // lagging / briefly disagreeing (common when a light client hops between
+            // servers during a reorg). Distinguish them by comparing the node's tip
+            // hash against our stored hash at that height: a bare height comparison
+            // rewinds on a lagging node too, which ratchets the wallet backwards.
+            // Only rewind when the hashes actually differ (or we no longer hold that
+            // block).
             if let Some(max_scanned) = db_data.block_max_scanned()?.map(|b| b.block_height()) {
-                let diverged = _chain_tip < max_scanned
+                let diverged = _chain_tip <= max_scanned
                     && db_data.block_metadata(_chain_tip)?.map(|m| m.block_hash())
                         != Some(tip_hash);
                 if diverged {
