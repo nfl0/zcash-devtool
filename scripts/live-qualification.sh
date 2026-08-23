@@ -24,6 +24,8 @@ ZAINO_GRPC_URL="http://$ZAINO_GRPC_ADDR"
 COPPICE_NAME_ONE="phase2-alpha"
 COPPICE_NAME_TWO="phase2-beta"
 COPPICE_BOND_VALUE=100000000
+# Coppice REGTEST_V0 activation in the pinned Coppice deployment.
+COPPICE_ACTIVATION_HEIGHT=10
 
 # Disposable BIP-39 zero-entropy test mnemonic (23 x "abandon" + "art").
 # Never use it for funds outside this local Regtest.
@@ -35,12 +37,14 @@ STATE_DIR="$WORK_DIR/state"
 ZAKURA_STATE_DIR="$STATE_DIR/zakura"
 ZAINO_STATE_DIR="$STATE_DIR/zaino"
 WALLET_DIR="$STATE_DIR/wallet"
+RECOVERY_WALLET_DIR="$STATE_DIR/recovery-wallet"
 LOG_DIR="$WORK_DIR/logs"
 GRPC_DIR="$LOG_DIR/grpc"
 ZAKURA_CONFIG="$CONFIG_DIR/zakura.toml"
 ZAINO_CONFIG="$CONFIG_DIR/zaino.toml"
 ACTIVATION_FILE="$CONFIG_DIR/activation-heights.toml"
 IDENTITY_FILE="$WALLET_DIR/identity.txt"
+RECOVERY_IDENTITY_FILE="$RECOVERY_WALLET_DIR/identity.txt"
 
 mkdir -p "$CONFIG_DIR" "$ZAKURA_STATE_DIR" "$ZAINO_STATE_DIR" "$WALLET_DIR" "$LOG_DIR" "$GRPC_DIR"
 umask 077
@@ -152,19 +156,29 @@ run_devtool_expect_failure() {
     printf '[PASS] %s failed as expected\n' "$label"
 }
 
-wallet_sync_logged() {
+wallet_sync_logged_for() {
     local label=$1
+    local wallet_dir=$2
 
     run_devtool_logged "$label" wallet \
-        --wallet-dir "$WALLET_DIR" sync \
+        --wallet-dir "$wallet_dir" sync \
         --server "$ZAINO_GRPC_ADDR" --connection direct
 }
 
-wallet_status_logged() {
+wallet_sync_logged() {
+    wallet_sync_logged_for "$1" "$WALLET_DIR"
+}
+
+wallet_status_logged_for() {
     local label=$1
+    local wallet_dir=$2
 
     run_devtool_logged "$label" wallet \
-        --wallet-dir "$WALLET_DIR" coppice status
+        --wallet-dir "$wallet_dir" coppice status
+}
+
+wallet_status_logged() {
+    wallet_status_logged_for "$1" "$WALLET_DIR"
 }
 
 assert_coppice_status() {
@@ -212,10 +226,11 @@ assert_coppice_tip_hash() {
     printf '[PASS] Coppice canonical tip hash matches Zakura replacement tip\n'
 }
 
-assert_snapshot_status() {
-    local name=$1
-    local expected_status=$2
-    local expected_height=$3
+assert_snapshot_status_for() {
+    local wallet_dir=$1
+    local name=$2
+    local expected_status=$3
+    local expected_height=$4
 
     jq -e \
         --arg name "$name" \
@@ -239,36 +254,50 @@ assert_snapshot_status() {
                    and ($record.status | has("BondSpent")))
                else false
                end)' \
-        "$WALLET_DIR/coppice-v1.json" >/dev/null \
+        "$wallet_dir/coppice-v1.json" >/dev/null \
         || die "Coppice snapshot does not show $name=$expected_status at height $expected_height"
     printf '[PASS] canonical Coppice snapshot: %s=%s at height %s\n' \
         "$name" "$expected_status" "$expected_height"
 }
 
-assert_resolved_address() {
+assert_snapshot_status() {
+    assert_snapshot_status_for "$WALLET_DIR" "$@"
+}
+
+assert_resolved_address_for() {
     local label=$1
-    local name=$2
-    local expected=$3
+    local wallet_dir=$2
+    local name=$3
+    local expected=$4
     local output="$LOG_DIR/$label.log"
     local actual
 
     run_devtool_logged "$label" wallet \
-        --wallet-dir "$WALLET_DIR" coppice resolve "$name"
+        --wallet-dir "$wallet_dir" coppice resolve "$name"
     actual="$(tail -1 "$output" | tr -d '\r')"
     [[ "$actual" == "$expected" ]] \
         || die "resolve($name) returned $actual, expected $expected"
     printf '[PASS] resolve(%s)=%s\n' "$name" "$actual"
 }
 
-assert_resolve_inactive() {
+assert_resolved_address() {
+    assert_resolved_address_for "$1" "$WALLET_DIR" "$2" "$3"
+}
+
+assert_resolve_inactive_for() {
     local label=$1
-    local name=$2
+    local wallet_dir=$2
+    local name=$3
     local output="$LOG_DIR/$label.log"
 
     run_devtool_expect_failure "$label" wallet \
-        --wallet-dir "$WALLET_DIR" coppice resolve "$name"
+        --wallet-dir "$wallet_dir" coppice resolve "$name"
     [[ -s "$output" ]] || die "inactive resolve($name) produced no diagnostic"
     printf '[PASS] resolve(%s) is unavailable/inactive\n' "$name"
+}
+
+assert_resolve_inactive() {
+    assert_resolve_inactive_for "$1" "$WALLET_DIR" "$2"
 }
 
 rpc_call() {
@@ -1156,11 +1185,140 @@ assert_resolve_inactive coppice-reorg-resolve-first "$COPPICE_NAME_ONE"
 printf '[PASS] Coppice replay rewound the removed BondSpent transition and followed replacement h=%s\n' \
     "$REORG_OLD_HEIGHT"
 
-printf '\n[PASS] Phase 2 Coppice qualification complete\n'
+status "Phase 3: fresh same-seed wallet recovery from Coppice activation"
+[[ ! -e "$RECOVERY_WALLET_DIR" ]] \
+    || die "fresh recovery wallet directory already exists"
+mkdir "$RECOVERY_WALLET_DIR"
+for forbidden_state in \
+    "$RECOVERY_WALLET_DIR/coppice-v1.json" \
+    "$RECOVERY_WALLET_DIR/coppice-pending-v1.json" \
+    "$RECOVERY_WALLET_DIR/coppice-protection.json" \
+    "$RECOVERY_WALLET_DIR/data.sqlite"; do
+    [[ ! -e "$forbidden_state" ]] \
+        || die "fresh recovery wallet unexpectedly contains preexisting state: $forbidden_state"
+done
+printf '[PASS] fresh recovery directory started empty; no original wallet or Coppice state was copied\n'
+
+printf '[INFO] initializing fresh wallet with birthday/Coppice replay start height %s\n' \
+    "$COPPICE_ACTIVATION_HEIGHT"
+if {
+    printf '%s\n' "$WALLET_MNEMONIC" | timeout 240 "$DEVTOOL_BIN" wallet \
+        --wallet-dir "$RECOVERY_WALLET_DIR" init \
+        --name phase3-recovery \
+        --identity "$RECOVERY_IDENTITY_FILE" \
+        --network regtest \
+        --birthday "$COPPICE_ACTIVATION_HEIGHT" \
+        --activation-heights "$ACTIVATION_FILE" \
+        --server "$ZAINO_GRPC_ADDR" \
+        --connection direct
+} >"$LOG_DIR/phase3-wallet-init.log" 2>&1; then
+    printf '[PASS] fresh same-seed wallet initialized normally at %s\n' \
+        "$RECOVERY_WALLET_DIR"
+else
+    status_code=$?
+    printf '[FAIL] phase3-wallet-init (exit %d); see %s\n' \
+        "$status_code" "$LOG_DIR/phase3-wallet-init.log" >&2
+    tail -100 "$LOG_DIR/phase3-wallet-init.log" >&2 || true
+    exit "$status_code"
+fi
+
+for forbidden_state in \
+    "$RECOVERY_WALLET_DIR/coppice-v1.json" \
+    "$RECOVERY_WALLET_DIR/coppice-pending-v1.json"; do
+    [[ ! -e "$forbidden_state" ]] \
+        || die "fresh wallet init unexpectedly created copied Coppice state: $forbidden_state"
+done
+
+wallet_sync_logged_for phase3-wallet-sync "$RECOVERY_WALLET_DIR"
+wallet_status_logged_for phase3-recovery-status "$RECOVERY_WALLET_DIR"
+assert_coppice_status phase3-recovery-status "$REORG_OLD_HEIGHT" Enabled 2 0
+assert_snapshot_status_for "$RECOVERY_WALLET_DIR" \
+    "$COPPICE_NAME_ONE" Released "$REORG_OLD_HEIGHT"
+assert_snapshot_status_for "$RECOVERY_WALLET_DIR" \
+    "$COPPICE_NAME_TWO" Active "$REORG_OLD_HEIGHT"
+assert_resolved_address_for phase3-recovery-resolve-active \
+    "$RECOVERY_WALLET_DIR" "$COPPICE_NAME_TWO" "$UA_THREE"
+assert_resolve_inactive_for phase3-recovery-resolve-released \
+    "$RECOVERY_WALLET_DIR" "$COPPICE_NAME_ONE"
+jq -e '.local_registrations == []' "$LOG_DIR/phase3-recovery-status.log" >/dev/null \
+    || die "fresh recovery recreated stale local pending-registration metadata"
+printf '[PASS] fresh standard sync replayed the canonical registry: %s=Released, %s=Active, no local pending registrations\n' \
+    "$COPPICE_NAME_ONE" "$COPPICE_NAME_TWO"
+
+run_devtool_logged phase3-recovery-balance wallet \
+    --wallet-dir "$RECOVERY_WALLET_DIR" balance --json --min-confirmations 1
+RECOVERY_BALANCE="$(rg -a '^[{]' "$LOG_DIR/phase3-recovery-balance.log" | tail -1)"
+[[ -n "$RECOVERY_BALANCE" ]] || die "fresh recovery balance command did not emit JSON"
+RECOVERY_TOTAL="$(jq -r '.total' <<<"$RECOVERY_BALANCE")"
+RECOVERY_SPENDABLE="$(jq -r '.ironwood_spendable' <<<"$RECOVERY_BALANCE")"
+[[ "$RECOVERY_TOTAL" =~ ^[0-9]+$ && "$RECOVERY_SPENDABLE" =~ ^[0-9]+$ ]] \
+    || die "fresh recovery balance values were not numeric: $RECOVERY_BALANCE"
+RECOVERY_LOCKED_VALUE=$((RECOVERY_TOTAL - RECOVERY_SPENDABLE))
+(( RECOVERY_LOCKED_VALUE == COPPICE_BOND_VALUE )) \
+    || die "fresh recovery locked-value evidence $RECOVERY_LOCKED_VALUE does not equal active bond $COPPICE_BOND_VALUE: $RECOVERY_BALANCE"
+printf '[PASS] fresh FVK/nullifier-derived inventory reconstructed the %s-zatoshi active bond lock (total=%s spendable=%s)\n' \
+    "$RECOVERY_LOCKED_VALUE" "$RECOVERY_TOTAL" "$RECOVERY_SPENDABLE"
+
+run_devtool_logged phase3-probe-address wallet \
+    --wallet-dir "$RECOVERY_WALLET_DIR" generate-address
+RECOVERY_PROBE_ADDRESS="$(sed -n 's/^     Address: //p' \
+    "$LOG_DIR/phase3-probe-address.log" | tail -1)"
+[[ -n "$RECOVERY_PROBE_ADDRESS" ]] || die "fresh recovery probe address was not generated"
+RECOVERY_PROBE_VALUE=$((RECOVERY_SPENDABLE + 1))
+run_devtool_expect_failure phase3-ordinary-send wallet \
+    --wallet-dir "$RECOVERY_WALLET_DIR" send \
+    --identity "$RECOVERY_IDENTITY_FILE" \
+    --address "$RECOVERY_PROBE_ADDRESS" \
+    --value "$RECOVERY_PROBE_VALUE" \
+    --server "$ZAINO_GRPC_ADDR" --connection direct
+rg -a -qi 'insufficient|not enough|Coppice spend protection|locked' \
+    "$LOG_DIR/phase3-ordinary-send.log" \
+    || die "ordinary send did not fail for the locked active bond as expected"
+printf '[PASS] ordinary send could not consume the reconstructed active bond while protection was Enabled\n'
+
+run_devtool_logged phase3-break-bond-address wallet \
+    --wallet-dir "$RECOVERY_WALLET_DIR" generate-address
+RECOVERY_BREAK_BOND_ADDRESS="$(sed -n 's/^     Address: //p' \
+    "$LOG_DIR/phase3-break-bond-address.log" | tail -1)"
+[[ -n "$RECOVERY_BREAK_BOND_ADDRESS" ]] \
+    || die "fresh recovery Break Bond destination was not generated"
+PHASE3_BREAK_BOND_HEIGHT_EXPECTED=$(($(zakura_tip_height) + 1))
+run_devtool_logged phase3-break-bond wallet \
+    --wallet-dir "$RECOVERY_WALLET_DIR" coppice break-bond \
+    --identity "$RECOVERY_IDENTITY_FILE" \
+    --name "$COPPICE_NAME_TWO" \
+    --address "$RECOVERY_BREAK_BOND_ADDRESS" \
+    --value 1000000 \
+    --server "$ZAINO_GRPC_ADDR" --connection direct
+RECOVERY_BREAK_BOND_TXID="$(rg -a -o '[0-9a-fA-F]{64}' \
+    "$LOG_DIR/phase3-break-bond.log" | tail -1 || true)"
+[[ -n "$RECOVERY_BREAK_BOND_TXID" ]] \
+    || die "fresh recovery Break Bond did not emit a transaction id"
+rpc_generate 1
+wait_for_zaino_tip "$PHASE3_BREAK_BOND_HEIGHT_EXPECTED"
+wallet_sync_logged_for phase3-break-bond-sync "$RECOVERY_WALLET_DIR"
+wallet_status_logged_for phase3-break-bond-status "$RECOVERY_WALLET_DIR"
+assert_coppice_status phase3-break-bond-status \
+    "$PHASE3_BREAK_BOND_HEIGHT_EXPECTED" Enabled 2 0
+assert_snapshot_status_for "$RECOVERY_WALLET_DIR" \
+    "$COPPICE_NAME_ONE" Released "$PHASE3_BREAK_BOND_HEIGHT_EXPECTED"
+assert_snapshot_status_for "$RECOVERY_WALLET_DIR" \
+    "$COPPICE_NAME_TWO" BondSpent "$PHASE3_BREAK_BOND_HEIGHT_EXPECTED"
+assert_resolve_inactive_for phase3-break-bond-resolve-spent \
+    "$RECOVERY_WALLET_DIR" "$COPPICE_NAME_TWO"
+jq -e '.local_registrations == []' "$LOG_DIR/phase3-break-bond-status.log" >/dev/null \
+    || die "fresh recovery retained local pending registrations after Break Bond"
+printf '[PASS] fresh-wallet Break Bond tx %s spent the reconstructed active bond at height %s; Released and BondSpent names remained inactive\n' \
+    "$RECOVERY_BREAK_BOND_TXID" "$PHASE3_BREAK_BOND_HEIGHT_EXPECTED"
+
+printf '\n[PASS] Phase 1 + Phase 2 + Phase 3 qualification complete\n'
 printf '[PASS] lifecycle evidence: %s COMMIT/REVEAL/UPDATE/RELEASE, %s second COMMIT/REVEAL/Break Bond\n' \
     "$COPPICE_NAME_ONE" "$COPPICE_NAME_TWO"
 printf '[PASS] restart recovery: Zaino and fresh wallet processes reused persisted state\n'
 printf '[PASS] shallow reorg: invalidated h=%s (%s), replacement h=%s (%s); post-reorg %s=Active and %s=Released\n' \
     "$REORG_OLD_HEIGHT" "$REORG_OLD_HASH" "$REORG_OLD_HEIGHT" "$REORG_NEW_HASH" \
     "$COPPICE_NAME_TWO" "$COPPICE_NAME_ONE"
+printf '[PASS] Phase 3 fresh same-seed recovery: birthday=%s, sync tip=%s, Break Bond tx=%s at h=%s\n' \
+    "$COPPICE_ACTIVATION_HEIGHT" "$REORG_OLD_HEIGHT" "$RECOVERY_BREAK_BOND_TXID" \
+    "$PHASE3_BREAK_BOND_HEIGHT_EXPECTED"
 printf '[PASS] deep reorg tests were not run\n'

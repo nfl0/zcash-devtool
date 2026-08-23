@@ -74,6 +74,9 @@ The harness creates an isolated disposable Regtest stack and runs:
   receive/spend.
 - Phase 2: Coppice COMMIT, REVEAL, `coppice complete`, UPDATE, RELEASE, second
   registration, Break Bond, restart recovery, and a same-height shallow reorg.
+- Phase 3: fresh same-seed wallet initialization from Coppice activation,
+  canonical replay, bond-lock reconstruction, protected ordinary-send rejection,
+  and fresh-wallet Break Bond.
 
 On success, temporary state and logs are removed. On failure, the run directory
 under `/tmp/coppice-live-qualification.*` is preserved and printed so the
