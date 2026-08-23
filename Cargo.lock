@@ -1351,7 +1351,7 @@ dependencies = [
 [[package]]
 name = "coppice"
 version = "0.1.0"
-source = "git+https://github.com/nfl0/coppice.git?rev=8cf92b040cfaee1fd875cccad554b2cb974a2303#8cf92b040cfaee1fd875cccad554b2cb974a2303"
+source = "git+https://github.com/nfl0/coppice.git?rev=d3c2e944770f5cbb4d59d26e9033cd39e6b1f14e#d3c2e944770f5cbb4d59d26e9033cd39e6b1f14e"
 dependencies = [
  "blake2b_simd",
  "halo2_gadgets",
@@ -1375,7 +1375,7 @@ dependencies = [
 [[package]]
 name = "coppice-librustzcash"
 version = "0.1.0"
-source = "git+https://github.com/nfl0/coppice.git?rev=8cf92b040cfaee1fd875cccad554b2cb974a2303#8cf92b040cfaee1fd875cccad554b2cb974a2303"
+source = "git+https://github.com/nfl0/coppice.git?rev=d3c2e944770f5cbb4d59d26e9033cd39e6b1f14e#d3c2e944770f5cbb4d59d26e9033cd39e6b1f14e"
 dependencies = [
  "coppice",
  "incrementalmerkletree",
@@ -4545,7 +4545,7 @@ checksum = "04744f49eae99ab78e0d5c0b603ab218f515ea8cfe5a456d7629ad883a3b6e7d"
 [[package]]
 name = "orchard"
 version = "0.15.3"
-source = "git+https://github.com/nfl0/coppice.git?rev=8cf92b040cfaee1fd875cccad554b2cb974a2303#8cf92b040cfaee1fd875cccad554b2cb974a2303"
+source = "git+https://github.com/nfl0/coppice.git?rev=d3c2e944770f5cbb4d59d26e9033cd39e6b1f14e#d3c2e944770f5cbb4d59d26e9033cd39e6b1f14e"
 dependencies = [
  "aes",
  "bitvec",

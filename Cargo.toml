@@ -14,8 +14,8 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(zcash_unstable, values("nu
 
 [dependencies]
 anyhow = "1"
-coppice = { git = "https://github.com/nfl0/coppice.git", rev = "8cf92b040cfaee1fd875cccad554b2cb974a2303" }
-coppice-librustzcash = { git = "https://github.com/nfl0/coppice.git", rev = "8cf92b040cfaee1fd875cccad554b2cb974a2303" }
+coppice = { git = "https://github.com/nfl0/coppice.git", rev = "d3c2e944770f5cbb4d59d26e9033cd39e6b1f14e" }
+coppice-librustzcash = { git = "https://github.com/nfl0/coppice.git", rev = "d3c2e944770f5cbb4d59d26e9033cd39e6b1f14e" }
 bip0039 = { version = "0.14", features = ["std", "all-languages"] }
 bip32 = { version = "=0.6.0-pre.1", default-features = false, features = ["secp256k1-ffi"] }
 futures-util = "0.3"
@@ -162,7 +162,7 @@ tui = [
 # at this same commit -- a git dependency's own nested patches don't
 # propagate to ours, so this workspace needs its own matching entry or the
 # graph disagrees on which orchard it's building against.
-orchard = { git = "https://github.com/nfl0/coppice.git", rev = "8cf92b040cfaee1fd875cccad554b2cb974a2303" }
+orchard = { git = "https://github.com/nfl0/coppice.git", rev = "d3c2e944770f5cbb4d59d26e9033cd39e6b1f14e" }
 equihash = { git = "https://github.com/zcash/librustzcash.git", rev = "6c07e5f3297febf469e5cc8d0b91321e0767cdd7" }
 f4jumble = { git = "https://github.com/zcash/librustzcash.git", rev = "6c07e5f3297febf469e5cc8d0b91321e0767cdd7" }
 zcash_address = { git = "https://github.com/zcash/librustzcash.git", rev = "6c07e5f3297febf469e5cc8d0b91321e0767cdd7" }
