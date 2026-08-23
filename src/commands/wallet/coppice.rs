@@ -824,7 +824,7 @@ fn require_coppice<P: Parameters>(
     wallet_dir: Option<&String>,
 ) -> anyhow::Result<(
     coppice_librustzcash::CoppiceProtectionMode,
-    coppice::reducer_v1::V1Reducer,
+    coppice::reducer::V1Reducer,
     coppice_librustzcash::PendingRegistrationCollection,
 )> {
     crate::coppice_support::load_existing(params, wallet_dir)?.ok_or_else(|| {
@@ -832,7 +832,7 @@ fn require_coppice<P: Parameters>(
     })
 }
 
-fn next_target(reducer: &coppice::reducer_v1::V1Reducer) -> anyhow::Result<TargetHeight> {
+fn next_target(reducer: &coppice::reducer::V1Reducer) -> anyhow::Result<TargetHeight> {
     Ok(TargetHeight::from(
         reducer
             .tip()
@@ -847,7 +847,7 @@ async fn construct_and_broadcast<P: Parameters + Clone>(
     params: &P,
     mode: coppice_librustzcash::CoppiceProtectionMode,
     host: &crate::coppice_support::StaticCanonicalTip,
-    reducer: &coppice::reducer_v1::V1Reducer,
+    reducer: &coppice::reducer::V1Reducer,
     pending: &coppice_librustzcash::PendingRegistrationCollection,
     db: &mut WalletDb<rusqlite::Connection, P, SystemClock, OsRng>,
     account_id: AccountUuid,

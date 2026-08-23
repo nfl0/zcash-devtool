@@ -14,7 +14,7 @@ use std::{
 use ::coppice::{
     bond_tag,
     config::{DeploymentParameters, REGTEST_V0, TESTNET_V0},
-    reducer_v1::{ActivationCheckpoint, V1Reducer},
+    reducer::{ActivationCheckpoint, V1Reducer},
 };
 use anyhow::{Context, anyhow};
 use coppice_librustzcash::{
@@ -802,7 +802,7 @@ pub(crate) async fn reconcile<P: Parameters>(
         );
     }
     if let Some(error) = persistence_error {
-        return Err(error.context("persisting incremental Coppice replay progress"));
+        return Err(error.context("persisting intermediate Coppice replay progress"));
     }
     let outcome =
         outcome.map_err(|error| anyhow!("Coppice canonical reconciliation failed: {error:?}"))?;

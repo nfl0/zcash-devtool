@@ -278,7 +278,7 @@ pub(crate) async fn pay<C: PaymentContext>(
         proposal.map_err(error::Error::from)?
     } else {
         // Explicit `Off` and pre-activation `Enabled` also repair any
-        // exact-owner advisory Coppice locks left by a concurrent or legacy
+        // exact-owner advisory Coppice locks left by a concurrent or pre-existing
         // protected process.
         crate::coppice_support::clear_coppice_advisory_locks(&mut db_data)?;
         propose_transfer(
