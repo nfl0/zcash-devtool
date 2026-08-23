@@ -49,6 +49,23 @@ use crate::{
     commands::select_account, config::WalletConfig, data::get_db_paths, remote::ConnectionArgs,
 };
 
+const COPPICE_PRESENTATION_SUFFIX: &str = ".zec";
+
+fn normalize_coppice_name(name: &str) -> anyhow::Result<String> {
+    let canonical = name
+        .strip_suffix(COPPICE_PRESENTATION_SUFFIX)
+        .unwrap_or(name);
+    if coppice::envelope::valid_name(canonical) {
+        Ok(canonical.to_owned())
+    } else {
+        Err(anyhow!("invalid Coppice name: {name}"))
+    }
+}
+
+fn display_coppice_name(canonical_name: &str) -> String {
+    format!("{canonical_name}{COPPICE_PRESENTATION_SUFFIX}")
+}
+
 #[derive(Debug, Subcommand)]
 pub(crate) enum Command {
     /// Show or set durable Coppice spend protection.
@@ -283,12 +300,19 @@ impl Status {
                 "tip_hash": hex::encode(reducer.tip().block_hash),
                 "names": reducer.state().names.len(),
                 "pending_protocol_commits": reducer.state().pending.len(),
+                "canonical_names": reducer.state().names.keys().map(|name| {
+                    serde_json::json!({
+                        "name": name,
+                        "display_name": display_coppice_name(name),
+                    })
+                }).collect::<Vec<_>>(),
                 "wallet_accounts": wallet_accounts,
                 "local_registrations": pending.commitments().map(|commitment| {
                     let registration = pending.get(&commitment).expect("enumerated commitment exists");
                     serde_json::json!({
                         "commitment": hex::encode(commitment),
                         "name": registration.name(),
+                        "display_name": display_coppice_name(registration.name()),
                         "account_id": hex::encode(registration.account_id().to_bytes()),
                         "stage": format!("{:?}", registration_stage(registration)),
                     })
@@ -306,13 +330,14 @@ impl Status {
 
 impl Resolve {
     fn run(self, wallet_dir: Option<String>) -> anyhow::Result<()> {
+        let name = normalize_coppice_name(&self.name)?;
         let config = WalletConfig::read(wallet_dir.as_ref())?;
         let params = config.network();
         let (_, path) = get_db_paths(wallet_dir.as_ref());
         let db = WalletDb::for_path(path, params, SystemClock, OsRng)?;
         let (_, reducer, _) = require_coppice(&params, wallet_dir.as_ref())?;
         let host = crate::coppice_support::wallet_tip(&db)?;
-        let destination = resolve_for_payment(&host, &reducer, &self.name)
+        let destination = resolve_for_payment(&host, &reducer, &name)
             .map_err(|error| anyhow!("Coppice name resolution failed: {error:?}"))?;
         println!("{}", String::from_utf8(destination.address)?);
         Ok(())
@@ -351,13 +376,14 @@ impl crate::commands::wallet::send::PaymentContext for Pay {
 
 impl Pay {
     async fn run(self, wallet_dir: Option<String>) -> anyhow::Result<()> {
+        let name = normalize_coppice_name(&self.name)?;
         let config = WalletConfig::read(wallet_dir.as_ref())?;
         let params = config.network();
         let (_, path) = get_db_paths(wallet_dir.as_ref());
         let db = WalletDb::for_path(path, params, SystemClock, OsRng)?;
         let (_, reducer, _) = require_coppice(&params, wallet_dir.as_ref())?;
         let host = crate::coppice_support::wallet_tip(&db)?;
-        let destination = resolve_for_payment(&host, &reducer, &self.name)
+        let destination = resolve_for_payment(&host, &reducer, &name)
             .map_err(|error| anyhow!("Coppice name resolution failed: {error:?}"))?;
         let recipient = ZcashAddress::from_str(&String::from_utf8(destination.address)?)
             .map_err(|_| anyhow!("canonical Coppice address could not be parsed"))?;
@@ -372,6 +398,7 @@ impl Pay {
 
 impl Register {
     async fn run(self, wallet_dir: Option<String>) -> anyhow::Result<()> {
+        let name = normalize_coppice_name(&self.name)?;
         let SpendingContext {
             params,
             mut db,
@@ -397,7 +424,7 @@ impl Register {
                 WalletAccountId::from_orchard_fvk(&orchard_fvk),
                 IronwoodViewingCapability::Spending,
                 &mut backend,
-                &self.name,
+                &name,
                 self.address.as_bytes(),
                 RegistrationOwner::DefaultSoftware(usk.orchard().to_bytes()),
                 OsRng,
@@ -462,6 +489,7 @@ impl ObserveCommit {
 
 impl Update {
     async fn run(self, wallet_dir: Option<String>) -> anyhow::Result<()> {
+        let name = normalize_coppice_name(&self.name)?;
         let SpendingContext {
             params,
             mut db,
@@ -474,7 +502,7 @@ impl Update {
         let prepared = prepare_update(
             &host,
             &reducer,
-            &self.name,
+            &name,
             self.address.as_bytes(),
             OwnerAuthority::DefaultSoftware(usk.orchard().to_bytes()),
         )
@@ -501,6 +529,7 @@ impl Update {
 
 impl Release {
     async fn run(self, wallet_dir: Option<String>) -> anyhow::Result<()> {
+        let name = normalize_coppice_name(&self.name)?;
         let SpendingContext {
             params,
             mut db,
@@ -513,7 +542,7 @@ impl Release {
         let prepared = prepare_release(
             &host,
             &reducer,
-            &self.name,
+            &name,
             OwnerAuthority::DefaultSoftware(usk.orchard().to_bytes()),
         )
         .map_err(|error| anyhow!("RELEASE preparation failed: {error:?}"))?;
@@ -551,6 +580,7 @@ impl Abandon {
 
 impl BreakBond {
     async fn run(self, wallet_dir: Option<String>) -> anyhow::Result<()> {
+        let name = normalize_coppice_name(&self.name)?;
         let SpendingContext {
             params,
             mut db,
@@ -571,7 +601,7 @@ impl BreakBond {
             let plan = prepare_break_bond(
                 &host,
                 &reducer,
-                &self.name,
+                &name,
                 IronwoodViewingCapability::Spending,
                 &backend,
             )
@@ -966,4 +996,18 @@ fn hex32(value: &str) -> anyhow::Result<[u8; 32]> {
     bytes
         .try_into()
         .map_err(|_| anyhow!("expected 32-byte hexadecimal value"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn presentation_names_converge_at_the_wallet_boundary() {
+        assert_eq!(normalize_coppice_name("alice").unwrap(), "alice");
+        assert_eq!(normalize_coppice_name("alice.zec").unwrap(), "alice");
+        assert_eq!(display_coppice_name("alice"), "alice.zec");
+        assert!(normalize_coppice_name("alice.zec.zec").is_err());
+        assert!(normalize_coppice_name("ALICE.zec").is_err());
+    }
 }

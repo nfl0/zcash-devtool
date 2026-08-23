@@ -94,6 +94,12 @@ normal wallet proposal, fee, proof, storage, and submission path. Local pending
 metadata advances to broadcast only after the exact stored transaction is
 accepted by the configured server.
 
+Coppice names are stored and resolved as bare canonical labels. Coppice-aware
+wallet commands accept either `alice` or the presentation form `alice.zec`;
+the suffix is stripped before normalization, lookup, commitments, signatures,
+and pending metadata. Status output keeps the canonical `name` and also
+provides a `display_name` ending in `.zec` for wallet/frontend presentation.
+
 Canonical replay targets the exact wallet-selected height and hash captured
 after wallet scanning; a lightwalletd tip that advances during the pass is only
 transport and is caught on the next wallet sync. Replay progress is persisted
