@@ -8,7 +8,7 @@ use tokio::{
     fs::File,
     io::{AsyncReadExt, stdin},
 };
-use zcash_client_backend::data_api::wallet::extract_and_store_transaction_from_pczt;
+use zcash_client_backend::data_api::{WalletRead, wallet::extract_and_store_transaction_from_pczt};
 use zcash_client_sqlite::{WalletDb, util::SystemClock};
 use zcash_proofs::prover::LocalTxProver;
 
@@ -43,6 +43,20 @@ impl Command {
 
         let pczt = Pczt::parse(&buf).map_err(|e| anyhow!("Failed to read PCZT: {:?}", e))?;
 
+        // Gate the public Ironwood nullifiers before the wallet-mutating
+        // extraction/storage operation. The exact stored transaction is
+        // checked again below, but a protected rejection must not first mark
+        // the bond spent in local wallet state.
+        crate::coppice_support::ensure_external_ironwood_nullifiers_respect_coppice(
+            &params,
+            wallet_dir.as_ref(),
+            &db_data,
+            pczt.ironwood()
+                .actions()
+                .iter()
+                .map(|action| *action.spend().nullifier()),
+        )?;
+
         let prover = LocalTxProver::bundled();
         let (spend_vk, output_vk) = prover.verifying_keys();
 
@@ -56,6 +70,15 @@ impl Command {
             None,
         )
         .map_err(|e| anyhow!("Failed to extract and store transaction from PCZT: {:?}", e))?;
+        let transaction = db_data
+            .get_transaction(txid)?
+            .ok_or_else(|| anyhow!("stored PCZT transaction is unavailable"))?;
+        crate::coppice_support::ensure_external_transaction_respects_coppice(
+            &params,
+            wallet_dir.as_ref(),
+            &db_data,
+            &transaction,
+        )?;
 
         // Send the exact stored transaction through the shared lifecycle boundary.
         println!("Sending transaction...");

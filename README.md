@@ -91,10 +91,21 @@ normal wallet proposal, fee, proof, storage, and submission path. Local pending
 metadata advances to broadcast only after the exact stored transaction is
 accepted by the configured server.
 
-Canonical replay progress is persisted after every block and immediately after
-a retained reorg rewind. An unusable snapshot or a reorg deeper than retained
-undo history rebuilds from Coppice activation. A successful sync then
-reconciles locks for every wallet account before returning.
+Canonical replay targets the exact wallet-selected height and hash captured
+after wallet scanning; a lightwalletd tip that advances during the pass is only
+transport and is caught on the next wallet sync. Replay progress is persisted
+atomically after every block and immediately after a retained reorg rewind. An
+unusable snapshot or a reorg deeper than retained undo history rebuilds from
+Coppice activation. A successful sync then reconciles account-scoped pending
+registrations and locks for every wallet account before returning.
+
+Explicit `off` removes only Coppice-owned advisory locks and preserves foreign
+locks. Automatic sends and proposal creation repeat that exact-owner cleanup in
+Off mode as a recovery boundary. In protected modes, ordinary wallet proposals,
+PCZT creation, and submission of already-signed PCZTs all fail closed if
+canonical state is missing or stale. Signed PCZT Ironwood nullifiers are gated
+before wallet storage; a transaction that spends an active or pending bond must
+use the explicit Break Bond workflow.
 
 ### Video tutorial of Zcash Devtool
 Kris Nuttycombe (@nuttycom) presented this tool during ZconVI. The session is available

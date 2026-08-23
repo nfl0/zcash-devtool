@@ -92,11 +92,7 @@ impl Command {
             ),
         );
         let input_selector = GreedyInputSelector::new();
-        let orchard_fvk = account
-            .ufvk()
-            .and_then(|ufvk| ufvk.orchard())
-            .cloned()
-            .ok_or_else(|| anyhow!("selected account has no Orchard full viewing key"))?;
+        let orchard_fvk = account.ufvk().and_then(|ufvk| ufvk.orchard()).cloned();
 
         let request = TransactionRequest::new(vec![
             Payment::new(
@@ -120,7 +116,7 @@ impl Command {
             wallet_dir.as_ref(),
             &mut db_data,
             account.id(),
-            &orchard_fvk,
+            orchard_fvk.as_ref(),
             |db| {
                 propose_transfer(
                     db,

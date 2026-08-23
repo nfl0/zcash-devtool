@@ -65,11 +65,7 @@ impl Command {
         let (_, db_data) = get_db_paths(wallet_dir.as_ref());
         let mut db_data = WalletDb::for_path(db_data, params, SystemClock, OsRng)?;
         let account = select_account(&db_data, self.account_id)?;
-        let orchard_fvk = account
-            .ufvk()
-            .and_then(|ufvk| ufvk.orchard())
-            .cloned()
-            .ok_or_else(|| anyhow!("selected account has no Orchard full viewing key"))?;
+        let orchard_fvk = account.ufvk().and_then(|ufvk| ufvk.orchard()).cloned();
 
         let recipient =
             ZcashAddress::from_str(&self.address).map_err(|_| error::Error::InvalidRecipient)?;
@@ -90,7 +86,7 @@ impl Command {
             wallet_dir.as_ref(),
             &mut db_data,
             account.id(),
-            &orchard_fvk,
+            orchard_fvk.as_ref(),
             |db| {
                 propose_send_max_transfer(
                     db,

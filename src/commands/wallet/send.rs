@@ -37,7 +37,7 @@ use crate::{
     remote::ConnectionArgs, ui::proposal::print_proposal,
 };
 use coppice_librustzcash::{
-    IronwoodViewingCapability, WalletCoppiceLockBackend, with_coppice_spend_guard,
+    IronwoodViewingCapability, WalletAccountId, WalletCoppiceLockBackend, with_coppice_spend_guard,
 };
 
 // Options accepted for the `send` command
@@ -254,6 +254,7 @@ pub(crate) async fn pay<C: PaymentContext>(
             &host_tip,
             &reducer,
             &pending,
+            WalletAccountId::from_orchard_fvk(&orchard_fvk),
             IronwoodViewingCapability::FullViewing,
             &mut backend,
             |backend| {
@@ -276,6 +277,9 @@ pub(crate) async fn pay<C: PaymentContext>(
         .map_err(|error| anyhow!("Coppice spend protection failed: {error:?}"))?;
         proposal.map_err(error::Error::from)?
     } else {
+        // Explicit `Off` also repairs any exact-owner advisory Coppice locks
+        // left by a concurrent or legacy protected process.
+        crate::coppice_support::clear_coppice_advisory_locks(&mut db_data)?;
         propose_transfer(
             &mut db_data,
             &params,

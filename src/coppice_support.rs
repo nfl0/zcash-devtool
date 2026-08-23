@@ -12,26 +12,30 @@ use std::{
 };
 
 use ::coppice::{
+    bond_tag,
     config::{DeploymentParameters, REGTEST_V0, TESTNET_V0},
     reducer_v1::{ActivationCheckpoint, V1Reducer},
 };
 use anyhow::{Context, anyhow};
 use coppice_librustzcash::{
-    CanonicalBlockSource, CanonicalTip, CoppiceProtectionMode, FullTransactionSource,
-    HostCanonicalTipSource, IronwoodViewingCapability, PendingRegistrationCollection,
-    ReconcileError, ReconcileOutcome, WalletCanonicalTip, WalletCoppiceLockBackend,
-    active_canonical_bond_tags, reconcile_canonical_chain_with_progress,
-    reconcile_canonical_commit_cache, reconcile_locks, with_coppice_spend_guard,
+    CanonicalBlockSource, CanonicalTip, CoppiceProtectionMode, FrozenCanonicalBlockSource,
+    FullTransactionSource, HostCanonicalTipSource, IronwoodViewingCapability,
+    PendingRegistrationCollection, ReconcileError, ReconcileOutcome, WalletAccountId,
+    WalletCanonicalTip, WalletCoppiceLockBackend, active_canonical_bond_tags,
+    reconcile_canonical_chain_with_progress, reconcile_canonical_commit_cache, reconcile_locks,
+    with_coppice_spend_guard,
 };
 use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
 use tonic::{Code, transport::Channel};
-use zcash_client_backend::data_api::{Account, WalletRead, wallet::TargetHeight};
+use uuid::Uuid;
+use zcash_client_backend::data_api::{Account, OutputLockStore, WalletRead, wallet::TargetHeight};
 use zcash_client_backend::proto::{
     compact_formats::CompactBlock,
     service::{self, compact_tx_streamer_client::CompactTxStreamerClient},
 };
 use zcash_client_sqlite::{WalletDb, util::SystemClock};
+use zcash_primitives::transaction::Transaction;
 use zcash_protocol::consensus::{NetworkType, Parameters};
 
 use crate::data::DEFAULT_WALLET_DIR;
@@ -236,16 +240,37 @@ pub(crate) fn set_protection_mode(
     mode: StoredProtectionMode,
 ) -> anyhow::Result<()> {
     let path = protection_path(wallet_dir);
-    let temporary = path.with_extension("json.tmp");
     let bytes = serde_json::to_vec(&StoredProtection {
         format_version: 1,
         mode,
     })?;
-    let mut file = fs::File::create(&temporary)?;
-    file.write_all(&bytes)?;
-    file.sync_all()?;
-    fs::rename(temporary, path)?;
-    Ok(())
+    atomic_write(&path, &bytes, false)
+}
+
+fn atomic_write(path: &Path, bytes: &[u8], private: bool) -> anyhow::Result<()> {
+    let extension = format!("tmp-{}", Uuid::new_v4());
+    let temporary = path.with_extension(extension);
+    let result = (|| {
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        if private {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&temporary)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        fs::rename(&temporary, path)?;
+        if let Some(parent) = path.parent() {
+            fs::File::open(parent)?.sync_all()?;
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
 }
 
 pub(crate) fn load_existing<P: Parameters>(
@@ -301,6 +326,7 @@ pub(crate) fn reconcile_wallet_locks<P: Parameters + Clone>(
         .checked_add(1)
         .ok_or_else(|| anyhow!("Coppice target height overflow"))?;
     let active = active_canonical_bond_tags(reducer);
+    validate_pending_account_ownership(wallet_db, pending)?;
     for account_id in wallet_db
         .get_account_ids()
         .map_err(|error| anyhow!("wallet account inventory failed: {error:?}"))?
@@ -322,6 +348,7 @@ pub(crate) fn reconcile_wallet_locks<P: Parameters + Clone>(
         reconcile_locks(
             &active,
             pending,
+            WalletAccountId::from_orchard_fvk(&orchard_fvk),
             IronwoodViewingCapability::FullViewing,
             &mut backend,
         )
@@ -330,21 +357,123 @@ pub(crate) fn reconcile_wallet_locks<P: Parameters + Clone>(
     Ok(())
 }
 
+fn validate_pending_account_ownership<P: Parameters>(
+    wallet_db: &WalletDb<rusqlite::Connection, P, SystemClock, OsRng>,
+    pending: &PendingRegistrationCollection,
+) -> anyhow::Result<()> {
+    let mut known = std::collections::BTreeSet::new();
+    for account_id in wallet_db
+        .get_account_ids()
+        .map_err(|error| anyhow!("wallet account inventory failed: {error:?}"))?
+    {
+        let account = wallet_db
+            .get_account(account_id)
+            .map_err(|error| anyhow!("wallet account lookup failed: {error:?}"))?
+            .ok_or_else(|| anyhow!("wallet account disappeared during pending validation"))?;
+        if let Some(fvk) = account.ufvk().and_then(|ufvk| ufvk.orchard()) {
+            known.insert(WalletAccountId::from_orchard_fvk(fvk));
+        }
+    }
+    if pending.commitments().any(|commitment| {
+        pending
+            .get(&commitment)
+            .is_some_and(|registration| !known.contains(&registration.account_id()))
+    }) {
+        return Err(anyhow!(
+            "Coppice pending registration belongs to an unavailable wallet account"
+        ));
+    }
+    Ok(())
+}
+
+/// Removes only exact-owner Coppice advisory locks before a deliberate
+/// transition to protection `Off`.
+///
+/// This does not require reducer state: each owned Ironwood note supplies its
+/// canonical bond tag, and `unlock_output` can remove only the matching
+/// `LockOwner`. Foreign and unrelated proposal locks are therefore preserved.
+pub(crate) fn clear_coppice_advisory_locks<P: Parameters + Clone>(
+    wallet_db: &mut WalletDb<rusqlite::Connection, P, SystemClock, OsRng>,
+) -> anyhow::Result<usize> {
+    let accounts = wallet_db
+        .get_account_ids()
+        .map_err(|error| anyhow!("wallet account inventory failed: {error:?}"))?;
+    let Some(metadata) = wallet_db
+        .block_max_scanned()
+        .map_err(|error| anyhow!("wallet canonical tip unavailable: {error:?}"))?
+    else {
+        for account_id in accounts {
+            if !wallet_db
+                .get_locked_outputs(account_id)
+                .map_err(|error| anyhow!("wallet lock inventory failed: {error:?}"))?
+                .is_empty()
+            {
+                return Err(anyhow!(
+                    "wallet has locks but no scanned tip; refusing ambiguous Coppice cleanup"
+                ));
+            }
+        }
+        return Ok(0);
+    };
+    let target = u32::from(metadata.block_height())
+        .checked_add(1)
+        .ok_or_else(|| anyhow!("wallet target height overflow"))?;
+    let empty_active = std::collections::BTreeSet::new();
+    let empty_pending = PendingRegistrationCollection::new();
+    let mut removed = 0usize;
+    for account_id in accounts {
+        let account = wallet_db
+            .get_account(account_id)
+            .map_err(|error| anyhow!("wallet account lookup failed: {error:?}"))?
+            .ok_or_else(|| anyhow!("wallet account disappeared during lock cleanup"))?;
+        let Some(orchard_fvk) = account.ufvk().and_then(|ufvk| ufvk.orchard()).cloned() else {
+            continue;
+        };
+        let mut backend = WalletCoppiceLockBackend::new(
+            wallet_db,
+            account_id,
+            TargetHeight::from(target),
+            &orchard_fvk,
+            IronwoodViewingCapability::FullViewing,
+        );
+        removed += reconcile_locks(
+            &empty_active,
+            &empty_pending,
+            WalletAccountId::from_orchard_fvk(&orchard_fvk),
+            IronwoodViewingCapability::FullViewing,
+            &mut backend,
+        )
+        .map_err(|error| anyhow!("Coppice lock cleanup failed: {error:?}"))?
+        .removed_locks;
+    }
+    Ok(removed)
+}
+
 pub(crate) fn with_spend_protection<P, R, E>(
     params: &P,
     wallet_dir: Option<&String>,
     wallet_db: &mut WalletDb<rusqlite::Connection, P, SystemClock, OsRng>,
     account_id: zcash_client_sqlite::AccountUuid,
-    orchard_fvk: &orchard::keys::FullViewingKey,
+    orchard_fvk: Option<&orchard::keys::FullViewingKey>,
     operation: impl FnOnce(&mut WalletDb<rusqlite::Connection, P, SystemClock, OsRng>) -> Result<R, E>,
 ) -> anyhow::Result<Result<R, E>>
 where
     P: Parameters + Clone,
     E: std::fmt::Debug,
 {
-    match load_existing(params, wallet_dir)? {
-        None => Ok(operation(wallet_db)),
+    let protected_state = load_existing(params, wallet_dir)?;
+    let orchard_fvk = orchard_fvk_for_protection(protected_state.is_some(), orchard_fvk)?;
+    match protected_state {
+        None => {
+            // `Off` is deliberately unprotected, but it must also repair an
+            // advisory Coppice lock left by a concurrent or older process.
+            // Exact-owner cleanup preserves foreign and non-Coppice locks.
+            clear_coppice_advisory_locks(wallet_db)?;
+            Ok(operation(wallet_db))
+        }
         Some((mode, reducer, pending)) => {
+            validate_pending_account_ownership(wallet_db, &pending)?;
+            let orchard_fvk = orchard_fvk.expect("protected mode checked above");
             let host_tip = wallet_tip(wallet_db)?;
             let target = reducer
                 .tip()
@@ -363,6 +492,7 @@ where
                 &host_tip,
                 &reducer,
                 &pending,
+                WalletAccountId::from_orchard_fvk(orchard_fvk),
                 IronwoodViewingCapability::FullViewing,
                 &mut backend,
                 |backend| operation(backend.wallet_db_mut()),
@@ -373,6 +503,71 @@ where
     }
 }
 
+fn orchard_fvk_for_protection(
+    protected: bool,
+    orchard_fvk: Option<&orchard::keys::FullViewingKey>,
+) -> anyhow::Result<Option<&orchard::keys::FullViewingKey>> {
+    if protected && orchard_fvk.is_none() {
+        Err(anyhow!(
+            "Coppice protection requires an Orchard full viewing key"
+        ))
+    } else {
+        Ok(orchard_fvk)
+    }
+}
+
+fn contains_protected_bond_spend(
+    nullifiers: impl IntoIterator<Item = [u8; 32]>,
+    protected: &std::collections::BTreeSet<[u8; 32]>,
+) -> bool {
+    nullifiers.into_iter().any(|nullifier| {
+        bond_tag::derive_v1_bond_tag(&nullifier).is_ok_and(|tag| protected.contains(&tag))
+    })
+}
+
+pub(crate) fn ensure_external_transaction_respects_coppice<P: Parameters>(
+    params: &P,
+    wallet_dir: Option<&String>,
+    wallet_db: &WalletDb<rusqlite::Connection, P, SystemClock, OsRng>,
+    transaction: &Transaction,
+) -> anyhow::Result<()> {
+    let nullifiers = transaction
+        .ironwood_bundle()
+        .into_iter()
+        .flat_map(|bundle| bundle.actions())
+        .map(|action| action.nullifier().to_bytes());
+    ensure_external_ironwood_nullifiers_respect_coppice(params, wallet_dir, wallet_db, nullifiers)
+}
+
+pub(crate) fn ensure_external_ironwood_nullifiers_respect_coppice<P: Parameters>(
+    params: &P,
+    wallet_dir: Option<&String>,
+    wallet_db: &WalletDb<rusqlite::Connection, P, SystemClock, OsRng>,
+    nullifiers: impl IntoIterator<Item = [u8; 32]>,
+) -> anyhow::Result<()> {
+    let Some((_, reducer, pending)) = load_existing(params, wallet_dir)? else {
+        return Ok(());
+    };
+    validate_pending_account_ownership(wallet_db, &pending)?;
+    let host_tip = wallet_tip(wallet_db)?;
+    coppice_librustzcash::require_exact_canonical_tip(&host_tip, &reducer)
+        .map_err(|error| anyhow!("Coppice submission protection failed: {error:?}"))?;
+
+    let mut protected = active_canonical_bond_tags(&reducer);
+    protected.extend(
+        pending
+            .commitments()
+            .filter_map(|commitment| pending.get(&commitment))
+            .map(|registration| registration.bond_tag()),
+    );
+    if contains_protected_bond_spend(nullifiers, &protected) {
+        return Err(anyhow!(
+            "signed transaction spends a protected Coppice bond; use explicit Break Bond"
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) fn persist_pending(
     wallet_dir: Option<&String>,
     deployment: &DeploymentParameters,
@@ -381,20 +576,7 @@ pub(crate) fn persist_pending(
     let bytes = pending
         .save_local(deployment)
         .map_err(|error| anyhow!("Coppice pending-intent encoding failed: {error:?}"))?;
-    let path = pending_path(wallet_dir);
-    let temporary = path.with_extension("json.tmp");
-    let mut options = fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let mut file = options.open(&temporary)?;
-    file.write_all(&bytes)?;
-    file.sync_all()?;
-    fs::rename(&temporary, path)?;
-    Ok(())
+    atomic_write(&pending_path(wallet_dir), &bytes, true)
 }
 
 async fn initial_reducer<P: Parameters>(
@@ -455,17 +637,13 @@ fn persist_snapshot(path: &Path, reducer: &V1Reducer) -> anyhow::Result<()> {
     let bytes = reducer
         .save_snapshot()
         .map_err(|error| anyhow!("Coppice snapshot encoding failed: {error:?}"))?;
-    let temporary = path.with_extension("json.tmp");
-    let mut file = fs::File::create(&temporary)?;
-    file.write_all(&bytes)?;
-    file.sync_all()?;
-    fs::rename(&temporary, path)?;
-    Ok(())
+    atomic_write(path, &bytes, false)
 }
 
 pub(crate) async fn reconcile<P: Parameters>(
     params: &P,
     client: &mut CompactTxStreamerClient<Channel>,
+    host_tip: WalletCanonicalTip,
     wallet_dir: Option<&String>,
 ) -> anyhow::Result<Option<ReconcileOutcome>> {
     if params.network_type() == NetworkType::Main {
@@ -476,11 +654,7 @@ pub(crate) async fn reconcile<P: Parameters>(
         return Ok(None);
     }
     let deployment = deployment(params)?;
-    let host_tip = client
-        .get_latest_block(service::ChainSpec::default())
-        .await?
-        .into_inner();
-    if host_tip.height < u64::from(deployment.activation_height) {
+    if host_tip.height < deployment.activation_height {
         return Ok(None);
     }
     let path = snapshot_path(wallet_dir);
@@ -501,9 +675,16 @@ pub(crate) async fn reconcile<P: Parameters>(
         Err(error) => return Err(error.into()),
     };
 
-    let mut canonical = LightwalletdCanonicalSource {
-        client: client.clone(),
+    let frozen_tip = CanonicalTip {
+        height: host_tip.height,
+        block_hash: host_tip.block_hash,
     };
+    let mut canonical = FrozenCanonicalBlockSource::new(
+        LightwalletdCanonicalSource {
+            client: client.clone(),
+        },
+        frozen_tip,
+    );
     let mut transactions = LightwalletdFullTransactionSource {
         client: client.clone(),
     };
@@ -523,9 +704,12 @@ pub(crate) async fn reconcile<P: Parameters>(
     );
     if matches!(outcome, Err(ReconcileError::NoRetainedCommonAncestor)) {
         reducer = initial_reducer(params, client, deployment.clone()).await?;
-        canonical = LightwalletdCanonicalSource {
-            client: client.clone(),
-        };
+        canonical = FrozenCanonicalBlockSource::new(
+            LightwalletdCanonicalSource {
+                client: client.clone(),
+            },
+            frozen_tip,
+        );
         transactions = LightwalletdFullTransactionSource {
             client: client.clone(),
         };
@@ -611,5 +795,47 @@ mod tests {
             protection_mode(&Network::Main, Some(&directory)).unwrap(),
             StoredProtectionMode::Off
         );
+    }
+
+    #[test]
+    fn external_transaction_gate_rejects_active_or_pending_bond_nullifiers() {
+        let nullifier = [1; 32];
+        let protected_tag = bond_tag::derive_v1_bond_tag(&nullifier).unwrap();
+        let protected = std::collections::BTreeSet::from([protected_tag]);
+        assert!(contains_protected_bond_spend([nullifier], &protected));
+        assert!(!contains_protected_bond_spend([[2; 32]], &protected));
+        assert!(!contains_protected_bond_spend([], &protected));
+    }
+
+    #[test]
+    fn explicit_off_mode_does_not_require_an_orchard_fvk() {
+        assert!(orchard_fvk_for_protection(false, None).unwrap().is_none());
+        assert!(orchard_fvk_for_protection(true, None).is_err());
+    }
+
+    #[test]
+    fn atomic_write_replaces_content_without_leaving_a_temporary_file() {
+        let directory = std::env::temp_dir().join(format!(
+            "zcash-devtool-coppice-atomic-{}-{}",
+            std::process::id(),
+            Uuid::new_v4()
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("state.json");
+
+        atomic_write(&path, b"first", true).unwrap();
+        atomic_write(&path, b"second", true).unwrap();
+
+        assert_eq!(fs::read(&path).unwrap(), b"second");
+        assert_eq!(fs::read_dir(&directory).unwrap().count(), 1);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        fs::remove_dir_all(directory).unwrap();
     }
 }

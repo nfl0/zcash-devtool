@@ -8,11 +8,12 @@ use clap::{Args, Subcommand, ValueEnum};
 use coppice::bond::V1BondProver;
 use coppice_librustzcash::{
     IronwoodViewingCapability, OwnerAuthority, PreparedCarrier, RegistrationBondMaterialSource,
-    RegistrationOwner, WalletBondPrivateMaterial, WalletCommitmentTreesIronwoodWitnessSource,
-    WalletCoppiceLockBackend, abandon_registration, begin_registration, complete_registration,
-    create_carrier_transaction, observe_canonical_commit, prepare_break_bond, prepare_release,
-    prepare_reveal, prepare_update, propose_carrier_transaction, record_commit_broadcast,
-    registration_stage, resolve_for_payment, with_coppice_spend_guard,
+    RegistrationOwner, WalletAccountId, WalletBondPrivateMaterial,
+    WalletCommitmentTreesIronwoodWitnessSource, WalletCoppiceLockBackend, abandon_registration,
+    begin_registration, complete_registration, create_carrier_transaction,
+    observe_canonical_commit, prepare_break_bond, prepare_release, prepare_reveal, prepare_update,
+    propose_carrier_transaction, record_commit_broadcast, registration_stage, resolve_for_payment,
+    with_coppice_spend_guard,
 };
 use orchard::keys::{FullViewingKey, SpendAuthorizingKey, SpendingKey};
 use rand::{RngCore, rngs::OsRng};
@@ -229,7 +230,13 @@ impl Protection {
                     "Coppice v1 is not deployed on Mainnet; protection mode must remain off"
                 ));
             }
-            crate::coppice_support::set_protection_mode(wallet_dir.as_ref(), mode.into())?;
+            let requested = crate::coppice_support::StoredProtectionMode::from(mode);
+            if requested == crate::coppice_support::StoredProtectionMode::Off {
+                let (_, db_path) = get_db_paths(wallet_dir.as_ref());
+                let mut db = WalletDb::for_path(db_path, config.network(), SystemClock, OsRng)?;
+                crate::coppice_support::clear_coppice_advisory_locks(&mut db)?;
+            }
+            crate::coppice_support::set_protection_mode(wallet_dir.as_ref(), requested)?;
         }
         println!(
             "{:?}",
@@ -357,6 +364,7 @@ impl Register {
                 &host,
                 &reducer,
                 &mut pending,
+                WalletAccountId::from_orchard_fvk(&orchard_fvk),
                 IronwoodViewingCapability::Spending,
                 &mut backend,
                 &self.name,
@@ -551,6 +559,7 @@ impl BreakBond {
                 &host,
                 &reducer,
                 &pending,
+                WalletAccountId::from_orchard_fvk(&orchard_fvk),
                 IronwoodViewingCapability::Spending,
                 &mut backend,
                 |backend| {
