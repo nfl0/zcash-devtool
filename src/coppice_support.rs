@@ -14,7 +14,7 @@ use std::{
 use ::coppice::{
     bond_tag,
     config::{DeploymentParameters, REGTEST_V0, TESTNET_V0},
-    reducer::{ActivationCheckpoint, V1Reducer},
+    reducer::{ActivationCheckpoint, Reducer},
 };
 use anyhow::{Context, anyhow};
 use coppice_librustzcash::{
@@ -280,7 +280,7 @@ pub(crate) fn load_existing<P: Parameters>(
 ) -> anyhow::Result<
     Option<(
         CoppiceProtectionMode,
-        V1Reducer,
+        Reducer,
         PendingRegistrationCollection,
     )>,
 > {
@@ -299,7 +299,7 @@ pub(crate) fn load_existing_at_tip<P: Parameters>(
 ) -> anyhow::Result<
     Option<(
         CoppiceProtectionMode,
-        V1Reducer,
+        Reducer,
         PendingRegistrationCollection,
     )>,
 > {
@@ -313,7 +313,7 @@ fn load_existing_inner<P: Parameters>(
 ) -> anyhow::Result<
     Option<(
         CoppiceProtectionMode,
-        V1Reducer,
+        Reducer,
         PendingRegistrationCollection,
     )>,
 > {
@@ -326,7 +326,7 @@ fn load_existing_inner<P: Parameters>(
         return Ok(None);
     }
     let reducer = match fs::read(snapshot_path(wallet_dir)) {
-        Ok(bytes) => V1Reducer::load_snapshot(deployment.clone(), &bytes)
+        Ok(bytes) => Reducer::load_snapshot(deployment.clone(), &bytes)
             .map_err(|error| anyhow!("invalid Coppice snapshot: {error:?}"))?,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             return Err(anyhow!(
@@ -347,7 +347,7 @@ fn load_existing_inner<P: Parameters>(
 }
 
 pub(crate) fn reconcile_wallet_locks<P: Parameters + Clone>(
-    reducer: &V1Reducer,
+    reducer: &Reducer,
     pending: &PendingRegistrationCollection,
     wallet_db: &mut WalletDb<rusqlite::Connection, P, SystemClock, OsRng>,
 ) -> anyhow::Result<()> {
@@ -657,7 +657,7 @@ async fn initial_reducer<P: Parameters>(
     params: &P,
     client: &mut CompactTxStreamerClient<Channel>,
     deployment: DeploymentParameters,
-) -> anyhow::Result<V1Reducer> {
+) -> anyhow::Result<Reducer> {
     let activation_base = deployment
         .activation_height
         .checked_sub(1)
@@ -695,7 +695,7 @@ async fn initial_reducer<P: Parameters>(
     if params.network_type() != deployment.address_network {
         return Err(anyhow!("Coppice deployment network mismatch"));
     }
-    V1Reducer::new(
+    Reducer::new(
         deployment,
         ActivationCheckpoint {
             height: activation_base,
@@ -707,7 +707,7 @@ async fn initial_reducer<P: Parameters>(
     .map_err(|error| anyhow!("invalid Coppice activation checkpoint: {error:?}"))
 }
 
-fn persist_snapshot(path: &Path, reducer: &V1Reducer) -> anyhow::Result<()> {
+fn persist_snapshot(path: &Path, reducer: &Reducer) -> anyhow::Result<()> {
     let bytes = reducer
         .save_snapshot()
         .map_err(|error| anyhow!("Coppice snapshot encoding failed: {error:?}"))?;
@@ -733,7 +733,7 @@ pub(crate) async fn reconcile<P: Parameters>(
     }
     let path = snapshot_path(wallet_dir);
     let mut reducer = match fs::read(&path) {
-        Ok(bytes) => match V1Reducer::load_snapshot(deployment.clone(), &bytes) {
+        Ok(bytes) => match Reducer::load_snapshot(deployment.clone(), &bytes) {
             Ok(reducer) => reducer,
             Err(error) => {
                 tracing::warn!(
