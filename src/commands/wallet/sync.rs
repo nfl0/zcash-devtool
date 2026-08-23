@@ -383,11 +383,12 @@ impl Command {
             )
             .await?
             {
-                let (_, reducer, pending) =
-                    crate::coppice_support::load_existing(&params, wallet_dir.as_ref())?
-                        .ok_or_else(|| {
-                            anyhow!("Coppice protection unexpectedly disabled after replay")
-                        })?;
+                let (_, reducer, pending) = crate::coppice_support::load_existing_at_tip(
+                    &params,
+                    wallet_dir.as_ref(),
+                    frozen_wallet_tip,
+                )?
+                .ok_or_else(|| anyhow!("Coppice protection unexpectedly disabled after replay"))?;
                 crate::coppice_support::reconcile_wallet_locks(&reducer, &pending, &mut db_data)?;
                 info!(
                     "Coppice synchronized to {} ({} blocks applied, {} rewound)",

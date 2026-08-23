@@ -228,10 +228,10 @@ pub(crate) async fn pay<C: PaymentContext>(
     let input_selector = GreedyInputSelector::new();
 
     let spend_policy = SpendPolicy::default();
+    let host_tip = crate::coppice_support::wallet_tip(&db_data)?;
     let proposal = if let Some((protection_mode, reducer, pending)) =
-        crate::coppice_support::load_existing(&params, wallet_dir.as_ref())?
+        crate::coppice_support::load_existing_at_tip(&params, wallet_dir.as_ref(), host_tip.0)?
     {
-        let host_tip = crate::coppice_support::wallet_tip(&db_data)?;
         let expected_height = reducer
             .tip()
             .height
@@ -277,8 +277,9 @@ pub(crate) async fn pay<C: PaymentContext>(
         .map_err(|error| anyhow!("Coppice spend protection failed: {error:?}"))?;
         proposal.map_err(error::Error::from)?
     } else {
-        // Explicit `Off` also repairs any exact-owner advisory Coppice locks
-        // left by a concurrent or legacy protected process.
+        // Explicit `Off` and pre-activation `Enabled` also repair any
+        // exact-owner advisory Coppice locks left by a concurrent or legacy
+        // protected process.
         crate::coppice_support::clear_coppice_advisory_locks(&mut db_data)?;
         propose_transfer(
             &mut db_data,

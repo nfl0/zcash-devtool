@@ -268,7 +268,14 @@ impl Status {
                 "wallet_account_id": wallet_account_id,
             }));
         }
-        let state = crate::coppice_support::load_existing(&params, wallet_dir.as_ref())?;
+        let state = match crate::coppice_support::wallet_tip(&db) {
+            Ok(host_tip) => crate::coppice_support::load_existing_at_tip(
+                &params,
+                wallet_dir.as_ref(),
+                host_tip.0,
+            )?,
+            Err(_) => crate::coppice_support::load_existing(&params, wallet_dir.as_ref())?,
+        };
         let output = match state {
             Some((_, reducer, pending)) => serde_json::json!({
                 "protection": format!("{mode:?}"),

@@ -283,11 +283,47 @@ pub(crate) fn load_existing<P: Parameters>(
         PendingRegistrationCollection,
     )>,
 > {
+    load_existing_inner(params, wallet_dir, None)
+}
+
+/// Load protected Coppice state for a wallet operation at its selected tip.
+///
+/// Before the deployment activation height, `Enabled` is intentionally
+/// equivalent to having no Coppice state to protect. Once activation has been
+/// reached, a missing snapshot remains a fail-closed error.
+pub(crate) fn load_existing_at_tip<P: Parameters>(
+    params: &P,
+    wallet_dir: Option<&String>,
+    host_tip: WalletCanonicalTip,
+) -> anyhow::Result<
+    Option<(
+        CoppiceProtectionMode,
+        V1Reducer,
+        PendingRegistrationCollection,
+    )>,
+> {
+    load_existing_inner(params, wallet_dir, Some(host_tip))
+}
+
+fn load_existing_inner<P: Parameters>(
+    params: &P,
+    wallet_dir: Option<&String>,
+    host_tip: Option<WalletCanonicalTip>,
+) -> anyhow::Result<
+    Option<(
+        CoppiceProtectionMode,
+        V1Reducer,
+        PendingRegistrationCollection,
+    )>,
+> {
     let mode = protection_mode(params, wallet_dir)?;
     if mode == StoredProtectionMode::Off {
         return Ok(None);
     }
     let deployment = deployment(params)?;
+    if host_tip.is_some_and(|tip| tip.height < deployment.activation_height) {
+        return Ok(None);
+    }
     let reducer = match fs::read(snapshot_path(wallet_dir)) {
         Ok(bytes) => V1Reducer::load_snapshot(deployment.clone(), &bytes)
             .map_err(|error| anyhow!("invalid Coppice snapshot: {error:?}"))?,
@@ -461,20 +497,21 @@ where
     P: Parameters + Clone,
     E: std::fmt::Debug,
 {
-    let protected_state = load_existing(params, wallet_dir)?;
+    let host_tip = wallet_tip(wallet_db)?;
+    let protected_state = load_existing_at_tip(params, wallet_dir, host_tip.0)?;
     let orchard_fvk = orchard_fvk_for_protection(protected_state.is_some(), orchard_fvk)?;
     match protected_state {
         None => {
-            // `Off` is deliberately unprotected, but it must also repair an
-            // advisory Coppice lock left by a concurrent or older process.
-            // Exact-owner cleanup preserves foreign and non-Coppice locks.
+            // `Off` and pre-activation `Enabled` are deliberately unprotected,
+            // but they must also repair an advisory Coppice lock left by a
+            // concurrent or older process. Exact-owner cleanup preserves
+            // foreign and non-Coppice locks.
             clear_coppice_advisory_locks(wallet_db)?;
             Ok(operation(wallet_db))
         }
         Some((mode, reducer, pending)) => {
             validate_pending_account_ownership(wallet_db, &pending)?;
             let orchard_fvk = orchard_fvk.expect("protected mode checked above");
-            let host_tip = wallet_tip(wallet_db)?;
             let target = reducer
                 .tip()
                 .height
@@ -545,11 +582,11 @@ pub(crate) fn ensure_external_ironwood_nullifiers_respect_coppice<P: Parameters>
     wallet_db: &WalletDb<rusqlite::Connection, P, SystemClock, OsRng>,
     nullifiers: impl IntoIterator<Item = [u8; 32]>,
 ) -> anyhow::Result<()> {
-    let Some((_, reducer, pending)) = load_existing(params, wallet_dir)? else {
+    let host_tip = wallet_tip(wallet_db)?;
+    let Some((_, reducer, pending)) = load_existing_at_tip(params, wallet_dir, host_tip.0)? else {
         return Ok(());
     };
     validate_pending_account_ownership(wallet_db, &pending)?;
-    let host_tip = wallet_tip(wallet_db)?;
     coppice_librustzcash::require_exact_canonical_tip(&host_tip, &reducer)
         .map_err(|error| anyhow!("Coppice submission protection failed: {error:?}"))?;
 
@@ -781,6 +818,37 @@ mod tests {
 
         set_protection_mode(Some(&directory), StoredProtectionMode::GuardOnly).unwrap();
         assert!(load_existing(&Network::Test, Some(&directory)).is_err());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn enabled_pre_activation_tip_has_no_protected_state() {
+        let directory = std::env::temp_dir().join(format!(
+            "zcash-devtool-coppice-pre-activation-{}-test",
+            std::process::id()
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        let directory = directory.to_string_lossy().into_owned();
+        let activation_height = deployment(&Network::Test).unwrap().activation_height;
+        let pre_activation_tip = WalletCanonicalTip {
+            height: activation_height - 1,
+            block_hash: [0; 32],
+        };
+        let activation_tip = WalletCanonicalTip {
+            height: activation_height,
+            block_hash: [0; 32],
+        };
+
+        assert_eq!(
+            protection_mode(&Network::Test, Some(&directory)).unwrap(),
+            StoredProtectionMode::Enabled
+        );
+        assert!(
+            load_existing_at_tip(&Network::Test, Some(&directory), pre_activation_tip)
+                .unwrap()
+                .is_none()
+        );
+        assert!(load_existing_at_tip(&Network::Test, Some(&directory), activation_tip).is_err());
         fs::remove_dir_all(directory).unwrap();
     }
 

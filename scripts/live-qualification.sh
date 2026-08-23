@@ -965,12 +965,6 @@ run_devtool_logged wallet-sync wallet \
     --wallet-dir "$WALLET_DIR" sync \
     --server "$ZAINO_GRPC_ADDR" --connection direct
 
-status "Disable Coppice protection for pre-activation bootstrap cleanup"
-run_devtool_logged coppice-protection-off wallet \
-    --wallet-dir "$WALLET_DIR" coppice protection off
-rg -a -q '^Off$' "$LOG_DIR/coppice-protection-off.log" \
-    || die "Coppice protection did not enter Off mode for bootstrap cleanup"
-
 status "Discard the pre-NU6.3 bootstrap Sapling coinbase note"
 run_devtool_logged discard-bootstrap-sapling wallet \
     --wallet-dir "$WALLET_DIR" send \
@@ -1007,10 +1001,15 @@ run_devtool_logged discard-bootstrap-sapling-history wallet \
 rg -a -q -F "$SAPLING_DISCARD_TXID" \
     "$LOG_DIR/discard-bootstrap-sapling-history.log" \
     || die "wallet transaction history does not contain confirmed bootstrap Sapling discard $SAPLING_DISCARD_TXID"
+SAPLING_DISCARD_MINED_HEIGHT="$(jq -r --arg txid "$SAPLING_DISCARD_TXID" \
+    '.[] | select(.txid == $txid) | .mined_height' \
+    "$LOG_DIR/discard-bootstrap-sapling-history.log" | tail -1)"
+[[ "$SAPLING_DISCARD_MINED_HEIGHT" =~ ^[0-9]+$ ]] \
+    || die "bootstrap Sapling discard $SAPLING_DISCARD_TXID has no mined height"
 printf '[PASS] wallet reports ironwood_spendable=%s zatoshi\n' \
     "$(jq -r '.ironwood_spendable' <<<"$FUNDED_BALANCE")"
-printf '[PASS] bootstrap Sapling note discarded: tx %s; sapling_spendable=0\n' \
-    "$SAPLING_DISCARD_TXID"
+printf '[PASS] bootstrap Sapling note discarded: tx %s at height %s; sapling_spendable=0\n' \
+    "$SAPLING_DISCARD_TXID" "$SAPLING_DISCARD_MINED_HEIGHT"
 
 status "Create an ordinary Ironwood receive target"
 run_devtool_logged generate-receive-address wallet \
