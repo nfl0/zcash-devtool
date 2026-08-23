@@ -67,6 +67,35 @@ If you want to run with debug or trace logging:
 ```
 RUST_LOG=debug cargo run --release -- wallet -w <wallet_dir> <command>
 ```
+
+## Coppice wallet integration
+
+Testnet and regtest wallets default to fail-closed Coppice protection. A
+missing, corrupt, or stale Coppice snapshot is not interpreted as an opt-out:
+ordinary sends and PCZT proposal creation remain blocked until `wallet sync`
+rebuilds canonical state and reconstructs bond-note locks. The durable setting
+can be inspected or deliberately changed with:
+
+```text
+wallet coppice protection
+wallet coppice protection enabled
+wallet coppice protection guard-only
+wallet coppice protection off
+```
+
+`wallet coppice` exposes canonical status and resolution, name-gated payment,
+REGISTER/COMMIT, canonical-COMMIT observation, REVEAL, UPDATE, RELEASE,
+completion/abandonment, and explicit Break Bond commands. Run
+`wallet coppice --help` for the exact arguments. Carrier construction uses the
+normal wallet proposal, fee, proof, storage, and submission path. Local pending
+metadata advances to broadcast only after the exact stored transaction is
+accepted by the configured server.
+
+Canonical replay progress is persisted after every block and immediately after
+a retained reorg rewind. An unusable snapshot or a reorg deeper than retained
+undo history rebuilds from Coppice activation. A successful sync then
+reconciles locks for every wallet account before returning.
+
 ### Video tutorial of Zcash Devtool
 Kris Nuttycombe (@nuttycom) presented this tool during ZconVI. The session is available
 on Youtube [here](https://www.youtube.com/watch?v=5gvQF5oFT8E)

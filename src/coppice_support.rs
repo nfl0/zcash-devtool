@@ -563,3 +563,53 @@ pub(crate) async fn reconcile<P: Parameters>(
     set_protection_mode(wallet_dir, mode)?;
     Ok(Some(outcome))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::data::Network;
+
+    #[test]
+    fn protection_mode_is_durable_and_missing_protected_state_fails_closed() {
+        let directory = std::env::temp_dir().join(format!(
+            "zcash-devtool-coppice-protection-{}-test",
+            std::process::id()
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        let directory = directory.to_string_lossy().into_owned();
+
+        assert_eq!(
+            protection_mode(&Network::Test, Some(&directory)).unwrap(),
+            StoredProtectionMode::Enabled
+        );
+        assert!(load_existing(&Network::Test, Some(&directory)).is_err());
+
+        set_protection_mode(Some(&directory), StoredProtectionMode::Off).unwrap();
+        assert_eq!(
+            protection_mode(&Network::Test, Some(&directory)).unwrap(),
+            StoredProtectionMode::Off
+        );
+        assert!(
+            load_existing(&Network::Test, Some(&directory))
+                .unwrap()
+                .is_none()
+        );
+
+        set_protection_mode(Some(&directory), StoredProtectionMode::GuardOnly).unwrap();
+        assert!(load_existing(&Network::Test, Some(&directory)).is_err());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn mainnet_defaults_to_explicitly_unprotected_until_deployed() {
+        let directory = std::env::temp_dir().join(format!(
+            "zcash-devtool-coppice-protection-{}-main",
+            std::process::id()
+        ));
+        let directory = directory.to_string_lossy().into_owned();
+        assert_eq!(
+            protection_mode(&Network::Main, Some(&directory)).unwrap(),
+            StoredProtectionMode::Off
+        );
+    }
+}

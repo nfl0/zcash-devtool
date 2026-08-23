@@ -1,6 +1,7 @@
 use clap::Subcommand;
 
 pub(crate) mod balance;
+pub(crate) mod coppice;
 pub(crate) mod delete_account;
 pub(crate) mod derive_address;
 pub(crate) mod derive_path;
@@ -99,6 +100,10 @@ pub(crate) enum Command {
 
     /// Send funds to the given address
     Send(send::Command),
+
+    /// Manage Coppice registry names and bond-protected registrations.
+    #[command(subcommand)]
+    Coppice(coppice::Command),
 
     /// Self-send a small payment with a high target note count, splitting
     /// change into many notes. Run repeatedly (mining/syncing between
