@@ -48,7 +48,21 @@ From the workspace root:
 ./zcash-devtool/scripts/build.sh
 ```
 
-This creates or refreshes:
+By default this only builds or refreshes:
+
+```text
+bin/zcash-devtool
+```
+
+Build the complete local qualification stack when needed:
+
+```sh
+./zcash-devtool/scripts/build.sh --all
+```
+
+Individual targets can also be selected or combined with `--zakura`,
+`--zaino`, and `--zcash-devtool`. The complete-stack invocation creates or
+refreshes:
 
 ```text
 bin/zakurad

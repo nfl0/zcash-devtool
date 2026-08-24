@@ -10,6 +10,59 @@ ZAINO_DIR="$ROOT_DIR/zaino"
 DEVTOOL_DIR="$ROOT_DIR/zcash-devtool"
 
 STAGE_DIR=""
+BUILD_ZAKURA=0
+BUILD_ZAINO=0
+BUILD_DEVTOOL=0
+
+usage() {
+    cat <<'EOF'
+Usage: ./scripts/build.sh [target ...]
+
+Build and install selected Coppice binaries. With no target, only
+zcash-devtool is built.
+
+Targets:
+  --zcash-devtool   Build the Coppice-enabled zcash-devtool (default)
+  --zaino           Build patched Zaino (zainod)
+  --zakura          Build Zakura (zakurad)
+  --all             Build all three qualification binaries
+  -h, --help        Show this help
+
+Targets may be combined, for example: --zaino --zcash-devtool.
+EOF
+}
+
+if (( $# == 0 )); then
+    BUILD_DEVTOOL=1
+else
+    for arg in "$@"; do
+        case "$arg" in
+            --zcash-devtool|--devtool)
+                BUILD_DEVTOOL=1
+                ;;
+            --zaino)
+                BUILD_ZAINO=1
+                ;;
+            --zakura)
+                BUILD_ZAKURA=1
+                ;;
+            --all)
+                BUILD_ZAKURA=1
+                BUILD_ZAINO=1
+                BUILD_DEVTOOL=1
+                ;;
+            -h|--help)
+                usage
+                exit 0
+                ;;
+            *)
+                printf '[FAIL] unknown build target: %s\n\n' "$arg" >&2
+                usage >&2
+                exit 2
+                ;;
+        esac
+    done
+fi
 
 on_error() {
     local status=$?
@@ -106,47 +159,77 @@ status "Check build prerequisites and cloned repositories"
 require_command cargo
 require_command rustc
 require_command install
-require_repo "$ZAKURA_DIR"
-require_repo "$ZAINO_DIR"
-require_repo "$DEVTOOL_DIR"
+if (( BUILD_ZAKURA )); then
+    require_repo "$ZAKURA_DIR"
+fi
+if (( BUILD_ZAINO )); then
+    require_repo "$ZAINO_DIR"
+fi
+if (( BUILD_DEVTOOL )); then
+    require_repo "$DEVTOOL_DIR"
+fi
 
 STAGE_DIR="$(mktemp -d /tmp/coppice-build.XXXXXX)"
 printf '[INFO] staging binaries in %s\n' "$STAGE_DIR"
 
-# Zakura's package is named zakura, while its node binary is zakurad.
-# Its default features include the repository's release-binary feature set.
-build_binary "Zakura (zakurad)" "$ZAKURA_DIR" zakura zakurad
+if (( BUILD_ZAKURA )); then
+    # Zakura's package is named zakura, while its node binary is zakurad.
+    # Its default features include the repository's release-binary feature set.
+    build_binary "Zakura (zakurad)" "$ZAKURA_DIR" zakura zakurad
+fi
 
-# Zaino's zainod package has an empty default feature set. The local fork's
-# Ironwood subtree plumbing is part of that default build.
-build_binary "patched Zaino (zainod)" "$ZAINO_DIR" zainod zainod
+if (( BUILD_ZAINO )); then
+    # Zaino's zainod package has an empty default feature set. The local fork's
+    # Ironwood subtree plumbing is part of that default build.
+    build_binary "patched Zaino (zainod)" "$ZAINO_DIR" zainod zainod
+fi
 
-# Coppice/Regtest support is explicitly feature-gated in zcash-devtool.
-build_binary \
-    "Coppice-enabled zcash-devtool" \
-    "$DEVTOOL_DIR" \
-    zcash-devtool \
-    zcash-devtool \
-    --features regtest_support
+if (( BUILD_DEVTOOL )); then
+    # Coppice/Regtest support is explicitly feature-gated in zcash-devtool.
+    build_binary \
+        "Coppice-enabled zcash-devtool" \
+        "$DEVTOOL_DIR" \
+        zcash-devtool \
+        zcash-devtool \
+        --features regtest_support
+fi
 
 status "Verify staged binaries"
-verify_binary zakurad "$STAGE_DIR/zakurad" "version flag"
-verify_binary zainod "$STAGE_DIR/zainod" "version flag"
-DEVTOOL_VERSION="$(sed -n 's/^version = "\([^"]*\)"/\1/p' "$DEVTOOL_DIR/Cargo.toml" | head -n 1)"
-[[ -n "$DEVTOOL_VERSION" ]] || die "could not read zcash-devtool package version"
-verify_binary zcash-devtool "$STAGE_DIR/zcash-devtool" \
-    "zcash-devtool package $DEVTOOL_VERSION"
+if (( BUILD_ZAKURA )); then
+    verify_binary zakurad "$STAGE_DIR/zakurad" "version flag"
+fi
+if (( BUILD_ZAINO )); then
+    verify_binary zainod "$STAGE_DIR/zainod" "version flag"
+fi
+if (( BUILD_DEVTOOL )); then
+    DEVTOOL_VERSION="$(sed -n 's/^version = "\([^"]*\)"/\1/p' "$DEVTOOL_DIR/Cargo.toml" | head -n 1)"
+    [[ -n "$DEVTOOL_VERSION" ]] || die "could not read zcash-devtool package version"
+    verify_binary zcash-devtool "$STAGE_DIR/zcash-devtool" \
+        "zcash-devtool package $DEVTOOL_VERSION"
+fi
 
 status "Install qualification binaries in $BIN_DIR"
 mkdir -p "$BIN_DIR"
-install -m 0755 "$STAGE_DIR/zakurad" "$BIN_DIR/zakurad"
-install -m 0755 "$STAGE_DIR/zainod" "$BIN_DIR/zainod"
-install -m 0755 "$STAGE_DIR/zcash-devtool" "$BIN_DIR/zcash-devtool"
+if (( BUILD_ZAKURA )); then
+    install -m 0755 "$STAGE_DIR/zakurad" "$BIN_DIR/zakurad"
+fi
+if (( BUILD_ZAINO )); then
+    install -m 0755 "$STAGE_DIR/zainod" "$BIN_DIR/zainod"
+fi
+if (( BUILD_DEVTOOL )); then
+    install -m 0755 "$STAGE_DIR/zcash-devtool" "$BIN_DIR/zcash-devtool"
+fi
 
 status "Verify installed binaries"
-verify_binary zakurad "$BIN_DIR/zakurad" "version flag"
-verify_binary zainod "$BIN_DIR/zainod" "version flag"
-verify_binary zcash-devtool "$BIN_DIR/zcash-devtool" \
-    "zcash-devtool package $DEVTOOL_VERSION"
+if (( BUILD_ZAKURA )); then
+    verify_binary zakurad "$BIN_DIR/zakurad" "version flag"
+fi
+if (( BUILD_ZAINO )); then
+    verify_binary zainod "$BIN_DIR/zainod" "version flag"
+fi
+if (( BUILD_DEVTOOL )); then
+    verify_binary zcash-devtool "$BIN_DIR/zcash-devtool" \
+        "zcash-devtool package $DEVTOOL_VERSION"
+fi
 
 printf '\n[DONE] qualification binaries are available in %s\n' "$BIN_DIR"
