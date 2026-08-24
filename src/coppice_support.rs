@@ -2,7 +2,7 @@
 //!
 //! lightwalletd is transport only. The host-selected identities returned by it
 //! are reconciled through `coppice-librustzcash`, and fetched transaction bytes
-//! remain untrusted until the core reducer validates them.
+//! remain untrusted until the core runtime validates them.
 
 use std::fmt;
 use std::{
@@ -14,7 +14,7 @@ use std::{
 use ::coppice::{
     bond_tag,
     config::{DeploymentParameters, REGTEST, TESTNET},
-    reducer::{ActivationCheckpoint, Reducer},
+    names_runtime::{CoreReplayActivationCheckpoint, NamesRuntime},
 };
 use anyhow::{Context, anyhow};
 use coppice_librustzcash::{
@@ -41,7 +41,7 @@ use zcash_protocol::consensus::{NetworkType, Parameters};
 
 use crate::data::{DEFAULT_WALLET_DIR, get_db_paths};
 
-const SNAPSHOT_FILE: &str = "coppice-v1.json";
+const SNAPSHOT_FILE: &str = "coppice-runtime-v1.json";
 const PENDING_FILE: &str = "coppice-pending-v1.json";
 const PROTECTION_FILE: &str = "coppice-protection.json";
 
@@ -228,7 +228,7 @@ pub(crate) fn protection_mode<P: Parameters>(
             } else {
                 // Existing Testnet/Regtest wallets fail closed. Deliberate Off
                 // must be persisted explicitly and cannot be inferred from a
-                // missing reducer snapshot.
+                // missing runtime snapshot.
                 StoredProtectionMode::Enabled
             })
         }
@@ -280,7 +280,7 @@ pub(crate) fn load_existing<P: Parameters>(
 ) -> anyhow::Result<
     Option<(
         CoppiceProtectionMode,
-        Reducer,
+        NamesRuntime,
         PendingRegistrationCollection,
     )>,
 > {
@@ -299,7 +299,7 @@ pub(crate) fn load_existing_at_tip<P: Parameters>(
 ) -> anyhow::Result<
     Option<(
         CoppiceProtectionMode,
-        Reducer,
+        NamesRuntime,
         PendingRegistrationCollection,
     )>,
 > {
@@ -313,7 +313,7 @@ fn load_existing_inner<P: Parameters>(
 ) -> anyhow::Result<
     Option<(
         CoppiceProtectionMode,
-        Reducer,
+        NamesRuntime,
         PendingRegistrationCollection,
     )>,
 > {
@@ -325,8 +325,8 @@ fn load_existing_inner<P: Parameters>(
     if host_tip.is_some_and(|tip| tip.height < deployment.activation_height) {
         return Ok(None);
     }
-    let reducer = match fs::read(snapshot_path(wallet_dir)) {
-        Ok(bytes) => Reducer::load_snapshot(deployment.clone(), &bytes)
+    let runtime = match fs::read(snapshot_path(wallet_dir)) {
+        Ok(bytes) => NamesRuntime::load_snapshot(deployment.clone(), &bytes)
             .map_err(|error| anyhow!("invalid Coppice snapshot: {error:?}"))?,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             return Err(anyhow!(
@@ -343,26 +343,26 @@ fn load_existing_inner<P: Parameters>(
         }
         Err(error) => return Err(error.into()),
     };
-    Ok(Some((mode.runtime(), reducer, pending)))
+    Ok(Some((mode.runtime(), runtime, pending)))
 }
 
 pub(crate) fn reconcile_wallet_locks<P: Parameters + Clone>(
-    reducer: &Reducer,
+    runtime: &NamesRuntime,
     pending: &PendingRegistrationCollection,
     wallet_db: &mut WalletDb<rusqlite::Connection, P, SystemClock, OsRng>,
 ) -> anyhow::Result<()> {
     let host_tip = wallet_tip(wallet_db)?;
-    if host_tip.0 != WalletCanonicalTip::from(reducer.tip()) {
+    if host_tip.0 != WalletCanonicalTip::from(runtime.tip()) {
         return Err(anyhow!(
             "wallet and Coppice canonical tips differ after sync"
         ));
     }
-    let target = reducer
+    let target = runtime
         .tip()
         .height
         .checked_add(1)
         .ok_or_else(|| anyhow!("Coppice target height overflow"))?;
-    let active = active_canonical_bond_tags(reducer);
+    let active = active_canonical_bond_tags(runtime);
     validate_pending_account_ownership(wallet_db, pending)?;
     for account_id in wallet_db
         .get_account_ids()
@@ -426,7 +426,7 @@ fn validate_pending_account_ownership<P: Parameters>(
 /// Removes only exact-owner Coppice advisory locks before a deliberate
 /// transition to protection `Off`.
 ///
-/// This does not require reducer state: each owned Ironwood note supplies its
+/// This does not require runtime state: each owned Ironwood note supplies its
 /// canonical bond tag, and `unlock_output` can remove only the matching
 /// `LockOwner`. Foreign and unrelated proposal locks are therefore preserved.
 pub(crate) fn clear_coppice_advisory_locks<P: Parameters + Clone>(
@@ -510,10 +510,10 @@ where
             clear_coppice_advisory_locks(wallet_db)?;
             Ok(operation(wallet_db))
         }
-        Some((mode, reducer, pending)) => {
+        Some((mode, runtime, pending)) => {
             validate_pending_account_ownership(wallet_db, &pending)?;
             let orchard_fvk = orchard_fvk.expect("protected mode checked above");
-            let target = reducer
+            let target = runtime
                 .tip()
                 .height
                 .checked_add(1)
@@ -528,7 +528,7 @@ where
             let (result, _) = with_coppice_spend_guard(
                 mode,
                 &host_tip,
-                &reducer,
+                &runtime,
                 &pending,
                 WalletAccountId::from_orchard_fvk(orchard_fvk),
                 IronwoodViewingCapability::FullViewing,
@@ -584,14 +584,14 @@ pub(crate) fn ensure_external_ironwood_nullifiers_respect_coppice<P: Parameters>
     nullifiers: impl IntoIterator<Item = [u8; 32]>,
 ) -> anyhow::Result<()> {
     let host_tip = wallet_tip(wallet_db)?;
-    let Some((_, reducer, pending)) = load_existing_at_tip(params, wallet_dir, host_tip.0)? else {
+    let Some((_, runtime, pending)) = load_existing_at_tip(params, wallet_dir, host_tip.0)? else {
         return Ok(());
     };
     validate_pending_account_ownership(wallet_db, &pending)?;
-    coppice_librustzcash::require_exact_canonical_tip(&host_tip, &reducer)
+    coppice_librustzcash::require_exact_canonical_tip(&host_tip, &runtime)
         .map_err(|error| anyhow!("Coppice submission protection failed: {error:?}"))?;
 
-    let mut protected = active_canonical_bond_tags(&reducer);
+    let mut protected = active_canonical_bond_tags(&runtime);
     protected.extend(
         pending
             .commitments()
@@ -653,11 +653,11 @@ pub(crate) fn persist_pending(
     atomic_write(&pending_path(wallet_dir), &bytes, true)
 }
 
-async fn initial_reducer<P: Parameters>(
+async fn initial_runtime<P: Parameters>(
     params: &P,
     client: &mut CompactTxStreamerClient<Channel>,
     deployment: DeploymentParameters,
-) -> anyhow::Result<Reducer> {
+) -> anyhow::Result<NamesRuntime> {
     let activation_base = deployment
         .activation_height
         .checked_sub(1)
@@ -695,9 +695,9 @@ async fn initial_reducer<P: Parameters>(
     if params.network_type() != deployment.address_network {
         return Err(anyhow!("Coppice deployment network mismatch"));
     }
-    Reducer::new(
+    NamesRuntime::new(
         deployment,
-        ActivationCheckpoint {
+        CoreReplayActivationCheckpoint {
             height: activation_base,
             block_hash,
             ironwood_frontier,
@@ -707,8 +707,8 @@ async fn initial_reducer<P: Parameters>(
     .map_err(|error| anyhow!("invalid Coppice activation checkpoint: {error:?}"))
 }
 
-fn persist_snapshot(path: &Path, reducer: &Reducer) -> anyhow::Result<()> {
-    let bytes = reducer
+fn persist_snapshot(path: &Path, runtime: &NamesRuntime) -> anyhow::Result<()> {
+    let bytes = runtime
         .save_snapshot()
         .map_err(|error| anyhow!("Coppice snapshot encoding failed: {error:?}"))?;
     atomic_write(path, &bytes, false)
@@ -732,19 +732,19 @@ pub(crate) async fn reconcile<P: Parameters>(
         return Ok(None);
     }
     let path = snapshot_path(wallet_dir);
-    let mut reducer = match fs::read(&path) {
-        Ok(bytes) => match Reducer::load_snapshot(deployment.clone(), &bytes) {
-            Ok(reducer) => reducer,
+    let mut runtime = match fs::read(&path) {
+        Ok(bytes) => match NamesRuntime::load_snapshot(deployment.clone(), &bytes) {
+            Ok(runtime) => runtime,
             Err(error) => {
                 tracing::warn!(
                     ?error,
                     "Coppice snapshot unusable; rebuilding from activation"
                 );
-                initial_reducer(params, client, deployment.clone()).await?
+                initial_runtime(params, client, deployment.clone()).await?
             }
         },
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            initial_reducer(params, client, deployment.clone()).await?
+            initial_runtime(params, client, deployment.clone()).await?
         }
         Err(error) => return Err(error.into()),
     };
@@ -765,7 +765,7 @@ pub(crate) async fn reconcile<P: Parameters>(
     let mut persistence_error = None;
     let mut outcome = reconcile_canonical_chain_with_progress(
         params,
-        &mut reducer,
+        &mut runtime,
         &mut canonical,
         &mut transactions,
         |progress| match persist_snapshot(&path, progress) {
@@ -777,7 +777,7 @@ pub(crate) async fn reconcile<P: Parameters>(
         },
     );
     if matches!(outcome, Err(ReconcileError::NoRetainedCommonAncestor)) {
-        reducer = initial_reducer(params, client, deployment.clone()).await?;
+        runtime = initial_runtime(params, client, deployment.clone()).await?;
         canonical = FrozenCanonicalBlockSource::new(
             LightwalletdCanonicalSource {
                 client: client.clone(),
@@ -789,7 +789,7 @@ pub(crate) async fn reconcile<P: Parameters>(
         };
         outcome = reconcile_canonical_chain_with_progress(
             params,
-            &mut reducer,
+            &mut runtime,
             &mut canonical,
             &mut transactions,
             |progress| match persist_snapshot(&path, progress) {
@@ -806,18 +806,18 @@ pub(crate) async fn reconcile<P: Parameters>(
     }
     let outcome =
         outcome.map_err(|error| anyhow!("Coppice canonical reconciliation failed: {error:?}"))?;
-    persist_snapshot(&path, &reducer)?;
+    persist_snapshot(&path, &runtime)?;
     let mut pending = match fs::read(pending_path(wallet_dir)) {
-        Ok(bytes) => PendingRegistrationCollection::load_local(reducer.deployment(), &bytes)
+        Ok(bytes) => PendingRegistrationCollection::load_local(runtime.deployment(), &bytes)
             .map_err(|error| anyhow!("invalid Coppice pending-intent store: {error:?}"))?,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             PendingRegistrationCollection::new()
         }
         Err(error) => return Err(error.into()),
     };
-    reconcile_canonical_commit_cache(&reducer, &mut pending)
+    reconcile_canonical_commit_cache(&runtime, &mut pending)
         .map_err(|error| anyhow!("Coppice canonical COMMIT cache failed: {error:?}"))?;
-    persist_pending(wallet_dir, reducer.deployment(), &pending)?;
+    persist_pending(wallet_dir, runtime.deployment(), &pending)?;
     set_protection_mode(wallet_dir, mode)?;
     Ok(Some(outcome))
 }

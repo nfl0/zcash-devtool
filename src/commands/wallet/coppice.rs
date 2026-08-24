@@ -72,13 +72,13 @@ pub(crate) enum Command {
     Protection(Protection),
     /// Show the local canonical registry and registration stages.
     Status(Status),
-    /// Resolve an active name through the synchronized canonical reducer.
+    /// Resolve an active name through the synchronized canonical runtime.
     Resolve(Resolve),
     /// Pay a canonical active name through the fail-closed resolver.
     Pay(Pay),
     /// Lock a fresh bond, persist intent, construct and broadcast COMMIT.
     Register(Register),
-    /// Observe a semantic COMMIT in canonical reducer state.
+    /// Observe a semantic COMMIT in canonical runtime state.
     ObserveCommit(ObserveCommit),
     /// Prove, construct and broadcast REVEAL for a canonical COMMIT.
     Reveal(Reveal),
@@ -294,13 +294,13 @@ impl Status {
             Err(_) => crate::coppice_support::load_existing(&params, wallet_dir.as_ref())?,
         };
         let output = match state {
-            Some((_, reducer, pending)) => serde_json::json!({
+            Some((_, runtime, pending)) => serde_json::json!({
                 "protection": format!("{mode:?}"),
-                "tip_height": reducer.tip().height,
-                "tip_hash": hex::encode(reducer.tip().block_hash),
-                "names": reducer.state().names.len(),
-                "pending_protocol_commits": reducer.state().pending.len(),
-                "canonical_names": reducer.state().names.keys().map(|name| {
+                "tip_height": runtime.tip().height,
+                "tip_hash": hex::encode(runtime.tip().block_hash),
+                "names": runtime.state().names.len(),
+                "pending_protocol_commits": runtime.state().pending.len(),
+                "canonical_names": runtime.state().names.keys().map(|name| {
                     serde_json::json!({
                         "name": name,
                         "display_name": display_coppice_name(name),
@@ -335,9 +335,9 @@ impl Resolve {
         let params = config.network();
         let (_, path) = get_db_paths(wallet_dir.as_ref());
         let db = WalletDb::for_path(path, params, SystemClock, OsRng)?;
-        let (_, reducer, _) = require_coppice(&params, wallet_dir.as_ref())?;
+        let (_, runtime, _) = require_coppice(&params, wallet_dir.as_ref())?;
         let host = crate::coppice_support::wallet_tip(&db)?;
-        let destination = resolve_for_payment(&host, &reducer, &name)
+        let destination = resolve_for_payment(&host, &runtime, &name)
             .map_err(|error| anyhow!("Coppice name resolution failed: {error:?}"))?;
         println!("{}", String::from_utf8(destination.address)?);
         Ok(())
@@ -381,9 +381,9 @@ impl Pay {
         let params = config.network();
         let (_, path) = get_db_paths(wallet_dir.as_ref());
         let db = WalletDb::for_path(path, params, SystemClock, OsRng)?;
-        let (_, reducer, _) = require_coppice(&params, wallet_dir.as_ref())?;
+        let (_, runtime, _) = require_coppice(&params, wallet_dir.as_ref())?;
         let host = crate::coppice_support::wallet_tip(&db)?;
-        let destination = resolve_for_payment(&host, &reducer, &name)
+        let destination = resolve_for_payment(&host, &runtime, &name)
             .map_err(|error| anyhow!("Coppice name resolution failed: {error:?}"))?;
         let recipient = ZcashAddress::from_str(&String::from_utf8(destination.address)?)
             .map_err(|_| anyhow!("canonical Coppice address could not be parsed"))?;
@@ -406,9 +406,9 @@ impl Register {
             usk,
             orchard_fvk,
         } = spending_context(wallet_dir.as_ref(), self.account_id, &self.identity)?;
-        let (mode, reducer, mut pending) = require_coppice(&params, wallet_dir.as_ref())?;
+        let (mode, runtime, mut pending) = require_coppice(&params, wallet_dir.as_ref())?;
         let host = crate::coppice_support::wallet_tip(&db)?;
-        let target = next_target(&reducer)?;
+        let target = next_target(&runtime)?;
         let prepared = {
             let mut backend = WalletCoppiceLockBackend::new(
                 &mut db,
@@ -419,7 +419,7 @@ impl Register {
             );
             begin_registration(
                 &host,
-                &reducer,
+                &runtime,
                 &mut pending,
                 WalletAccountId::from_orchard_fvk(&orchard_fvk),
                 IronwoodViewingCapability::Spending,
@@ -433,7 +433,7 @@ impl Register {
         };
         crate::coppice_support::persist_pending(
             wallet_dir.as_ref(),
-            reducer.deployment(),
+            runtime.deployment(),
             &pending,
         )?;
         let mut client = self.connection.connect(params, wallet_dir.as_ref()).await?;
@@ -441,7 +441,7 @@ impl Register {
             &params,
             mode,
             &host,
-            &reducer,
+            &runtime,
             &pending,
             &mut db,
             account_id,
@@ -455,7 +455,7 @@ impl Register {
             .map_err(|error| anyhow!("recording COMMIT broadcast failed: {error:?}"))?;
         crate::coppice_support::persist_pending(
             wallet_dir.as_ref(),
-            reducer.deployment(),
+            runtime.deployment(),
             &pending,
         )?;
         println!(
@@ -472,14 +472,14 @@ impl ObserveCommit {
         let params = config.network();
         let (_, path) = get_db_paths(wallet_dir.as_ref());
         let db = WalletDb::for_path(path, params, SystemClock, OsRng)?;
-        let (_, reducer, mut pending) = require_coppice(&params, wallet_dir.as_ref())?;
+        let (_, runtime, mut pending) = require_coppice(&params, wallet_dir.as_ref())?;
         let commitment = hex32(&self.commitment)?;
         let host = crate::coppice_support::wallet_tip(&db)?;
-        let height = observe_canonical_commit(&host, &reducer, &mut pending, &commitment)
+        let height = observe_canonical_commit(&host, &runtime, &mut pending, &commitment)
             .map_err(|error| anyhow!("canonical COMMIT observation failed: {error:?}"))?;
         crate::coppice_support::persist_pending(
             wallet_dir.as_ref(),
-            reducer.deployment(),
+            runtime.deployment(),
             &pending,
         )?;
         println!("{height}");
@@ -497,11 +497,11 @@ impl Update {
             usk,
             orchard_fvk,
         } = spending_context(wallet_dir.as_ref(), self.account_id, &self.identity)?;
-        let (mode, reducer, pending) = require_coppice(&params, wallet_dir.as_ref())?;
+        let (mode, runtime, pending) = require_coppice(&params, wallet_dir.as_ref())?;
         let host = crate::coppice_support::wallet_tip(&db)?;
         let prepared = prepare_update(
             &host,
-            &reducer,
+            &runtime,
             &name,
             self.address.as_bytes(),
             OwnerAuthority::DefaultSoftware(usk.orchard().to_bytes()),
@@ -512,7 +512,7 @@ impl Update {
             &params,
             mode,
             &host,
-            &reducer,
+            &runtime,
             &pending,
             &mut db,
             account_id,
@@ -537,11 +537,11 @@ impl Release {
             usk,
             orchard_fvk,
         } = spending_context(wallet_dir.as_ref(), self.account_id, &self.identity)?;
-        let (mode, reducer, pending) = require_coppice(&params, wallet_dir.as_ref())?;
+        let (mode, runtime, pending) = require_coppice(&params, wallet_dir.as_ref())?;
         let host = crate::coppice_support::wallet_tip(&db)?;
         let prepared = prepare_release(
             &host,
-            &reducer,
+            &runtime,
             &name,
             OwnerAuthority::DefaultSoftware(usk.orchard().to_bytes()),
         )
@@ -551,7 +551,7 @@ impl Release {
             &params,
             mode,
             &host,
-            &reducer,
+            &runtime,
             &pending,
             &mut db,
             account_id,
@@ -588,19 +588,19 @@ impl BreakBond {
             usk,
             orchard_fvk,
         } = spending_context(wallet_dir.as_ref(), self.account_id, &self.identity)?;
-        let (mode, reducer, pending) = require_coppice(&params, wallet_dir.as_ref())?;
+        let (mode, runtime, pending) = require_coppice(&params, wallet_dir.as_ref())?;
         let host = crate::coppice_support::wallet_tip(&db)?;
         let proposal = {
             let mut backend = WalletCoppiceLockBackend::new(
                 &mut db,
                 account_id,
-                next_target(&reducer)?,
+                next_target(&runtime)?,
                 &orchard_fvk,
                 IronwoodViewingCapability::Spending,
             );
             let plan = prepare_break_bond(
                 &host,
-                &reducer,
+                &runtime,
                 &name,
                 IronwoodViewingCapability::Spending,
                 &backend,
@@ -617,7 +617,7 @@ impl BreakBond {
             let (proposal, _) = with_coppice_spend_guard(
                 mode,
                 &host,
-                &reducer,
+                &runtime,
                 &pending,
                 WalletAccountId::from_orchard_fvk(&orchard_fvk),
                 IronwoodViewingCapability::Spending,
@@ -687,10 +687,10 @@ impl Reveal {
             usk,
             orchard_fvk,
         } = spending_context(wallet_dir.as_ref(), self.account_id, &self.identity)?;
-        let (mode, reducer, pending) = require_coppice(&params, wallet_dir.as_ref())?;
+        let (mode, runtime, pending) = require_coppice(&params, wallet_dir.as_ref())?;
         let commitment = hex32(&self.commitment)?;
         let host = crate::coppice_support::wallet_tip(&db)?;
-        let target = next_target(&reducer)?;
+        let target = next_target(&runtime)?;
         let (_, db_path) = get_db_paths(wallet_dir.as_ref());
         let prover = V1BondProver::new()
             .map_err(|error| anyhow!("v1 BondProof key construction failed: {error:?}"))?;
@@ -712,7 +712,7 @@ impl Reveal {
             );
             prepare_reveal(
                 &host,
-                &reducer,
+                &runtime,
                 &pending,
                 IronwoodViewingCapability::Spending,
                 &mut backend,
@@ -729,7 +729,7 @@ impl Reveal {
             &params,
             mode,
             &host,
-            &reducer,
+            &runtime,
             &pending,
             &mut db,
             account_id,
@@ -761,7 +761,7 @@ fn lifecycle_remove(
         .and_then(|ufvk| ufvk.orchard())
         .cloned()
         .ok_or_else(|| anyhow!("selected account has no Orchard full viewing key"))?;
-    let (_, reducer, mut pending) = require_coppice(&params, wallet_dir.as_ref())?;
+    let (_, runtime, mut pending) = require_coppice(&params, wallet_dir.as_ref())?;
     let commitment = hex32(commitment)?;
     let selected_wallet_account_id = WalletAccountId::from_orchard_fvk(&orchard_fvk);
     let pending_registration = pending
@@ -776,14 +776,14 @@ fn lifecycle_remove(
     let mut backend = WalletCoppiceLockBackend::new(
         &mut db,
         account_id,
-        next_target(&reducer)?,
+        next_target(&runtime)?,
         &orchard_fvk,
         IronwoodViewingCapability::FullViewing,
     );
     if complete {
         complete_registration(
             &host,
-            &reducer,
+            &runtime,
             &mut pending,
             IronwoodViewingCapability::FullViewing,
             &mut backend,
@@ -793,7 +793,7 @@ fn lifecycle_remove(
     } else {
         abandon_registration(
             &host,
-            &reducer,
+            &runtime,
             &mut pending,
             IronwoodViewingCapability::FullViewing,
             &mut backend,
@@ -801,7 +801,7 @@ fn lifecycle_remove(
         )
         .map_err(|error| anyhow!("registration abandonment failed: {error:?}"))?;
     }
-    crate::coppice_support::persist_pending(wallet_dir.as_ref(), reducer.deployment(), &pending)
+    crate::coppice_support::persist_pending(wallet_dir.as_ref(), runtime.deployment(), &pending)
 }
 
 type ConcreteWallet = WalletDb<rusqlite::Connection, crate::data::Network, SystemClock, OsRng>;
@@ -854,7 +854,7 @@ fn require_coppice<P: Parameters>(
     wallet_dir: Option<&String>,
 ) -> anyhow::Result<(
     coppice_librustzcash::CoppiceProtectionMode,
-    coppice::reducer::Reducer,
+    coppice::names_runtime::NamesRuntime,
     coppice_librustzcash::PendingRegistrationCollection,
 )> {
     crate::coppice_support::load_existing(params, wallet_dir)?.ok_or_else(|| {
@@ -862,9 +862,9 @@ fn require_coppice<P: Parameters>(
     })
 }
 
-fn next_target(reducer: &coppice::reducer::Reducer) -> anyhow::Result<TargetHeight> {
+fn next_target(runtime: &coppice::names_runtime::NamesRuntime) -> anyhow::Result<TargetHeight> {
     Ok(TargetHeight::from(
-        reducer
+        runtime
             .tip()
             .height
             .checked_add(1)
@@ -877,7 +877,7 @@ async fn construct_and_broadcast<P: Parameters + Clone>(
     params: &P,
     mode: coppice_librustzcash::CoppiceProtectionMode,
     host: &crate::coppice_support::StaticCanonicalTip,
-    reducer: &coppice::reducer::Reducer,
+    runtime: &coppice::names_runtime::NamesRuntime,
     pending: &coppice_librustzcash::PendingRegistrationCollection,
     db: &mut WalletDb<rusqlite::Connection, P, SystemClock, OsRng>,
     account_id: AccountUuid,
@@ -900,7 +900,7 @@ async fn construct_and_broadcast<P: Parameters + Clone>(
     >(
         mode,
         host,
-        reducer,
+        runtime,
         pending,
         IronwoodViewingCapability::Spending,
         db,

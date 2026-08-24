@@ -229,10 +229,10 @@ pub(crate) async fn pay<C: PaymentContext>(
 
     let spend_policy = SpendPolicy::default();
     let host_tip = crate::coppice_support::wallet_tip(&db_data)?;
-    let proposal = if let Some((protection_mode, reducer, pending)) =
+    let proposal = if let Some((protection_mode, runtime, pending)) =
         crate::coppice_support::load_existing_at_tip(&params, wallet_dir.as_ref(), host_tip.0)?
     {
-        let expected_height = reducer
+        let expected_height = runtime
             .tip()
             .height
             .checked_add(1)
@@ -252,7 +252,7 @@ pub(crate) async fn pay<C: PaymentContext>(
         let (proposal, _) = with_coppice_spend_guard(
             protection_mode,
             &host_tip,
-            &reducer,
+            &runtime,
             &pending,
             WalletAccountId::from_orchard_fvk(&orchard_fvk),
             IronwoodViewingCapability::FullViewing,
