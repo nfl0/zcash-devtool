@@ -8,7 +8,9 @@ IFS=$'\n\t'
 # Phase 3 checks fresh same-seed recovery; Phase 4 checks account isolation;
 # Phase 5 attacks every wallet-backed Ironwood spend boundary and protection mode.
 # Phase 6 dispatches to the deterministic Coppice/coppice-librustzcash deep
-# reorg qualification and deliberately does not launch the live stack.
+# reorg qualification and deliberately does not launch the live stack. Phase 7
+# runs phases 1-5 and then forces a beyond-retention reorg through the real
+# Zakura -> Zaino -> zcash-devtool stack.
 # Every node, database, wallet, and log is disposable and lives below one
 # run-specific directory under /tmp.
 
@@ -18,8 +20,9 @@ Usage: live-qualification.sh [--phase N] [--keep-state]
        live-qualification.sh --resume RUN_DIR --phase 5 [--keep-state]
 
 Options:
-  --phase N       Run a fresh stack through phase N (1-5), or run the
-                  deterministic Phase 6 qualification. The default is 5.
+  --phase N       Run a fresh stack through phase N (1-5), run deterministic
+                  Phase 6, or run all live phases including deep-reorg Phase 7.
+                  The default is 5.
   --resume DIR   Reuse a Phase 4 checkpoint and run only Phase 5. The directory
                   must have been produced with --phase 4 --keep-state.
   --keep-state   Preserve the disposable run directory after success. This is
@@ -31,6 +34,7 @@ Examples:
   ./scripts/live-qualification.sh --phase 4 --keep-state
   ./scripts/live-qualification.sh --resume /tmp/coppice-live-qualification.X --phase 5
   ./scripts/live-qualification.sh --phase 6
+  ./scripts/live-qualification.sh --phase 7
 EOF
 }
 
@@ -67,8 +71,8 @@ while (($# > 0)); do
     esac
 done
 
-[[ "$TARGET_PHASE" =~ ^[1-6]$ ]] || {
-    printf '[FAIL] --phase must be an integer from 1 through 6\n' >&2
+[[ "$TARGET_PHASE" =~ ^[1-7]$ ]] || {
+    printf '[FAIL] --phase must be an integer from 1 through 7\n' >&2
     exit 2
 }
 if [[ -n "$RESUME_DIR" ]]; then
@@ -150,6 +154,7 @@ RECOVERY_WALLET_DIR="$STATE_DIR/recovery-wallet"
 PHASE4_RECOVERY_WALLET_DIR="$STATE_DIR/phase4-recovery-wallet"
 PHASE5_OFF_WALLET_DIR="$STATE_DIR/phase5-off-wallet"
 PHASE5_PCZT_DIR="$STATE_DIR/phase5-pczt"
+PHASE7_RECOVERY_WALLET_DIR="$STATE_DIR/phase7-recovery-wallet"
 ZAKURA_CONFIG="$CONFIG_DIR/zakura.toml"
 ZAINO_CONFIG="$CONFIG_DIR/zaino.toml"
 ACTIVATION_FILE="$CONFIG_DIR/activation-heights.toml"
@@ -157,6 +162,7 @@ IDENTITY_FILE="$WALLET_DIR/identity.txt"
 RECOVERY_IDENTITY_FILE="$RECOVERY_WALLET_DIR/identity.txt"
 PHASE4_RECOVERY_IDENTITY_FILE="$PHASE4_RECOVERY_WALLET_DIR/identity.txt"
 PHASE5_OFF_IDENTITY_FILE="$PHASE5_OFF_WALLET_DIR/identity.txt"
+PHASE7_RECOVERY_IDENTITY_FILE="$PHASE7_RECOVERY_WALLET_DIR/identity.txt"
 PHASE4_CHECKPOINT="$WORK_DIR/phase4.env"
 
 if [[ -n "$RESUME_DIR" ]]; then
@@ -692,6 +698,23 @@ rpc_generate() {
         printf '%s\n' "$response" >&2
         die "Zakura generate RPC returned an error or the wrong block count"
     fi
+}
+
+rpc_generate_batched() {
+    local remaining=$1
+    local batch_size=${2:-20}
+    local batch
+
+    (( remaining >= 0 )) || die "batched generation count must be non-negative"
+    (( batch_size > 0 )) || die "batched generation size must be positive"
+    while (( remaining > 0 )); do
+        batch=$batch_size
+        if (( batch > remaining )); then
+            batch=$remaining
+        fi
+        rpc_generate "$batch"
+        remaining=$((remaining - batch))
+    done
 }
 
 zakura_tip_height() {
@@ -2846,4 +2869,163 @@ printf '[PASS] Phase 5 owner exception: Break Bond tx=%s at h=%s; final %s=Activ
     "$PHASE5_BREAK_BOND_TXID" "$PHASE5_BREAK_BOND_HEIGHT_EXPECTED" \
     "$PHASE4_NAME_ONE" "$PHASE4_NAME_TWO"
 printf '[PASS] Phase 5 wrong-account attempts and rejected-operation state invariants held; foreign-lock unit regression passed\n'
-printf '[PASS] deep reorg tests were not run\n'
+if (( TARGET_PHASE == 5 )); then
+    printf '[PASS] live deep reorg was not requested; use --phase 7\n'
+fi
+finish_phase_if_requested 5
+
+status "Phase 7: place an application transition on the branch that will be abandoned"
+PHASE7_COMMON_HEIGHT="$(zakura_tip_height)"
+PHASE7_RELEASE_HEIGHT=$((PHASE7_COMMON_HEIGHT + 1))
+run_devtool_logged phase7-release-a wallet \
+    --wallet-dir "$WALLET_DIR" coppice release "$ACCOUNT_A_UUID" \
+    --identity "$IDENTITY_FILE" \
+    --name "$PHASE4_NAME_ONE" \
+    --server "$ZAINO_GRPC_ADDR" --connection direct
+PHASE7_RELEASE_TXID="$(rg -a -o '[0-9a-fA-F]{64}' \
+    "$LOG_DIR/phase7-release-a.log" | tail -1 || true)"
+[[ -n "$PHASE7_RELEASE_TXID" ]] \
+    || die "Phase 7 RELEASE did not emit a transaction id"
+rpc_generate 1
+wait_for_zaino_tip "$PHASE7_RELEASE_HEIGHT"
+PHASE7_RELEASE_HASH="$(zakura_block_hash "$PHASE7_RELEASE_HEIGHT")"
+wallet_sync_logged phase7-release-sync
+wallet_status_logged phase7-release-status
+assert_coppice_status phase7-release-status "$PHASE7_RELEASE_HEIGHT" Enabled \
+    "$PHASE5_EXPECTED_NAME_COUNT" 1
+assert_snapshot_status "$PHASE4_NAME_ONE" Released "$PHASE7_RELEASE_HEIGHT"
+assert_snapshot_status "$PHASE4_NAME_TWO" BondSpent "$PHASE7_RELEASE_HEIGHT"
+assert_resolve_inactive phase7-release-resolve-a "$PHASE4_NAME_ONE"
+printf '[PASS] branch-only RELEASE tx %s made %s inactive at h=%s hash=%s\n' \
+    "$PHASE7_RELEASE_TXID" "$PHASE4_NAME_ONE" \
+    "$PHASE7_RELEASE_HEIGHT" "$PHASE7_RELEASE_HASH"
+
+status "Phase 7: advance the old branch beyond the retained rewind horizon"
+# Names v1 currently requests 121 retained blocks from generic Core. The
+# abandoned suffix includes the RELEASE block plus 130 descendants.
+PHASE7_PADDING_BLOCKS=130
+PHASE7_REORG_DEPTH=$((PHASE7_PADDING_BLOCKS + 1))
+(( PHASE7_REORG_DEPTH > 121 )) \
+    || die "Phase 7 reorg depth does not exceed the configured retention"
+PHASE7_OLD_TIP_HEIGHT=$((PHASE7_RELEASE_HEIGHT + PHASE7_PADDING_BLOCKS))
+rpc_generate_batched "$PHASE7_PADDING_BLOCKS"
+wait_for_zaino_tip "$PHASE7_OLD_TIP_HEIGHT"
+wallet_sync_logged phase7-old-branch-sync
+PHASE7_OLD_TIP_HASH="$(zakura_block_hash "$PHASE7_OLD_TIP_HEIGHT")"
+wallet_status_logged phase7-old-branch-status
+assert_coppice_status phase7-old-branch-status "$PHASE7_OLD_TIP_HEIGHT" Enabled \
+    "$PHASE5_EXPECTED_NAME_COUNT" 0
+assert_coppice_tip_hash phase7-old-branch-status "$PHASE7_OLD_TIP_HASH"
+assert_snapshot_status "$PHASE4_NAME_ONE" Released "$PHASE7_OLD_TIP_HEIGHT"
+assert_snapshot_status "$PHASE4_NAME_TWO" BondSpent "$PHASE7_OLD_TIP_HEIGHT"
+PHASE7_OLD_SNAPSHOT_DIGEST="$(sha256sum \
+    "$WALLET_DIR/coppice-runtime-v1.json" | cut -d' ' -f1)"
+printf '[PASS] old branch retained %s blocks beyond common h=%s; %s remained Released at h=%s\n' \
+    "$PHASE7_REORG_DEPTH" "$PHASE7_COMMON_HEIGHT" \
+    "$PHASE4_NAME_ONE" "$PHASE7_OLD_TIP_HEIGHT"
+
+status "Phase 7: invalidate the deep suffix and mine an equal-length replacement"
+rpc_invalidate_block "$PHASE7_RELEASE_HASH"
+wait_for_zakura_tip "$PHASE7_COMMON_HEIGHT"
+rpc_generate_batched "$PHASE7_REORG_DEPTH"
+wait_for_zakura_tip "$PHASE7_OLD_TIP_HEIGHT"
+PHASE7_NEW_TIP_HASH="$(zakura_block_hash "$PHASE7_OLD_TIP_HEIGHT")"
+[[ "$PHASE7_NEW_TIP_HASH" != "$PHASE7_OLD_TIP_HASH" ]] \
+    || die "Phase 7 replacement tip hash did not change"
+wait_for_zaino_tip_hash "$PHASE7_NEW_TIP_HASH" "$PHASE7_OLD_TIP_HEIGHT"
+
+status "Phase 7: force beyond-retention runtime rebuild from canonical activation"
+wallet_sync_logged phase7-deep-reorg-sync
+wallet_status_logged phase7-deep-reorg-status
+assert_coppice_status phase7-deep-reorg-status "$PHASE7_OLD_TIP_HEIGHT" Enabled \
+    "$PHASE5_EXPECTED_NAME_COUNT" 0
+assert_coppice_tip_hash phase7-deep-reorg-status "$PHASE7_NEW_TIP_HASH"
+assert_snapshot_status "$PHASE4_NAME_ONE" Active "$PHASE7_OLD_TIP_HEIGHT"
+assert_snapshot_status "$PHASE4_NAME_TWO" BondSpent "$PHASE7_OLD_TIP_HEIGHT"
+assert_resolved_address phase7-deep-reorg-resolve-a \
+    "$PHASE4_NAME_ONE" "$PHASE4_UA_ONE"
+assert_resolve_inactive phase7-deep-reorg-resolve-b "$PHASE4_NAME_TWO"
+wallet_balance_logged_for phase7-deep-reorg-balance-a "$WALLET_DIR" "$ACCOUNT_A_UUID"
+wallet_balance_logged_for phase7-deep-reorg-balance-b "$WALLET_DIR" "$ACCOUNT_B_UUID"
+PHASE7_A_PROTECTED_LOCKED="$(balance_locked_value phase7-deep-reorg-balance-a)"
+PHASE7_B_PROTECTED_LOCKED="$(balance_locked_value phase7-deep-reorg-balance-b)"
+
+# Mining 131 replacement blocks leaves immature coinbase value in the miner's
+# account, so total-minus-spendable is no longer an exact Coppice lock metric.
+# Toggle only Coppice protection and require its exact-owner cleanup/rebuild to
+# remove and restore precisely one active Names bond without changing Account B.
+run_devtool_logged phase7-protection-off wallet \
+    --wallet-dir "$WALLET_DIR" coppice protection off
+wallet_balance_logged_for phase7-off-balance-a "$WALLET_DIR" "$ACCOUNT_A_UUID"
+wallet_balance_logged_for phase7-off-balance-b "$WALLET_DIR" "$ACCOUNT_B_UUID"
+PHASE7_A_OFF_LOCKED="$(balance_locked_value phase7-off-balance-a)"
+PHASE7_B_OFF_LOCKED="$(balance_locked_value phase7-off-balance-b)"
+[[ "$((PHASE7_A_PROTECTED_LOCKED - PHASE7_A_OFF_LOCKED))" == "$COPPICE_BOND_VALUE" ]] \
+    || die "deep rebuild did not restore exactly Account A's active Names bond lock"
+[[ "$PHASE7_B_PROTECTED_LOCKED" == "$PHASE7_B_OFF_LOCKED" ]] \
+    || die "deep rebuild recreated a Coppice lock for Account B's terminal bond"
+run_devtool_logged phase7-protection-enabled wallet \
+    --wallet-dir "$WALLET_DIR" coppice protection enabled
+wallet_sync_logged phase7-reenabled-sync
+wallet_balance_logged_for phase7-reenabled-balance-a "$WALLET_DIR" "$ACCOUNT_A_UUID"
+wallet_balance_logged_for phase7-reenabled-balance-b "$WALLET_DIR" "$ACCOUNT_B_UUID"
+[[ "$(balance_locked_value phase7-reenabled-balance-a)" == "$PHASE7_A_PROTECTED_LOCKED" ]] \
+    || die "re-enabling protection did not restore Account A's rebuilt bond lock"
+[[ "$(balance_locked_value phase7-reenabled-balance-b)" == "$PHASE7_B_PROTECTED_LOCKED" ]] \
+    || die "re-enabling protection changed Account B's terminal lock state"
+PHASE7_REBUILT_SNAPSHOT_DIGEST="$(sha256sum \
+    "$WALLET_DIR/coppice-runtime-v1.json" | cut -d' ' -f1)"
+[[ "$PHASE7_REBUILT_SNAPSHOT_DIGEST" != "$PHASE7_OLD_SNAPSHOT_DIGEST" ]] \
+    || die "deep replacement left the old-branch runtime snapshot unchanged"
+printf '[PASS] main wallet rebuilt across a %s-block reorg: %s returned Active and its lock was restored\n' \
+    "$PHASE7_REORG_DEPTH" "$PHASE4_NAME_ONE"
+
+status "Phase 7: independently reconstruct the replacement state from the same seed"
+[[ ! -e "$PHASE7_RECOVERY_WALLET_DIR" ]] \
+    || die "Phase 7 recovery wallet directory already exists"
+mkdir "$PHASE7_RECOVERY_WALLET_DIR"
+if {
+    printf '%s\n' "$WALLET_MNEMONIC" | timeout 240 "$DEVTOOL_BIN" wallet \
+        --wallet-dir "$PHASE7_RECOVERY_WALLET_DIR" init \
+        --name phase7-fresh \
+        --identity "$PHASE7_RECOVERY_IDENTITY_FILE" \
+        --network regtest \
+        --birthday "$COPPICE_ACTIVATION_HEIGHT" \
+        --activation-heights "$ACTIVATION_FILE" \
+        --server "$ZAINO_GRPC_ADDR" \
+        --connection direct
+} >"$LOG_DIR/phase7-fresh-wallet-init.log" 2>&1; then
+    printf '[PASS] Phase 7 fresh same-seed wallet initialized at birthday %s\n' \
+        "$COPPICE_ACTIVATION_HEIGHT"
+else
+    status_code=$?
+    printf '[FAIL] phase7-fresh-wallet-init (exit %d); see %s\n' \
+        "$status_code" "$LOG_DIR/phase7-fresh-wallet-init.log" >&2
+    tail -100 "$LOG_DIR/phase7-fresh-wallet-init.log" >&2 || true
+    exit "$status_code"
+fi
+wallet_sync_logged_for phase7-fresh-wallet-sync "$PHASE7_RECOVERY_WALLET_DIR"
+wallet_status_logged_for phase7-fresh-wallet-status "$PHASE7_RECOVERY_WALLET_DIR"
+assert_coppice_status phase7-fresh-wallet-status "$PHASE7_OLD_TIP_HEIGHT" Enabled \
+    "$PHASE5_EXPECTED_NAME_COUNT" 0
+assert_coppice_tip_hash phase7-fresh-wallet-status "$PHASE7_NEW_TIP_HASH"
+assert_snapshot_status_for "$PHASE7_RECOVERY_WALLET_DIR" \
+    "$PHASE4_NAME_ONE" Active "$PHASE7_OLD_TIP_HEIGHT"
+assert_snapshot_status_for "$PHASE7_RECOVERY_WALLET_DIR" \
+    "$PHASE4_NAME_TWO" BondSpent "$PHASE7_OLD_TIP_HEIGHT"
+assert_resolved_address_for phase7-fresh-resolve-a \
+    "$PHASE7_RECOVERY_WALLET_DIR" "$PHASE4_NAME_ONE" "$PHASE4_UA_ONE"
+assert_resolve_inactive_for phase7-fresh-resolve-b \
+    "$PHASE7_RECOVERY_WALLET_DIR" "$PHASE4_NAME_TWO"
+PHASE7_FRESH_SNAPSHOT_DIGEST="$(sha256sum \
+    "$PHASE7_RECOVERY_WALLET_DIR/coppice-runtime-v1.json" | cut -d' ' -f1)"
+[[ "$PHASE7_FRESH_SNAPSHOT_DIGEST" == "$PHASE7_REBUILT_SNAPSHOT_DIGEST" ]] \
+    || die "fresh replay and deep-reorg rebuild produced different runtime snapshots"
+printf '\n[PASS] Phase 7 live deep-reorg qualification complete\n'
+printf '[PASS] real stack: common h=%s, abandoned RELEASE h=%s, old/new tip h=%s hashes=%s/%s\n' \
+    "$PHASE7_COMMON_HEIGHT" "$PHASE7_RELEASE_HEIGHT" \
+    "$PHASE7_OLD_TIP_HEIGHT" "$PHASE7_OLD_TIP_HASH" "$PHASE7_NEW_TIP_HASH"
+printf '[PASS] beyond-retention depth=%s forced canonical rebuild; rebuilt and fresh snapshots sha256=%s\n' \
+    "$PHASE7_REORG_DEPTH" "$PHASE7_REBUILT_SNAPSHOT_DIGEST"
+printf '[PASS] application reconstruction: %s=Active/locked, %s=BondSpent/inactive\n' \
+    "$PHASE4_NAME_ONE" "$PHASE4_NAME_TWO"
