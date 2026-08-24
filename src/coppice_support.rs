@@ -922,9 +922,11 @@ mod tests {
 
     #[test]
     fn activation_tree_state_hash_must_match_activation_predecessor() {
-        let mut tree_state = service::TreeState::default();
-        tree_state.height = 9;
-        tree_state.hash = hex::encode([7u8; 32]);
+        let mut tree_state = service::TreeState {
+            height: 9,
+            hash: hex::encode([7u8; 32]),
+            ..Default::default()
+        };
         let activation_block = CompactBlock {
             height: 10,
             prev_hash: vec![7; 32],
