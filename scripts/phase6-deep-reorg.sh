@@ -96,15 +96,20 @@ command -v cargo >/dev/null 2>&1 || die "required command not found: cargo"
 mkdir -p "$LOG_DIR"
 
 status "Phase 6: deterministic retained reorg, deep rebuild, and lock recovery"
-run_logged coppice-phase6-tests cargo test --locked \
-    --manifest-path "$COPPICE_DIR/Cargo.toml" -p coppice --lib phase6_ -- --nocapture
+run_logged coppice-runtime-reorg-tests cargo test --locked \
+    --manifest-path "$COPPICE_DIR/Cargo.toml" -p coppice \
+    --test fuzz_properties persisted_delta_reorgs_equal_fresh_replay -- --nocapture
+run_logged coppice-names-lifecycle-tests cargo test --locked \
+    --manifest-path "$COPPICE_DIR/Cargo.toml" -p coppice \
+    --test names_runtime_lifecycle \
+    routed_names_lifecycle_rewind_bond_spend_pruning_and_fresh_replay -- --nocapture
 run_logged librustzcash-phase6-tests cargo test --locked \
     --manifest-path "$COPPICE_DIR/Cargo.toml" -p coppice-librustzcash --lib phase6_ -- --nocapture
 
 printf '\n[PASS] Phase 6 deterministic qualification complete\n'
 printf '[PASS] configured retention exercised: 121 blocks; deep fork: 135 blocks from common height 105\n'
 printf '[PASS] retained reorg: 15 replacement blocks from common height 225 to tip 240 (within horizon)\n'
-printf '[PASS] rebuild signal: ReconcileError::NoRetainedCommonAncestor / RewindError::SnapshotMissing\n'
+printf '[PASS] rebuild signal: ReconcileError::NoRetainedCommonAncestor / NamesRuntimeRewindError\n'
 printf '[PASS] replay evidence: activation-checkpoint replacement replay matched an independent clean replay byte-for-byte\n'
 printf '[PASS] lock evidence: rebuilt Active bond restored; Released and BondSpent bonds were not protected\n'
 printf '[PASS] logs: %s\n' "$WORK_DIR"

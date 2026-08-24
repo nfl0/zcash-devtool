@@ -123,7 +123,9 @@ PHASE4_NAME_TWO="phase4-account-b"
 PHASE5_NAME_PENDING="phase5-pending"
 COPPICE_BOND_VALUE=100000000
 PHASE4_ACCOUNT_FUNDING_VALUE=400000000
-PHASE5_PENDING_FUNDING_VALUE=150000000
+# The production registration path deliberately selects an exact-minimum
+# bond unless a caller explicitly opts into larger-note bonding.
+PHASE5_PENDING_FUNDING_VALUE=$COPPICE_BOND_VALUE
 # Coppice Regtest qualification activation height in the pinned parameters.
 COPPICE_ACTIVATION_HEIGHT=10
 
@@ -594,12 +596,14 @@ assert_snapshot_status_for() {
         --arg expected "$expected_status" \
         --argjson height "$expected_height" \
         '
-        def record:
-          [.current.state.names[] | select(.[0] == $name)]
+        (.application_snapshot | implode | fromjson) as $application
+        | def record:
+          [$application.state.names[] | select(.[0] == $name)]
           | if length == 1 then .[0][1] else null end;
         (record) as $record
         | .format_version == 1
-          and .current.height == $height
+          and .tip.height == $height
+          and $application.format_version == 1
           and $record != null
           and (if $expected == "Active" then
                  $record.status == "Active"
@@ -611,7 +615,7 @@ assert_snapshot_status_for() {
                    and ($record.status | has("BondSpent")))
                else false
                end)' \
-        "$wallet_dir/coppice-v1.json" >/dev/null \
+        "$wallet_dir/coppice-runtime-v1.json" >/dev/null \
         || die "Coppice snapshot does not show $name=$expected_status at height $expected_height"
     printf '[PASS] canonical Coppice snapshot: %s=%s at height %s\n' \
         "$name" "$expected_status" "$expected_height"
@@ -1601,7 +1605,7 @@ status "Phase 3: fresh same-seed wallet recovery from Coppice activation"
     || die "fresh recovery wallet directory already exists"
 mkdir "$RECOVERY_WALLET_DIR"
 for forbidden_state in \
-    "$RECOVERY_WALLET_DIR/coppice-v1.json" \
+    "$RECOVERY_WALLET_DIR/coppice-runtime-v1.json" \
     "$RECOVERY_WALLET_DIR/coppice-pending-v1.json" \
     "$RECOVERY_WALLET_DIR/coppice-protection.json" \
     "$RECOVERY_WALLET_DIR/data.sqlite"; do
@@ -1634,7 +1638,7 @@ else
 fi
 
 for forbidden_state in \
-    "$RECOVERY_WALLET_DIR/coppice-v1.json" \
+    "$RECOVERY_WALLET_DIR/coppice-runtime-v1.json" \
     "$RECOVERY_WALLET_DIR/coppice-pending-v1.json"; do
     [[ ! -e "$forbidden_state" ]] \
         || die "fresh wallet init unexpectedly created copied Coppice state: $forbidden_state"
@@ -2200,7 +2204,7 @@ else
     exit "$status_code"
 fi
 for forbidden_state in \
-    "$PHASE4_RECOVERY_WALLET_DIR/coppice-v1.json" \
+    "$PHASE4_RECOVERY_WALLET_DIR/coppice-runtime-v1.json" \
     "$PHASE4_RECOVERY_WALLET_DIR/coppice-pending-v1.json" \
     "$PHASE4_RECOVERY_WALLET_DIR/coppice-protection.json"; do
     [[ ! -e "$forbidden_state" ]] \
@@ -2398,7 +2402,7 @@ phase5_assert_fixture_unchanged() {
     assert_snapshot_status "$PHASE4_NAME_TWO" Active "$PHASE5_TIP"
     assert_pending_owner "$label-status" "$PHASE5_COMMITMENT" \
         "$PHASE5_NAME_PENDING" "$ACCOUNT_A_WALLET_ID"
-    digest="$(sha256sum "$WALLET_DIR/coppice-v1.json" \
+    digest="$(sha256sum "$WALLET_DIR/coppice-runtime-v1.json" \
         "$WALLET_DIR/coppice-pending-v1.json")"
     [[ "$digest" == "$PHASE5_STATE_DIGEST" ]] \
         || die "$label changed Coppice snapshot or pending metadata"
@@ -2420,7 +2424,7 @@ phase5_assert_rejected_diagnostic() {
 }
 
 status "Phase 5: reject wrong-account REVEAL, ABANDON, COMPLETE, and Break Bond"
-PHASE5_STATE_DIGEST="$(sha256sum "$WALLET_DIR/coppice-v1.json" \
+PHASE5_STATE_DIGEST="$(sha256sum "$WALLET_DIR/coppice-runtime-v1.json" \
     "$WALLET_DIR/coppice-pending-v1.json")"
 run_devtool_expect_failure phase5-wrong-account-reveal wallet \
     --wallet-dir "$WALLET_DIR" coppice reveal "$ACCOUNT_B_UUID" \
@@ -2475,7 +2479,7 @@ PHASE5_B_OFF_RESIDUAL=$((PHASE4_B_ACTIVE_LOCKED - COPPICE_BOND_VALUE))
     || die "switching protection Off did not remove Account A's Coppice-owned locks"
 [[ "$(balance_locked_value phase5-off-balance-b)" == "$PHASE5_B_OFF_RESIDUAL" ]] \
     || die "switching protection Off did not remove Account B's Coppice-owned locks"
-[[ "$(sha256sum "$WALLET_DIR/coppice-v1.json" \
+[[ "$(sha256sum "$WALLET_DIR/coppice-runtime-v1.json" \
     "$WALLET_DIR/coppice-pending-v1.json")" == "$PHASE5_STATE_DIGEST" ]] \
     || die "switching protection Off changed canonical or pending Coppice state"
 printf '[PASS] Off removed both Coppice-owned advisory lock sets; residual non-Coppice values A=%s, B=%s\n' \
@@ -2530,7 +2534,7 @@ wallet_balance_logged_for phase5-reenabled-balance-a "$WALLET_DIR" "$ACCOUNT_A_U
 wallet_balance_logged_for phase5-reenabled-balance-b "$WALLET_DIR" "$ACCOUNT_B_UUID"
 PHASE5_A_LOCKED="$(balance_locked_value phase5-reenabled-balance-a)"
 PHASE5_B_LOCKED="$(balance_locked_value phase5-reenabled-balance-b)"
-PHASE5_STATE_DIGEST="$(sha256sum "$WALLET_DIR/coppice-v1.json" \
+PHASE5_STATE_DIGEST="$(sha256sum "$WALLET_DIR/coppice-runtime-v1.json" \
     "$WALLET_DIR/coppice-pending-v1.json")"
 printf '[PASS] Enabled replay reconstructed active/pending state and locks: A=%s, B=%s\n' \
     "$PHASE5_A_LOCKED" "$PHASE5_B_LOCKED"
@@ -2661,7 +2665,7 @@ wallet_balance_logged_for phase5-off-main-balance-b "$WALLET_DIR" "$ACCOUNT_B_UU
     || die "main Off transition left Account A's Coppice lock"
 [[ "$(balance_locked_value phase5-off-main-balance-b)" == "$PHASE5_B_OFF_RESIDUAL" ]] \
     || die "main Off transition left Account B's Coppice lock"
-[[ "$(sha256sum "$WALLET_DIR/coppice-v1.json" \
+[[ "$(sha256sum "$WALLET_DIR/coppice-runtime-v1.json" \
     "$WALLET_DIR/coppice-pending-v1.json")" == "$PHASE5_STATE_DIGEST" ]] \
     || die "main Off transition changed canonical or pending state"
 printf '[PASS] main Off transition removed only Coppice-owned lock values (residual A/B=%s/%s)\n' \
@@ -2693,7 +2697,7 @@ else
     exit "$status_code"
 fi
 for forbidden_state in \
-    "$PHASE5_OFF_WALLET_DIR/coppice-v1.json" \
+    "$PHASE5_OFF_WALLET_DIR/coppice-runtime-v1.json" \
     "$PHASE5_OFF_WALLET_DIR/coppice-pending-v1.json"; do
     [[ ! -e "$forbidden_state" ]] \
         || die "fresh Off wallet init unexpectedly created Coppice state: $forbidden_state"
@@ -2712,7 +2716,7 @@ PHASE5_OFF_BALANCE="$(balance_json phase5-off-wallet-balance)"
 jq -e '.ironwood_spendable > 0' >/dev/null <<<"$PHASE5_OFF_BALANCE" \
     || die "fresh Off wallet did not receive spendable Ironwood value"
 for forbidden_state in \
-    "$PHASE5_OFF_WALLET_DIR/coppice-v1.json" \
+    "$PHASE5_OFF_WALLET_DIR/coppice-runtime-v1.json" \
     "$PHASE5_OFF_WALLET_DIR/coppice-pending-v1.json"; do
     [[ ! -e "$forbidden_state" ]] \
         || die "Off-mode sync unexpectedly created Coppice state: $forbidden_state"
