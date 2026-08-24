@@ -37,7 +37,7 @@ use zcash_client_backend::proto::{
 };
 use zcash_client_sqlite::{WalletDb, util::SystemClock};
 use zcash_primitives::transaction::Transaction;
-use zcash_protocol::consensus::{NetworkType, Parameters};
+use zcash_protocol::consensus::{BlockHeight, NetworkType, Parameters};
 
 use crate::data::{DEFAULT_WALLET_DIR, get_db_paths};
 
@@ -653,6 +653,35 @@ pub(crate) fn persist_pending(
     atomic_write(&pending_path(wallet_dir), &bytes, true)
 }
 
+fn activation_checkpoint_parts(
+    tree_state: &service::TreeState,
+    activation_block: &CompactBlock,
+    activation_base: u32,
+) -> anyhow::Result<([u8; 32], coppice::names_runtime::IronwoodFrontier, u32)> {
+    let chain_state = tree_state
+        .to_chain_state()
+        .context("invalid activation TreeState hash or frontier encoding")?;
+    if chain_state.block_height() != BlockHeight::from_u32(activation_base) {
+        return Err(anyhow!("activation TreeState returned the wrong height"));
+    }
+    let predecessor = activation_block
+        .prev_hash
+        .as_slice()
+        .try_into()
+        .map_err(|_| anyhow!("activation CompactBlock has an invalid predecessor hash"))?;
+    if chain_state.block_hash().0 != predecessor {
+        return Err(anyhow!(
+            "activation TreeState hash does not match the activation predecessor"
+        ));
+    }
+    let ironwood_frontier = tree_state
+        .ironwood_tree()
+        .context("invalid activation Ironwood frontier")?;
+    let ironwood_tree_size = u32::try_from(ironwood_frontier.size())
+        .map_err(|_| anyhow!("activation Ironwood tree is too large"))?;
+    Ok((predecessor, ironwood_frontier, ironwood_tree_size))
+}
+
 async fn initial_runtime<P: Parameters>(
     params: &P,
     client: &mut CompactTxStreamerClient<Channel>,
@@ -669,12 +698,6 @@ async fn initial_runtime<P: Parameters>(
         })
         .await?
         .into_inner();
-    if tree_state.height != u64::from(activation_base) {
-        return Err(anyhow!("activation TreeState returned the wrong height"));
-    }
-    let ironwood_frontier = tree_state
-        .ironwood_tree()
-        .context("invalid activation Ironwood frontier")?;
     let activation_block = client
         .get_block(service::BlockId {
             height: u64::from(deployment.activation_height),
@@ -685,13 +708,8 @@ async fn initial_runtime<P: Parameters>(
     if activation_block.height != u64::from(deployment.activation_height) {
         return Err(anyhow!("activation CompactBlock returned the wrong height"));
     }
-    let block_hash = activation_block
-        .prev_hash
-        .as_slice()
-        .try_into()
-        .map_err(|_| anyhow!("activation CompactBlock has an invalid predecessor hash"))?;
-    let ironwood_tree_size = u32::try_from(ironwood_frontier.size())
-        .map_err(|_| anyhow!("activation Ironwood tree is too large"))?;
+    let (block_hash, ironwood_frontier, ironwood_tree_size) =
+        activation_checkpoint_parts(&tree_state, &activation_block, activation_base)?;
     if params.network_type() != deployment.address_network {
         return Err(anyhow!("Coppice deployment network mismatch"));
     }
@@ -900,6 +918,26 @@ mod tests {
             protection_mode(&Network::Main, Some(&directory)).unwrap(),
             StoredProtectionMode::Off
         );
+    }
+
+    #[test]
+    fn activation_tree_state_hash_must_match_activation_predecessor() {
+        let mut tree_state = service::TreeState::default();
+        tree_state.height = 9;
+        tree_state.hash = hex::encode([7u8; 32]);
+        let activation_block = CompactBlock {
+            height: 10,
+            prev_hash: vec![7; 32],
+            ..Default::default()
+        };
+        let (_, frontier, tree_size) =
+            activation_checkpoint_parts(&tree_state, &activation_block, 9).unwrap();
+        assert_eq!(frontier.size(), 0);
+        assert_eq!(tree_size, 0);
+
+        tree_state.hash = hex::encode([8u8; 32]);
+        let error = activation_checkpoint_parts(&tree_state, &activation_block, 9).unwrap_err();
+        assert!(error.to_string().contains("does not match"));
     }
 
     #[test]
