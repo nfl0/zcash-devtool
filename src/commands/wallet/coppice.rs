@@ -5,7 +5,6 @@ use std::{num::NonZeroUsize, str::FromStr};
 use age::Identity;
 use anyhow::{Context, anyhow};
 use clap::{Args, Subcommand, ValueEnum};
-use coppice::bond::V1BondProver;
 use coppice_librustzcash::{
     IronwoodViewingCapability, OwnerAuthority, PreparedCarrier, RegistrationBondMaterialSource,
     RegistrationOwner, WalletAccountId, WalletBondPrivateMaterial,
@@ -15,6 +14,7 @@ use coppice_librustzcash::{
     propose_carrier_transaction, record_commit_broadcast, registration_stage, resolve_for_payment,
     with_coppice_spend_guard,
 };
+use coppice_names::bond::V1BondProver;
 use orchard::keys::{FullViewingKey, SpendAuthorizingKey, SpendingKey};
 use rand::{RngCore, rngs::OsRng};
 use secrecy::ExposeSecret;
@@ -55,7 +55,7 @@ fn normalize_coppice_name(name: &str) -> anyhow::Result<String> {
     let canonical = name
         .strip_suffix(COPPICE_PRESENTATION_SUFFIX)
         .unwrap_or(name);
-    if coppice::envelope::valid_name(canonical) {
+    if coppice_names::envelope::valid_name(canonical) {
         Ok(canonical.to_owned())
     } else {
         Err(anyhow!("invalid Coppice name: {name}"))
@@ -854,7 +854,7 @@ fn require_coppice<P: Parameters>(
     wallet_dir: Option<&String>,
 ) -> anyhow::Result<(
     coppice_librustzcash::CoppiceProtectionMode,
-    coppice::names_runtime::NamesRuntime,
+    coppice_names::names_runtime::NamesRuntime,
     coppice_librustzcash::PendingRegistrationCollection,
 )> {
     crate::coppice_support::load_existing(params, wallet_dir)?.ok_or_else(|| {
@@ -862,7 +862,9 @@ fn require_coppice<P: Parameters>(
     })
 }
 
-fn next_target(runtime: &coppice::names_runtime::NamesRuntime) -> anyhow::Result<TargetHeight> {
+fn next_target(
+    runtime: &coppice_names::names_runtime::NamesRuntime,
+) -> anyhow::Result<TargetHeight> {
     Ok(TargetHeight::from(
         runtime
             .tip()
@@ -877,7 +879,7 @@ async fn construct_and_broadcast<P: Parameters + Clone>(
     params: &P,
     mode: coppice_librustzcash::CoppiceProtectionMode,
     host: &crate::coppice_support::StaticCanonicalTip,
-    runtime: &coppice::names_runtime::NamesRuntime,
+    runtime: &coppice_names::names_runtime::NamesRuntime,
     pending: &coppice_librustzcash::PendingRegistrationCollection,
     db: &mut WalletDb<rusqlite::Connection, P, SystemClock, OsRng>,
     account_id: AccountUuid,

@@ -11,11 +11,6 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use ::coppice::{
-    bond_tag,
-    config::{DeploymentParameters, REGTEST, TESTNET},
-    names_runtime::{CoreReplayActivationCheckpoint, NamesRuntime},
-};
 use anyhow::{Context, anyhow};
 use coppice_librustzcash::{
     CanonicalBlockSource, CanonicalTip, CoppiceProtectionMode, FrozenCanonicalBlockSource,
@@ -24,6 +19,11 @@ use coppice_librustzcash::{
     WalletCanonicalTip, WalletCoppiceLockBackend, active_canonical_bond_tags,
     reconcile_canonical_chain_with_progress, reconcile_canonical_commit_cache, reconcile_locks,
     with_coppice_spend_guard,
+};
+use coppice_names::{
+    bond_tag,
+    config::{DeploymentParameters, REGTEST, TESTNET},
+    names_runtime::{CoreReplayActivationCheckpoint, NamesRuntime},
 };
 use pczt::Pczt;
 use rand::rngs::OsRng;
@@ -657,7 +657,11 @@ fn activation_checkpoint_parts(
     tree_state: &service::TreeState,
     activation_block: &CompactBlock,
     activation_base: u32,
-) -> anyhow::Result<([u8; 32], coppice::names_runtime::IronwoodFrontier, u32)> {
+) -> anyhow::Result<(
+    [u8; 32],
+    coppice_names::names_runtime::IronwoodFrontier,
+    u32,
+)> {
     let chain_state = tree_state
         .to_chain_state()
         .context("invalid activation TreeState hash or frontier encoding")?;
