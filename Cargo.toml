@@ -52,7 +52,7 @@ uuid = "1"
 # re-check these against the new rev's Cargo.toml files, or Cargo will
 # silently fall back to stale crates.io versions for the unsatisfied ones
 # and duplicate half the dependency graph (as happened here).
-orchard = { version = "0.15.0", default-features = false }
+orchard = { version = "=0.15.3", default-features = false }
 pczt = { version = "0.9.1", features = ["io-finalizer", "orchard", "prover", "signer", "spend-finalizer", "transparent", "tx-extractor"] }
 sapling = { package = "sapling-crypto", version = "0.7" }
 transparent = { package = "zcash_transparent", version = "0.10.0", features = ["test-dependencies", "transparent-inputs"] }
@@ -159,12 +159,11 @@ tui = [
 # (zcash_pool_migration is still not published to crates.io, so it remains
 # pinned by git revision.)
 #
-# orchard is patched here too, mirroring librustzcash's OWN
-# [patch.crates-io] pin (orchard PR #535, deferred-anchor Updater setters)
-# at this same commit -- a git dependency's own nested patches don't
-# propagate to ours, so this workspace needs its own matching entry or the
-# graph disagrees on which orchard it's building against.
-orchard = { path = "../coppice/vendor/orchard" }
+# orchard is patched here too, to the dedicated non-consensus Coppice Names
+# extension. A git dependency's own nested patches do not propagate to ours,
+# so this workspace needs its own matching entry or the graph disagrees on
+# which orchard it is building against.
+orchard = { git = "https://github.com/nfl0/orchard-coppice.git", rev = "9907318813ceb8d66a9f3fa9fe7ea773a53899a4" }
 equihash = { git = "https://github.com/zcash/librustzcash.git", rev = "6c07e5f3297febf469e5cc8d0b91321e0767cdd7" }
 f4jumble = { git = "https://github.com/zcash/librustzcash.git", rev = "6c07e5f3297febf469e5cc8d0b91321e0767cdd7" }
 zcash_address = { git = "https://github.com/zcash/librustzcash.git", rev = "6c07e5f3297febf469e5cc8d0b91321e0767cdd7" }
