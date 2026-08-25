@@ -7,6 +7,11 @@ developers, for developers for use in prototyping Zcash functionality, and
 should not be considered production-ready. The command-line API that this tool
 exposes can and will change at any time and without warning.
 
+The local Coppice integration keeps the repository boundary explicit: generic
+canonical ingest and reconciliation come from `coppice` and
+`coppice-librustzcash`, while Names protocol and wallet policy come from
+`coppice-names` and `coppice-names-librustzcash`.
+
 ## Security Warnings
 
 **DO NOT USE THIS IN PRODUCTION!!!**

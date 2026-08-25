@@ -1352,23 +1352,7 @@ dependencies = [
 name = "coppice"
 version = "0.1.0"
 dependencies = [
- "blake2b_simd",
  "coppice-core",
- "halo2_gadgets",
- "halo2_proofs",
- "hex",
- "incrementalmerkletree",
- "orchard",
- "pasta_curves",
- "rand_chacha 0.3.1",
- "rand_core 0.6.4",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "shardtree",
- "zcash_address",
- "zcash_note_encryption",
- "zcash_primitives",
  "zcash_protocol",
 ]
 
@@ -1401,7 +1385,7 @@ name = "coppice-names"
 version = "0.1.0"
 dependencies = [
  "blake2b_simd",
- "coppice-core",
+ "coppice",
  "halo2_gadgets",
  "halo2_proofs",
  "hex",
@@ -1424,7 +1408,7 @@ dependencies = [
 name = "coppice-names-librustzcash"
 version = "0.1.0"
 dependencies = [
- "coppice-core",
+ "coppice",
  "coppice-librustzcash",
  "coppice-names",
  "incrementalmerkletree",
@@ -9561,6 +9545,7 @@ dependencies = [
  "chrono",
  "clap",
  "coppice",
+ "coppice-librustzcash",
  "coppice-names",
  "coppice-names-librustzcash",
  "crossterm",

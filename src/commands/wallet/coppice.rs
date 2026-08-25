@@ -5,7 +5,8 @@ use std::{num::NonZeroUsize, str::FromStr};
 use age::Identity;
 use anyhow::{Context, anyhow};
 use clap::{Args, Subcommand, ValueEnum};
-use coppice_librustzcash::{
+use coppice_names::bond::V1BondProver;
+use coppice_names_librustzcash::{
     IronwoodViewingCapability, OwnerAuthority, PreparedCarrier, RegistrationBondMaterialSource,
     RegistrationOwner, WalletAccountId, WalletBondPrivateMaterial,
     WalletCommitmentTreesIronwoodWitnessSource, WalletCoppiceLockBackend, abandon_registration,
@@ -14,7 +15,6 @@ use coppice_librustzcash::{
     propose_carrier_transaction, record_commit_broadcast, registration_stage, resolve_for_payment,
     with_coppice_spend_guard,
 };
-use coppice_names::bond::V1BondProver;
 use orchard::keys::{FullViewingKey, SpendAuthorizingKey, SpendingKey};
 use rand::{RngCore, rngs::OsRng};
 use secrecy::ExposeSecret;
@@ -853,9 +853,9 @@ fn require_coppice<P: Parameters>(
     params: &P,
     wallet_dir: Option<&String>,
 ) -> anyhow::Result<(
-    coppice_librustzcash::CoppiceProtectionMode,
+    coppice_names_librustzcash::CoppiceProtectionMode,
     coppice_names::names_runtime::NamesRuntime,
-    coppice_librustzcash::PendingRegistrationCollection,
+    coppice_names_librustzcash::PendingRegistrationCollection,
 )> {
     crate::coppice_support::load_existing(params, wallet_dir)?.ok_or_else(|| {
         anyhow!("Coppice protection is Off; enable it and synchronize before this operation")
@@ -877,10 +877,10 @@ fn next_target(
 #[allow(clippy::too_many_arguments)]
 async fn construct_and_broadcast<P: Parameters + Clone>(
     params: &P,
-    mode: coppice_librustzcash::CoppiceProtectionMode,
+    mode: coppice_names_librustzcash::CoppiceProtectionMode,
     host: &crate::coppice_support::StaticCanonicalTip,
     runtime: &coppice_names::names_runtime::NamesRuntime,
-    pending: &coppice_librustzcash::PendingRegistrationCollection,
+    pending: &coppice_names_librustzcash::PendingRegistrationCollection,
     db: &mut WalletDb<rusqlite::Connection, P, SystemClock, OsRng>,
     account_id: AccountUuid,
     orchard_fvk: &FullViewingKey,
@@ -963,7 +963,7 @@ impl<P: Parameters + Clone> RegistrationBondMaterialSource for SqliteBondMateria
 
     fn private_material_for(
         &mut self,
-        output_id: &coppice_librustzcash::IronwoodOutputId,
+        output_id: &coppice_names_librustzcash::IronwoodOutputId,
     ) -> Result<WalletBondPrivateMaterial, Self::Error> {
         let received = self
             .wallet

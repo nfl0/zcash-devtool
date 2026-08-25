@@ -36,7 +36,7 @@ use crate::{
     commands::select_account, config::WalletConfig, data::get_db_paths, error,
     remote::ConnectionArgs, ui::proposal::print_proposal,
 };
-use coppice_librustzcash::{
+use coppice_names_librustzcash::{
     IronwoodViewingCapability, WalletAccountId, WalletCoppiceLockBackend, with_coppice_spend_guard,
 };
 

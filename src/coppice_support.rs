@@ -13,17 +13,19 @@ use std::{
 
 use anyhow::{Context, anyhow};
 use coppice_librustzcash::{
-    CanonicalBlockSource, CanonicalTip, CoppiceProtectionMode, FrozenCanonicalBlockSource,
-    FullTransactionSource, HostCanonicalTipSource, IronwoodViewingCapability,
-    PendingRegistrationCollection, ReconcileError, ReconcileOutcome, WalletAccountId,
-    WalletCanonicalTip, WalletCoppiceLockBackend, active_canonical_bond_tags,
-    reconcile_canonical_chain_with_progress, reconcile_canonical_commit_cache, reconcile_locks,
-    with_coppice_spend_guard,
+    CanonicalBlockSource, CanonicalTip, FrozenCanonicalBlockSource, FullTransactionSource,
+    ReconcileError, ReconcileOutcome, reconcile_canonical_chain_with_progress,
 };
 use coppice_names::{
     bond_tag,
     config::{DeploymentParameters, REGTEST, TESTNET},
     names_runtime::{CoreReplayActivationCheckpoint, NamesRuntime},
+};
+use coppice_names_librustzcash::{
+    CoppiceProtectionMode, HostCanonicalTipSource, IronwoodViewingCapability,
+    PendingRegistrationCollection, WalletAccountId, WalletCanonicalTip, WalletCoppiceLockBackend,
+    active_canonical_bond_tags, reconcile_canonical_commit_cache, reconcile_locks,
+    with_coppice_spend_guard,
 };
 use pczt::Pczt;
 use rand::rngs::OsRng;
@@ -588,7 +590,7 @@ pub(crate) fn ensure_external_ironwood_nullifiers_respect_coppice<P: Parameters>
         return Ok(());
     };
     validate_pending_account_ownership(wallet_db, &pending)?;
-    coppice_librustzcash::require_exact_canonical_tip(&host_tip, &runtime)
+    coppice_names_librustzcash::require_exact_canonical_tip(&host_tip, &runtime)
         .map_err(|error| anyhow!("Coppice submission protection failed: {error:?}"))?;
 
     let mut protected = active_canonical_bond_tags(&runtime);
