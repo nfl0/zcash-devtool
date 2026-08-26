@@ -99,15 +99,17 @@ only Phase 5 on later runs:
 ```
 
 The first command prints the actual run directory and the exact resume command.
-The default invocation still runs all five live phases. Phase 5 cannot be resumed
-from a Phase 1–3 checkpoint because its adversarial fixture depends on the
-canonical two-account state produced by Phase 4.
+The default invocation runs all five live phases. `--phase 7` runs those same
+live phases and then the beyond-retention deep-reorg qualification. Phase 5
+cannot be resumed from a Phase 1–3 checkpoint because its adversarial fixture
+depends on the canonical two-account state produced by Phase 4.
 
 Phase 6 is intentionally separate from the live stack. It constructs a
-deterministic Coppice/coppice-librustzcash chain, exercises the 121-block
-retention horizon with a 15-block retained fork and a deeper 135-block fork,
-verifies the rebuild signal and atomicity, compares replacement replay with an
-independent clean replay, and reconstructs only Active-bond locks:
+deterministic Coppice Names / `coppice-names-librustzcash` chain using the
+public Coppice runtime, exercises the 121-block retention horizon with a
+15-block retained fork and a deeper 135-block fork, verifies the rebuild
+signal and atomicity, compares replacement replay with an independent clean
+replay, and reconstructs only Active-bond locks:
 
 ```sh
 ./zcash-devtool/scripts/live-qualification.sh --phase 6
@@ -132,10 +134,17 @@ The harness creates an isolated disposable Regtest stack and runs:
 - Phase 5: adversarial wallet/PCZT spend-path rejection under Enabled and
   GuardOnly, exact-owner Break Bond, Off-mode lock cleanup, foreign-lock
   preservation, and an unsynchronized ordinary Off-mode send.
+- Phase 7: a fresh real-stack run through Phase 5 followed by a 131-block
+  beyond-retention reorg, activation rebuild, and independent same-seed
+  snapshot convergence.
 
 The separate Phase 6 entry point runs deterministic retained reorg, deep-fork
 `NeedsRebuild`-equivalent signaling, activation-checkpoint rebuild equivalence,
 and post-rebuild bond lock reconstruction.
+
+`--phase 7` is the complete live qualification entry point; it is intentionally
+fresh and does not resume a Phase 4 checkpoint. It exercises the real stack
+through the live lifecycle and then forces the deep reorg described above.
 
 On success, temporary state and logs are removed. On failure, the run directory
 under `/tmp/coppice-live-qualification.*` is preserved and printed so the

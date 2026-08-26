@@ -35,6 +35,7 @@ done
 SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)"
 ROOT_DIR="$(CDPATH= cd -- "$SCRIPT_DIR/../.." && pwd -P)"
 COPPICE_DIR="$ROOT_DIR/coppice"
+NAMES_DIR="$ROOT_DIR/coppice-names"
 WORK_DIR="$(mktemp -d /tmp/coppice-phase6-deep-reorg.XXXXXX)"
 LOG_DIR="$WORK_DIR/logs"
 CURRENT_STAGE="bootstrap"
@@ -93,18 +94,19 @@ run_logged() {
 
 command -v cargo >/dev/null 2>&1 || die "required command not found: cargo"
 [[ -d "$COPPICE_DIR" ]] || die "Coppice checkout not found: $COPPICE_DIR"
+[[ -d "$NAMES_DIR" ]] || die "Coppice Names checkout not found: $NAMES_DIR"
 mkdir -p "$LOG_DIR"
 
 status "Phase 6: deterministic retained reorg, deep rebuild, and lock recovery"
-run_logged coppice-runtime-reorg-tests cargo test --locked \
-    --manifest-path "$COPPICE_DIR/Cargo.toml" -p coppice \
+run_logged coppice-names-reorg-tests cargo test --locked \
+    --manifest-path "$NAMES_DIR/Cargo.toml" -p coppice-names \
     --test fuzz_properties persisted_delta_reorgs_equal_fresh_replay -- --nocapture
 run_logged coppice-names-lifecycle-tests cargo test --locked \
-    --manifest-path "$COPPICE_DIR/Cargo.toml" -p coppice \
+    --manifest-path "$NAMES_DIR/Cargo.toml" -p coppice-names \
     --test names_runtime_lifecycle \
     routed_names_lifecycle_rewind_bond_spend_pruning_and_fresh_replay -- --nocapture
 run_logged librustzcash-phase6-tests cargo test --locked \
-    --manifest-path "$COPPICE_DIR/Cargo.toml" -p coppice-librustzcash --lib phase6_ -- --nocapture
+    --manifest-path "$NAMES_DIR/Cargo.toml" -p coppice-names-librustzcash --lib phase6_ -- --nocapture
 
 printf '\n[PASS] Phase 6 deterministic qualification complete\n'
 printf '[PASS] configured retention exercised: 121 blocks; deep fork: 135 blocks from common height 105\n'

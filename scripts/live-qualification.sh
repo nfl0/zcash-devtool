@@ -2671,8 +2671,8 @@ printf '[PASS] GuardOnly preserved canonical replay/resolution and protected act
 
 status "Phase 5: Off cleanup, foreign-lock regression, and unsynchronized ordinary send"
 run_logged phase5-foreign-lock-regression cargo \
-    test --manifest-path "$ROOT_DIR/coppice/Cargo.toml" --locked \
-    -p coppice-librustzcash --lib off_transition_cleanup_removes_only_coppice_owned_locks
+    test --manifest-path "$ROOT_DIR/coppice-names/Cargo.toml" --locked \
+    -p coppice-names-librustzcash --lib off_transition_cleanup_removes_only_coppice_owned_locks
 rg -a -q 'test .*off_transition_cleanup_removes_only_coppice_owned_locks .*ok' \
     "$LOG_DIR/phase5-foreign-lock-regression.log" \
     || die "foreign-lock cleanup regression did not pass"
