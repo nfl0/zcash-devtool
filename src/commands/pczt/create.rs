@@ -52,8 +52,15 @@ pub(crate) struct Command {
     value: u64,
 
     /// A memo to send to the recipient
-    #[arg(long)]
+    #[arg(long, conflicts_with = "memo_hex")]
     memo: Option<String>,
+
+    /// Exact binary memo bytes, encoded as 512-byte hexadecimal.
+    ///
+    /// This is intended for protocol envelopes that are not text. It is
+    /// additive; the normal text-memo path is unchanged.
+    #[arg(long, conflicts_with = "memo")]
+    memo_hex: Option<String>,
 
     /// Note management: the number of notes to maintain in the wallet
     #[arg(long)]
@@ -94,15 +101,13 @@ impl Command {
         let input_selector = GreedyInputSelector::new();
         let orchard_fvk = account.ufvk().and_then(|ufvk| ufvk.orchard()).cloned();
 
+        let memo = memo_bytes(self.memo, self.memo_hex)?;
         let request = TransactionRequest::new(vec![
             Payment::new(
                 ZcashAddress::from_str(&self.address)
                     .map_err(|_| error::Error::InvalidRecipient)?,
                 Some(Zatoshis::from_u64(self.value).map_err(|_| error::Error::InvalidAmount)?),
-                self.memo
-                    .map(|memo| Memo::from_str(&memo))
-                    .transpose()?
-                    .map(MemoBytes::from),
+                memo,
                 None,
                 None,
                 vec![],
@@ -169,5 +174,37 @@ impl Command {
         }
 
         Ok(())
+    }
+}
+
+fn memo_bytes(
+    text: Option<String>,
+    binary_hex: Option<String>,
+) -> Result<Option<MemoBytes>, anyhow::Error> {
+    match (text, binary_hex) {
+        (Some(memo), None) => Ok(Some(MemoBytes::from(Memo::from_str(&memo)?))),
+        (None, Some(hex_memo)) => {
+            let bytes = hex::decode(hex_memo).map_err(|_| anyhow!("invalid memo hex"))?;
+            Ok(Some(MemoBytes::from_bytes(&bytes)?))
+        }
+        (None, None) => Ok(None),
+        (Some(_), Some(_)) => unreachable!("clap rejects conflicting memo options"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::memo_bytes;
+
+    #[test]
+    fn binary_memo_preserves_non_utf8_bytes() {
+        let memo = [0xff; 512];
+        assert_eq!(
+            memo_bytes(None, Some(hex::encode(memo)))
+                .unwrap()
+                .unwrap()
+                .as_slice(),
+            memo
+        );
     }
 }

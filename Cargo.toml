@@ -18,6 +18,8 @@ coppice = { path = "../coppice/crates/coppice" }
 coppice-librustzcash = { path = "../coppice/crates/coppice-librustzcash" }
 coppice-names-librustzcash = { path = "../coppice-names/crates/coppice-names-librustzcash" }
 coppice-names = { path = "../coppice-names/crates/coppice-names" }
+coppice-receipts = { path = "../coppice-receipts" }
+coppice-zcash-rpc = { path = "../coppice/crates/coppice-zcash-rpc" }
 bip0039 = { version = "0.14", features = ["std", "all-languages"] }
 bip32 = { version = "=0.6.0-pre.1", default-features = false, features = ["secp256k1-ffi"] }
 futures-util = "0.3"

@@ -1427,6 +1427,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "coppice-receipts"
+version = "0.1.0"
+dependencies = [
+ "blake2b_simd",
+ "coppice",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "coppice-zcash-rpc"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "coppice-core",
+ "coppice-librustzcash",
+ "hex",
+ "serde",
+ "serde_json",
+ "zcash_client_backend",
+ "zcash_primitives",
+ "zcash_protocol",
+]
+
+[[package]]
 name = "core-foundation"
 version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9549,6 +9574,8 @@ dependencies = [
  "coppice-librustzcash",
  "coppice-names",
  "coppice-names-librustzcash",
+ "coppice-receipts",
+ "coppice-zcash-rpc",
  "crossterm",
  "ed25519-zebra",
  "equihash 0.2.0",
