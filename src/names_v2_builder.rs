@@ -9,7 +9,7 @@ use orchard::{
     note::{ExtractedNoteCommitment, Note},
     value::NoteValue,
 };
-use pczt::roles::creator::Creator;
+use pczt::roles::{creator::Creator, io_finalizer::IoFinalizer};
 use rand::RngCore;
 use zcash_primitives::transaction::{TxVersion as TransactionVersion, builder::PcztParts};
 use zcash_protocol::consensus::{BlockHeight, BranchId, Parameters};
@@ -77,6 +77,22 @@ pub struct NamesV2PcztPlan<P: Parameters> {
 
 /// Complete, still-unproved Names v2 PCZT and the metadata needed by later roles.
 pub struct NamesV2BuiltPczt {
+    pub pczt: pczt::Pczt,
+    /// The canonical CNV2 action index, encoded as `u32` at this boundary.
+    pub designated_action_index: u32,
+    pub designated_nullifier: [u8; 32],
+    pub designated_commitment: [u8; 32],
+    pub action_count: usize,
+    pub real_spend_count: usize,
+    pub requested_output_count: usize,
+    pub carrier_output_count: usize,
+    pub change_output_count: usize,
+    pub ironwood_value_balance: i64,
+}
+
+/// Complete Names v2 PCZT after IO finalization, still without real witnesses, proofs, or
+/// real spend authorization signatures.
+pub struct NamesV2FinalizedPczt {
     pub pczt: pczt::Pczt,
     /// The canonical CNV2 action index, encoded as `u32` at this boundary.
     pub designated_action_index: u32,
@@ -263,6 +279,74 @@ pub fn build_names_v2_pczt<P: Parameters>(plan: NamesV2PcztPlan<P>) -> Result<Na
     );
 
     Ok(NamesV2BuiltPczt {
+        pczt,
+        designated_action_index,
+        designated_nullifier,
+        designated_commitment,
+        action_count,
+        real_spend_count,
+        requested_output_count,
+        carrier_output_count,
+        change_output_count,
+        ironwood_value_balance,
+    })
+}
+
+/// Runs the pinned PCZT IO Finalizer over a complete Names v2 V6 PCZT.
+pub fn finalize_names_v2_pczt_io(built: NamesV2BuiltPczt) -> Result<NamesV2FinalizedPczt> {
+    let NamesV2BuiltPczt {
+        pczt,
+        designated_action_index,
+        designated_nullifier,
+        designated_commitment,
+        action_count,
+        real_spend_count,
+        requested_output_count,
+        carrier_output_count,
+        change_output_count,
+        ironwood_value_balance,
+    } = built;
+    let before_action_layout = embedded_action_layout(&pczt)?;
+    let before_action_count = pczt.ironwood().actions().len();
+    ensure!(
+        before_action_count == action_count,
+        "pre-finalization Ironwood action count changed"
+    );
+    ensure!(
+        *pczt.ironwood().value_sum() == value_sum_parts(ironwood_value_balance)?,
+        "pre-finalization Ironwood value balance changed"
+    );
+
+    let pczt = IoFinalizer::new(pczt)
+        .finalize_io()
+        .map_err(|error| anyhow::anyhow!("finalize Names v2 PCZT IO: {error:?}"))?;
+
+    ensure!(
+        pczt.ironwood().actions().len() == before_action_count,
+        "IO finalization changed the Ironwood action count"
+    );
+    ensure!(
+        embedded_action_layout(&pczt)? == before_action_layout,
+        "IO finalization changed the ordered Ironwood action layout"
+    );
+    ensure!(
+        *pczt.ironwood().value_sum() == value_sum_parts(ironwood_value_balance)?,
+        "IO finalization changed the Ironwood value balance"
+    );
+    ensure!(
+        !pczt.global().inputs_modifiable()
+            && !pczt.global().outputs_modifiable()
+            && !pczt.global().shielded_modifiable(),
+        "IO finalization left transaction effects modifiable"
+    );
+    verify_embedded_designated_action(
+        &pczt,
+        designated_action_index,
+        designated_nullifier,
+        designated_commitment,
+    )?;
+
+    Ok(NamesV2FinalizedPczt {
         pczt,
         designated_action_index,
         designated_nullifier,
@@ -618,6 +702,98 @@ mod tests {
         )
         .unwrap();
         assert_eq!(*parsed.ironwood().value_sum(), (1_000, false));
+
+        let deferred_spend_indices = complete
+            .pczt
+            .ironwood()
+            .actions()
+            .iter()
+            .enumerate()
+            .filter(|(_, action)| action.spend().witness().is_none())
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        let dummy_spend_indices = complete
+            .pczt
+            .ironwood()
+            .actions()
+            .iter()
+            .enumerate()
+            .filter(|(_, action)| action.spend().witness().is_some())
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        assert_eq!(deferred_spend_indices.len(), 2);
+        assert_eq!(dummy_spend_indices.len(), 11);
+
+        let pre_finalize_layout = embedded_action_layout(&complete.pczt).unwrap();
+        let creator_bytes = complete.pczt.clone().serialize().unwrap();
+        let finalized = finalize_names_v2_pczt_io(complete).unwrap();
+
+        assert_eq!(finalized.action_count, 13);
+        assert_eq!(finalized.pczt.ironwood().actions().len(), 13);
+        assert_eq!(finalized.designated_action_index, 4);
+        assert_eq!(
+            embedded_action_layout(&finalized.pczt).unwrap(),
+            pre_finalize_layout
+        );
+        verify_embedded_designated_action(
+            &finalized.pczt,
+            finalized.designated_action_index,
+            finalized.designated_nullifier,
+            finalized.designated_commitment,
+        )
+        .unwrap();
+        assert_eq!(*finalized.pczt.ironwood().value_sum(), (1_000, false));
+        assert_eq!(finalized.ironwood_value_balance, 1_000);
+        assert!(!finalized.pczt.global().inputs_modifiable());
+        assert!(!finalized.pczt.global().outputs_modifiable());
+        assert!(!finalized.pczt.global().shielded_modifiable());
+        assert!(!finalized.pczt.global().has_sighash_single());
+        assert!(finalized.pczt.ironwood().anchor().is_none());
+        assert!(finalized.pczt.ironwood().zkproof().is_none());
+        assert!(deferred_spend_indices.iter().all(|index| {
+            finalized.pczt.ironwood().actions()[*index]
+                .spend()
+                .witness()
+                .is_none()
+                && finalized.pczt.ironwood().actions()[*index]
+                    .spend()
+                    .spend_auth_sig()
+                    .is_none()
+        }));
+        assert!(dummy_spend_indices.iter().all(|index| {
+            finalized.pczt.ironwood().actions()[*index]
+                .spend()
+                .witness()
+                .is_some()
+                && finalized.pczt.ironwood().actions()[*index]
+                    .spend()
+                    .spend_auth_sig()
+                    .is_some()
+        }));
+
+        // IO finalization materializes binding state and dummy signatures in the PCZT;
+        // real witness/proof/signature state remains intentionally deferred.
+        let finalized_bytes = finalized.pczt.clone().serialize().unwrap();
+        assert_ne!(finalized_bytes, creator_bytes);
+        let finalized_parsed = pczt::Pczt::parse(&finalized_bytes).unwrap();
+        assert_eq!(
+            embedded_action_layout(&finalized_parsed).unwrap(),
+            pre_finalize_layout
+        );
+        verify_embedded_designated_action(
+            &finalized_parsed,
+            finalized.designated_action_index,
+            finalized.designated_nullifier,
+            finalized.designated_commitment,
+        )
+        .unwrap();
+        assert_eq!(
+            finalized_parsed.clone().serialize().unwrap(),
+            finalized_bytes
+        );
+        assert_eq!(*finalized_parsed.ironwood().value_sum(), (1_000, false));
+        assert!(finalized_parsed.ironwood().anchor().is_none());
+        assert!(finalized_parsed.ironwood().zkproof().is_none());
     }
 
     #[test]
