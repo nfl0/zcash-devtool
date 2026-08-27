@@ -9,7 +9,7 @@ use orchard::{
     note::{ExtractedNoteCommitment, Note},
     value::NoteValue,
 };
-use pczt::roles::{creator::Creator, io_finalizer::IoFinalizer, updater::Updater};
+use pczt::roles::{creator::Creator, io_finalizer::IoFinalizer, prover::Prover, updater::Updater};
 use rand::RngCore;
 use zcash_primitives::transaction::{TxVersion as TransactionVersion, builder::PcztParts};
 use zcash_protocol::consensus::{BlockHeight, BranchId, Parameters};
@@ -134,6 +134,25 @@ pub struct NamesV2WitnessedPczt {
     pub carrier_output_count: usize,
     pub change_output_count: usize,
     pub ironwood_value_balance: i64,
+}
+
+/// Names v2 PCZT after creating the consensus Ironwood bundle proof.
+pub struct NamesV2ProvedPczt {
+    pub pczt: pczt::Pczt,
+    pub anchor: orchard::Anchor,
+    /// `(nullifier, final PCZT action index)` entries in witness-plan order.
+    pub witnessed_action_indices: Vec<([u8; 32], usize)>,
+    /// The canonical CNV2 action index, encoded as `u32` at this boundary.
+    pub designated_action_index: u32,
+    pub designated_nullifier: [u8; 32],
+    pub designated_commitment: [u8; 32],
+    pub action_count: usize,
+    pub real_spend_count: usize,
+    pub requested_output_count: usize,
+    pub carrier_output_count: usize,
+    pub change_output_count: usize,
+    pub ironwood_value_balance: i64,
+    pub ironwood_proof_byte_len: usize,
 }
 
 /// Builds the Ironwood portion of a Names v2 PCZT without proving or signing.
@@ -580,6 +599,183 @@ pub fn install_names_v2_ironwood_witnesses(
     })
 }
 
+/// Creates the consensus Ironwood proof for an anchored, witnessed Names v2 PCZT.
+///
+/// The pinned Prover performs the authoritative witness-root check immediately
+/// before invoking the Ironwood circuit. This wrapper only checks cheap PCZT
+/// structure before and after that operation.
+pub fn prove_names_v2_ironwood_pczt(
+    witnessed: NamesV2WitnessedPczt,
+    proving_key: &orchard::circuit::ProvingKey,
+) -> Result<NamesV2ProvedPczt> {
+    let NamesV2WitnessedPczt {
+        pczt,
+        anchor,
+        witnessed_action_indices,
+        designated_action_index,
+        designated_nullifier,
+        designated_commitment,
+        action_count,
+        real_spend_count,
+        requested_output_count,
+        carrier_output_count,
+        change_output_count,
+        ironwood_value_balance,
+    } = witnessed;
+    let before_action_layout = embedded_action_layout(&pczt)?;
+    let before_action_count = pczt.ironwood().actions().len();
+    let before_value_balance = *pczt.ironwood().value_sum();
+    let expected_anchor = anchor.to_bytes();
+
+    ensure!(
+        pczt.ironwood().zkproof().is_none(),
+        "Ironwood proof is already present"
+    );
+    ensure!(
+        pczt.ironwood().anchor().as_ref() == Some(&expected_anchor),
+        "witnessed PCZT anchor does not match the expected anchor"
+    );
+    ensure!(
+        before_action_count == action_count,
+        "pre-proof Ironwood action count changed"
+    );
+    ensure!(
+        before_value_balance == value_sum_parts(ironwood_value_balance)?,
+        "pre-proof Ironwood value balance changed"
+    );
+    verify_embedded_designated_action(
+        &pczt,
+        designated_action_index,
+        designated_nullifier,
+        designated_commitment,
+    )?;
+
+    let mut real_action_indices = witnessed_action_indices
+        .iter()
+        .map(|(_, action_index)| *action_index)
+        .collect::<Vec<_>>();
+    ensure!(
+        real_action_indices.len() == real_spend_count,
+        "witness metadata does not cover exactly the real Ironwood spends"
+    );
+    real_action_indices.sort_unstable();
+    ensure!(
+        real_action_indices
+            .windows(2)
+            .all(|indices| indices[0] != indices[1]),
+        "witness metadata contains duplicate real Ironwood spends"
+    );
+    for action_index in &real_action_indices {
+        let action = &pczt.ironwood().actions()[*action_index];
+        ensure!(
+            action.spend().witness().is_some(),
+            "a real Ironwood spend is missing its witness before proving"
+        );
+        ensure!(
+            action.spend().spend_auth_sig().is_none(),
+            "a real Ironwood spend is already signed before proving"
+        );
+    }
+
+    let dummy_signatures = pczt
+        .ironwood()
+        .actions()
+        .iter()
+        .enumerate()
+        .filter_map(|(action_index, action)| {
+            action
+                .spend()
+                .spend_auth_sig()
+                .as_ref()
+                .copied()
+                .map(|signature| (action_index, signature))
+        })
+        .collect::<Vec<_>>();
+    ensure!(
+        dummy_signatures.len()
+            == action_count
+                .checked_sub(real_spend_count)
+                .context("real spend count exceeds Ironwood action count")?,
+        "unexpected number of pre-existing dummy Ironwood signatures"
+    );
+
+    let pczt = Prover::new(pczt)
+        .create_ironwood_proof(proving_key)
+        .map_err(|error| anyhow::anyhow!("create Names v2 Ironwood proof: {error:?}"))?
+        .finish();
+
+    let proof_byte_len = pczt
+        .ironwood()
+        .zkproof()
+        .as_ref()
+        .map(Vec::len)
+        .context("Prover returned no Ironwood proof")?;
+    ensure!(
+        proof_byte_len > 0,
+        "Prover returned an empty Ironwood proof"
+    );
+    ensure!(
+        pczt.ironwood().actions().len() == before_action_count,
+        "Prover changed the Ironwood action count"
+    );
+    ensure!(
+        embedded_action_layout(&pczt)? == before_action_layout,
+        "Prover changed the ordered Ironwood action layout"
+    );
+    ensure!(
+        *pczt.ironwood().value_sum() == before_value_balance,
+        "Prover changed the Ironwood value balance"
+    );
+    ensure!(
+        pczt.ironwood().anchor().as_ref() == Some(&expected_anchor),
+        "Prover changed the Ironwood anchor"
+    );
+    verify_embedded_designated_action(
+        &pczt,
+        designated_action_index,
+        designated_nullifier,
+        designated_commitment,
+    )?;
+    for action_index in &real_action_indices {
+        let action = &pczt.ironwood().actions()[*action_index];
+        ensure!(
+            action.spend().witness().is_some(),
+            "Prover removed a real Ironwood spend witness"
+        );
+        ensure!(
+            action.spend().spend_auth_sig().is_none(),
+            "Prover signed a real Ironwood spend"
+        );
+    }
+    for (action_index, expected_signature) in dummy_signatures {
+        ensure!(
+            pczt.ironwood().actions()[action_index]
+                .spend()
+                .spend_auth_sig()
+                .as_ref()
+                .copied()
+                == Some(expected_signature),
+            "Prover changed a dummy Ironwood spend signature"
+        );
+    }
+
+    Ok(NamesV2ProvedPczt {
+        pczt,
+        anchor,
+        witnessed_action_indices,
+        designated_action_index,
+        designated_nullifier,
+        designated_commitment,
+        action_count,
+        real_spend_count,
+        requested_output_count,
+        carrier_output_count,
+        change_output_count,
+        ironwood_value_balance,
+        ironwood_proof_byte_len: proof_byte_len,
+    })
+}
+
 /// Verifies the exact physical action relation expected by the Names host.
 pub fn verify_designated_action(
     bundle: &orchard::pczt::Bundle,
@@ -704,6 +900,7 @@ mod tests {
     };
     use rand::{SeedableRng, rngs::StdRng};
     use shardtree::{ShardTree, store::memory::MemoryShardStore};
+    use std::sync::OnceLock;
     use zcash_protocol::{
         consensus::BlockHeight,
         constants::{V6_TX_VERSION, V6_VERSION_GROUP_ID},
@@ -891,6 +1088,14 @@ mod tests {
             #[cfg(zcash_unstable = "nu7")]
             nu7: two,
         }
+    }
+
+    static IRONWOOD_PROVING_KEY: OnceLock<orchard::circuit::ProvingKey> = OnceLock::new();
+
+    fn ironwood_proving_key() -> &'static orchard::circuit::ProvingKey {
+        IRONWOOD_PROVING_KEY.get_or_init(|| {
+            orchard::circuit::ProvingKey::build(BundleVersion::ironwood_v3().circuit_version())
+        })
     }
 
     #[test]
@@ -1304,6 +1509,146 @@ mod tests {
                     .copied()
                     == *signature
         }));
+    }
+
+    #[test]
+    fn funded_reveal_creates_one_consensus_ironwood_proof() {
+        let fixture = funded_reveal_fixture();
+        let witness_plan = deterministic_funded_reveal_witness_plan(&fixture);
+        let expected_anchor = witness_plan.anchor;
+        let built = build_names_v2_bundle(fixture.plan, StdRng::from_seed([10; 32])).unwrap();
+        let complete = build_names_v2_pczt(NamesV2PcztPlan {
+            ironwood: built,
+            params: local_v6_params(),
+            consensus_branch_id: BranchId::Nu6_3,
+            expiry_height: BlockHeight::from_u32(100),
+            fallback_lock_time: 0,
+        })
+        .unwrap();
+        let finalized = finalize_names_v2_pczt_io(complete).unwrap();
+        let witnessed = install_names_v2_ironwood_witnesses(finalized, witness_plan).unwrap();
+
+        let before_layout = embedded_action_layout(&witnessed.pczt).unwrap();
+        let before_action_count = witnessed.pczt.ironwood().actions().len();
+        let before_value_balance = *witnessed.pczt.ironwood().value_sum();
+        let before_designated_action_index = witnessed.designated_action_index;
+        let before_designated_nullifier = witnessed.designated_nullifier;
+        let before_designated_commitment = witnessed.designated_commitment;
+        let before_anchor = witnessed.anchor;
+        assert_eq!(before_action_count, 13);
+        assert_eq!(before_value_balance, (1_000, false));
+        assert_eq!(before_designated_action_index, 4);
+        assert_eq!(before_designated_nullifier, fixture.registration_nullifier);
+        assert_eq!(before_anchor, expected_anchor);
+        assert_eq!(
+            witnessed.pczt.ironwood().anchor().as_ref().copied(),
+            Some(expected_anchor.to_bytes())
+        );
+        assert!(witnessed.pczt.ironwood().zkproof().is_none());
+
+        let mut real_action_indices = witnessed
+            .witnessed_action_indices
+            .iter()
+            .map(|(_, action_index)| *action_index)
+            .collect::<Vec<_>>();
+        real_action_indices.sort_unstable();
+        assert_eq!(real_action_indices, vec![4, 7]);
+        assert!(real_action_indices.iter().all(|action_index| {
+            witnessed.pczt.ironwood().actions()[*action_index]
+                .spend()
+                .witness()
+                .is_some()
+                && witnessed.pczt.ironwood().actions()[*action_index]
+                    .spend()
+                    .spend_auth_sig()
+                    .is_none()
+        }));
+        let dummy_signatures = witnessed
+            .pczt
+            .ironwood()
+            .actions()
+            .iter()
+            .enumerate()
+            .filter_map(|(action_index, action)| {
+                action
+                    .spend()
+                    .spend_auth_sig()
+                    .as_ref()
+                    .copied()
+                    .map(|signature| (action_index, signature))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(dummy_signatures.len(), 11);
+
+        let proved = prove_names_v2_ironwood_pczt(witnessed, ironwood_proving_key()).unwrap();
+
+        assert_eq!(proved.anchor, before_anchor);
+        assert_eq!(proved.action_count, before_action_count);
+        assert_eq!(proved.pczt.ironwood().actions().len(), 13);
+        assert_eq!(*proved.pczt.ironwood().value_sum(), before_value_balance);
+        assert_eq!(proved.designated_action_index, 4);
+        assert_eq!(proved.designated_nullifier, before_designated_nullifier);
+        assert_eq!(proved.designated_commitment, before_designated_commitment);
+        assert_eq!(embedded_action_layout(&proved.pczt).unwrap(), before_layout);
+        assert_eq!(
+            proved.pczt.ironwood().anchor().as_ref().copied(),
+            Some(before_anchor.to_bytes())
+        );
+        let proof_len = proved
+            .pczt
+            .ironwood()
+            .zkproof()
+            .as_ref()
+            .map(Vec::len)
+            .expect("Prover produced an Ironwood proof");
+        assert!(proof_len > 0);
+        assert_eq!(proof_len, proved.ironwood_proof_byte_len);
+        verify_embedded_designated_action(
+            &proved.pczt,
+            proved.designated_action_index,
+            proved.designated_nullifier,
+            proved.designated_commitment,
+        )
+        .unwrap();
+        for action_index in &real_action_indices {
+            let action = &proved.pczt.ironwood().actions()[*action_index];
+            assert!(action.spend().witness().is_some());
+            assert!(action.spend().spend_auth_sig().is_none());
+        }
+        for (action_index, expected_signature) in &dummy_signatures {
+            assert_eq!(
+                proved.pczt.ironwood().actions()[*action_index]
+                    .spend()
+                    .spend_auth_sig()
+                    .as_ref()
+                    .copied(),
+                Some(*expected_signature)
+            );
+        }
+
+        let proved_bytes = proved.pczt.clone().serialize().unwrap();
+        let parsed = pczt::Pczt::parse(&proved_bytes).unwrap();
+        assert!(
+            parsed
+                .ironwood()
+                .zkproof()
+                .as_ref()
+                .is_some_and(|proof| { !proof.is_empty() })
+        );
+        assert_eq!(
+            parsed.ironwood().anchor().as_ref().copied(),
+            Some(before_anchor.to_bytes())
+        );
+        assert_eq!(parsed.ironwood().actions().len(), before_action_count);
+        assert_eq!(embedded_action_layout(&parsed).unwrap(), before_layout);
+        assert_eq!(*parsed.ironwood().value_sum(), before_value_balance);
+        verify_embedded_designated_action(
+            &parsed,
+            proved.designated_action_index,
+            proved.designated_nullifier,
+            proved.designated_commitment,
+        )
+        .unwrap();
     }
 
     #[test]
