@@ -83,6 +83,9 @@ const RENEW_ACTION_INDEX: u32 = 4;
 const RENEW_SUCCESSOR_SEED: u8 = 5;
 const RELEASE_ACTION_INDEX: u32 = 4;
 const RELEASE_SUCCESSOR_SEED: u8 = 6;
+const RECLAIM_RECORD: [u8; 64] = [11; 64];
+const RECLAIM_SECRET: [u8; 32] = [11; 32];
+const RECLAIM_SUCCESSOR_SEED: u8 = 7;
 
 #[derive(Parser)]
 #[command(name = "names-v2-live")]
@@ -116,6 +119,16 @@ enum Command {
     VerifyRelease(VerifyReleaseArgs),
     /// Verify the exact Released -> Expired claimability boundary.
     VerifyReleaseBoundary(VerifyReleaseBoundaryArgs),
+    /// Build, authorize, and submit the replacement COMMIT for the claimable fixture name.
+    ReclaimCommit(CommonArgs),
+    /// Build, authorize, and submit the replacement REVEAL for the claimable fixture name.
+    ReclaimReveal(ReclaimRevealArgs),
+    /// Validate the canonical replacement lineage and COMMIT without proving.
+    ReclaimCheck(ReclaimRevealArgs),
+    /// Replay and independently resolve the accepted explicit replacement registration.
+    VerifyReclaim(VerifyReclaimArgs),
+    /// Replay and independently resolve stale-to-active replacement RENEW recovery.
+    VerifyReclaimRenew(VerifyReclaimRenewArgs),
 }
 
 #[derive(Args, Clone)]
@@ -175,7 +188,7 @@ struct RenewArgs {
     #[arg(long)]
     reveal_txid: String,
     #[arg(long)]
-    update_txid: String,
+    update_txid: Option<String>,
 }
 
 #[derive(Args)]
@@ -239,6 +252,49 @@ struct VerifyReleaseBoundaryArgs {
     expected_status: ReleaseBoundaryStatus,
 }
 
+#[derive(Args)]
+struct ReclaimRevealArgs {
+    #[command(flatten)]
+    common: CommonArgs,
+    #[arg(long)]
+    commit_txid: String,
+    #[arg(long)]
+    reveal_txid: String,
+    #[arg(long)]
+    update_txid: String,
+    #[arg(long)]
+    renew_txid: String,
+    #[arg(long)]
+    release_txid: String,
+}
+
+#[derive(Args)]
+struct VerifyReclaimArgs {
+    #[arg(long)]
+    rpc_url: String,
+    #[arg(long)]
+    reveal_txid: String,
+    #[arg(long, value_enum, default_value_t = ReclaimResolution::Active)]
+    expected_status: ReclaimResolution,
+}
+
+#[derive(Args)]
+struct VerifyReclaimRenewArgs {
+    #[arg(long)]
+    rpc_url: String,
+    #[arg(long)]
+    reveal_txid: String,
+    #[arg(long)]
+    renew_txid: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+#[value(rename_all = "lower")]
+enum ReclaimResolution {
+    Active,
+    Stale,
+}
+
 fn local_consensus() -> LocalNetwork {
     let one = Some(BlockHeight::from_u32(1));
     let two = Some(BlockHeight::from_u32(2));
@@ -262,12 +318,16 @@ fn v2_parameters() -> V2Parameters {
     V2Parameters::testing()
 }
 
-fn names_intent(ask: &SpendAuthorizingKey) -> Result<RegistrationIntent> {
+fn registration_intent(
+    ask: &SpendAuthorizingKey,
+    record: [u8; 64],
+    secret: [u8; 32],
+) -> Result<RegistrationIntent> {
     Ok(RegistrationIntent {
         name: NAME.to_owned(),
         owner_pk: spend_auth_owner_key_bytes(ask),
-        record: RECORD.to_vec(),
-        secret: SECRET,
+        record: record.to_vec(),
+        secret,
     })
 }
 
@@ -401,10 +461,23 @@ fn submit_raw(rpc_url: &str, bytes: &[u8]) -> Result<[u8; 32]> {
 }
 
 fn build_commit(args: CommonArgs) -> Result<()> {
+    build_commit_for(args, RECORD, SECRET, "COMMIT")
+}
+
+fn build_reclaim_commit(args: CommonArgs) -> Result<()> {
+    build_commit_for(args, RECLAIM_RECORD, RECLAIM_SECRET, "RECLAIM_COMMIT")
+}
+
+fn build_commit_for(
+    args: CommonArgs,
+    record: [u8; 64],
+    secret: [u8; 32],
+    label: &str,
+) -> Result<()> {
     let params = local_consensus();
     let usk = wallet_usk(&params)?;
     let ask = SpendAuthorizingKey::from(usk.orchard());
-    let intent = names_intent(&ask)?;
+    let intent = registration_intent(&ask, record, secret)?;
     let commitment = intent
         .commitment()
         .map_err(|error| anyhow::anyhow!("derive COMMIT commitment: {error:?}"))?;
@@ -423,10 +496,10 @@ fn build_commit(args: CommonArgs) -> Result<()> {
     );
     let raw = build_wallet_carrier_transaction(&args.wallet_dir, build_carrier_request(&frames)?)?;
     let txid = submit_raw(&args.rpc_url, &raw)?;
-    println!("COMMIT_TXID={}", hex::encode(txid));
-    println!("COMMITMENT={}", hex::encode(commitment));
-    println!("COMMIT_OPERATION_BYTES={}", encoded.len());
-    println!("COMMIT_CPV1_FRAMES={}", frames.len());
+    println!("{label}_TXID={}", hex::encode(txid));
+    println!("{label}_COMMITMENT={}", hex::encode(commitment));
+    println!("{label}_OPERATION_BYTES={}", encoded.len());
+    println!("{label}_CPV1_FRAMES={}", frames.len());
     println!("NAMES_APPLICATION_ID={}", hex::encode(app_id));
     println!(
         "RENDEZVOUS_RECEIVER={}",
@@ -612,6 +685,10 @@ struct ReplayedNamesLineage {
     fresh_status: ResolutionStatus,
     fresh_head: NameState,
     fresh_anchor: Option<StateRef>,
+    /// A stale state can be beyond the bounded fresh-discovery lookback while
+    /// still being renewable by its wallet owner. Construction must then rely
+    /// on authenticated full replay, not pretend a fresh lookup succeeded.
+    fresh_available: bool,
 }
 
 /// Reconstructs the supplied registration and, optionally, requires canonical
@@ -1024,7 +1101,7 @@ fn replay_names_lineage(
         .head(name_id)
         .context("full replay returned no accepted Names state")?
         .clone();
-    if update_txid.is_none() {
+    if update_txid.is_none() && renew_txid.is_none() && release_txid.is_none() {
         ensure!(
             full_head.commitment == *state_commitment,
             "full replay registration commitment mismatch"
@@ -1036,22 +1113,43 @@ fn replay_names_lineage(
     }
     let resolver = FreshResolver::new(v2)
         .map_err(|error| anyhow::anyhow!("construct Names v2 fresh resolver: {error:?}"))?;
-    let fresh_result = resolver
-        .resolve(NAME, &blocks, verifier)
-        .map_err(|error| anyhow::anyhow!("Names v2 FreshResolver failed: {error:?}"))?;
-    let fresh_status = fresh_result.status;
-    let fresh_anchor = fresh_result.anchor;
-    let fresh_head = fresh_result
-        .state
-        .context("FreshResolver returned no accepted Names state")?;
-    ensure!(
-        full_status == fresh_status,
-        "full replay and FreshResolver returned different statuses"
-    );
-    ensure!(
-        full_head == fresh_head,
-        "full replay and FreshResolver returned different NameState values"
-    );
+    let (fresh_status, fresh_anchor, fresh_head, fresh_available) =
+        match resolver.resolve(NAME, &blocks, verifier) {
+            Ok(fresh_result) => {
+                let Some(fresh_head) = fresh_result.state else {
+                    if full_status == ResolutionStatus::Stale {
+                        return Ok(ReplayedNamesLineage {
+                            blocks,
+                            tip_height: canonical_tip_height,
+                            activation_height,
+                            activation_parent_hash,
+                            name_id,
+                            machine,
+                            full_status,
+                            full_head: full_head.clone(),
+                            fresh_status: full_status,
+                            fresh_head: full_head,
+                            fresh_anchor: fresh_result.anchor,
+                            fresh_available: false,
+                        });
+                    }
+                    bail!("FreshResolver returned no accepted Names state");
+                };
+                ensure!(
+                    full_status == fresh_result.status,
+                    "full replay and FreshResolver returned different statuses"
+                );
+                ensure!(
+                    full_head == fresh_head,
+                    "full replay and FreshResolver returned different NameState values"
+                );
+                (fresh_result.status, fresh_result.anchor, fresh_head, true)
+            }
+            Err(_) if full_status == ResolutionStatus::Stale => {
+                (full_status, None, full_head.clone(), false)
+            }
+            Err(error) => bail!("Names v2 FreshResolver failed: {error:?}"),
+        };
 
     Ok(ReplayedNamesLineage {
         blocks,
@@ -1065,6 +1163,7 @@ fn replay_names_lineage(
         fresh_status,
         fresh_head,
         fresh_anchor,
+        fresh_available,
     })
 }
 
@@ -1189,6 +1288,17 @@ fn wallet_witnesses(
 }
 
 fn reveal(args: RevealArgs) -> Result<()> {
+    reveal_with_replacement(args, RECORD, SECRET, SUCCESSOR_SEED, None, "REVEAL")
+}
+
+fn reveal_with_replacement(
+    args: RevealArgs,
+    record: [u8; 64],
+    secret: [u8; 32],
+    successor_seed: u8,
+    replacement_predecessor: Option<StateRef>,
+    flow_label: &str,
+) -> Result<()> {
     let params = local_consensus();
     let v2 = v2_parameters();
     let commit_txid = parse_txid_hex(&args.commit_txid)?;
@@ -1202,7 +1312,7 @@ fn reveal(args: RevealArgs) -> Result<()> {
     let usk = wallet_usk(&params)?;
     let names_fvk = FullViewingKey::from(usk.orchard());
     let names_ask = SpendAuthorizingKey::from(usk.orchard());
-    let intent = names_intent(&names_ask)?;
+    let intent = registration_intent(&names_ask, record, secret)?;
     let intent_commitment = intent
         .commitment()
         .map_err(|error| anyhow::anyhow!("derive REVEAL commitment: {error:?}"))?;
@@ -1268,7 +1378,7 @@ fn reveal(args: RevealArgs) -> Result<()> {
     let successor_note = {
         let rho = Option::<Rho>::from(Rho::from_bytes(&registration_nf))
             .context("registration nullifier is not a valid successor rho")?;
-        let rseed = Option::<RandomSeed>::from(RandomSeed::from_bytes([SUCCESSOR_SEED; 32], &rho))
+        let rseed = Option::<RandomSeed>::from(RandomSeed::from_bytes([successor_seed; 32], &rho))
             .context("construct deterministic successor note seed")?;
         Option::<Note>::from(Note::from_parts(
             names_fvk.address_at(0u32, registration.1),
@@ -1330,7 +1440,7 @@ fn reveal(args: RevealArgs) -> Result<()> {
     let reveal = V2Operation::Reveal {
         intent: Box::new(intent),
         commit,
-        replacement_predecessor: None,
+        replacement_predecessor,
         state: state_data,
         state_commitment: successor_commitment,
         state_nullifier: successor_future_nf,
@@ -1502,6 +1612,7 @@ fn reveal(args: RevealArgs) -> Result<()> {
         "node returned a different REVEAL txid"
     );
 
+    println!("REGISTRATION_FLOW={flow_label}");
     println!("COMMIT_TXID={}", hex::encode(commit.position.txid));
     println!("COMMITMENT={}", hex::encode(commit.commitment));
     println!("COMMIT_HEIGHT={}", commit.position.height);
@@ -1533,6 +1644,12 @@ fn reveal(args: RevealArgs) -> Result<()> {
     println!("SUCCESSOR_CMX={}", hex::encode(successor_commitment));
     println!("SUCCESSOR_FUTURE_NF={}", hex::encode(successor_future_nf));
     println!(
+        "REPLACEMENT_PREDECESSOR={}",
+        replacement_predecessor
+            .map(|reference| hex::encode(reference.digest()))
+            .unwrap_or_else(|| "none".to_owned())
+    );
+    println!(
         "CONSENSUS_PROOF_BYTES={}",
         extracted.ironwood_proof_byte_len
     );
@@ -1545,6 +1662,313 @@ fn reveal(args: RevealArgs) -> Result<()> {
     println!(
         "RENDEZVOUS_RECEIVER={}",
         hex::encode(REGTEST.rendezvous.orchard_receiver)
+    );
+    Ok(())
+}
+
+struct ReclaimContext {
+    terminal: NameState,
+    claimable_height: u32,
+    commit: CommitRef,
+}
+
+fn reclaim_context(args: &ReclaimRevealArgs) -> Result<ReclaimContext> {
+    let params = local_consensus();
+    let v2 = v2_parameters();
+    let reveal_txid = parse_txid_hex(&args.reveal_txid)?;
+    let update_txid = parse_txid_hex(&args.update_txid)?;
+    let renew_txid = parse_txid_hex(&args.renew_txid)?;
+    let release_txid = parse_txid_hex(&args.release_txid)?;
+    let mut source = source_for(&args.common.rpc_url)?;
+    let rendezvous = CoreRendezvous::try_new(
+        &REGTEST.rendezvous.orchard_ivk,
+        &REGTEST.rendezvous.orchard_receiver,
+    )
+    .map_err(|error| anyhow::anyhow!("construct Names rendezvous decoder: {error:?}"))?;
+    let app_id = names_application_id().to_bytes();
+    let (_, transition_verifier, _, genesis_verifier) =
+        orchard::circuit::state_note_binding::keygen();
+    let names_verifier = OrchardV2ProofVerifier::from_parts(transition_verifier, genesis_verifier);
+    let lineage = replay_names_lineage(
+        &mut source,
+        &params,
+        &rendezvous,
+        app_id,
+        reveal_txid,
+        Some(update_txid),
+        Some(renew_txid),
+        Some(release_txid),
+        &names_verifier,
+    )?;
+    ensure!(
+        lineage.full_status == ResolutionStatus::Expired
+            && lineage.fresh_status == ResolutionStatus::Expired
+            && lineage.full_head == lineage.fresh_head,
+        "replacement requires the exact canonical terminal lineage to be claimable"
+    );
+    let terminal = lineage.full_head.clone();
+    ensure!(
+        terminal.data.status == StateStatus::Released,
+        "replacement predecessor is not an explicitly released terminal state"
+    );
+    let claimable_height = v2
+        .claimable_from(
+            terminal.data.status,
+            terminal.data.lease_expiry,
+            terminal.data.terminal_height,
+        )
+        .context("derive terminal claimability height")?;
+    ensure!(
+        lineage.tip_height >= claimable_height,
+        "canonical tip is before the released lineage claimability boundary"
+    );
+
+    let usk = wallet_usk(&params)?;
+    let ask = SpendAuthorizingKey::from(usk.orchard());
+    let reclaim_intent = registration_intent(&ask, RECLAIM_RECORD, RECLAIM_SECRET)?;
+    let reclaim_commitment = reclaim_intent
+        .commitment()
+        .map_err(|error| anyhow::anyhow!("derive replacement COMMIT commitment: {error:?}"))?;
+    let (commit, _) = find_canonical_commit(
+        &mut source,
+        &params,
+        &rendezvous,
+        app_id,
+        parse_txid_hex(&args.commit_txid)?,
+        reclaim_commitment,
+    )?;
+    ensure!(
+        commit.position.height >= claimable_height,
+        "replacement COMMIT predates the canonical claimability boundary"
+    );
+    Ok(ReclaimContext {
+        terminal,
+        claimable_height,
+        commit,
+    })
+}
+
+fn print_reclaim_context(context: &ReclaimContext) {
+    println!(
+        "RECLAIM_PREDECESSOR_HEIGHT={}",
+        context.terminal.state_ref.position().height
+    );
+    println!(
+        "RECLAIM_PREDECESSOR_TXID={}",
+        hex::encode(context.terminal.state_ref.position().txid)
+    );
+    println!("RECLAIM_CLAIMABLE_HEIGHT={}", context.claimable_height);
+    println!("RECLAIM_COMMIT_HEIGHT={}", context.commit.position.height);
+    println!("RECLAIM_PRECONDITIONS=yes");
+}
+
+fn reclaim_check(args: ReclaimRevealArgs) -> Result<()> {
+    let context = reclaim_context(&args)?;
+    print_reclaim_context(&context);
+    Ok(())
+}
+
+fn reclaim_reveal(args: ReclaimRevealArgs) -> Result<()> {
+    let context = reclaim_context(&args)?;
+    print_reclaim_context(&context);
+    reveal_with_replacement(
+        RevealArgs {
+            common: args.common,
+            commit_txid: args.commit_txid,
+        },
+        RECLAIM_RECORD,
+        RECLAIM_SECRET,
+        RECLAIM_SUCCESSOR_SEED,
+        Some(context.terminal.state_ref),
+        "EXPLICIT_REPLACEMENT_REVEAL",
+    )
+}
+
+fn verify_reclaim(args: VerifyReclaimArgs) -> Result<()> {
+    let params = local_consensus();
+    let mut source = source_for(&args.rpc_url)?;
+    let rendezvous = CoreRendezvous::try_new(
+        &REGTEST.rendezvous.orchard_ivk,
+        &REGTEST.rendezvous.orchard_receiver,
+    )
+    .map_err(|error| anyhow::anyhow!("construct Names rendezvous decoder: {error:?}"))?;
+    let app_id = names_application_id().to_bytes();
+    let (_, transition_verifier, _, genesis_verifier) =
+        orchard::circuit::state_note_binding::keygen();
+    let names_verifier = OrchardV2ProofVerifier::from_parts(transition_verifier, genesis_verifier);
+    let reveal_txid = parse_txid_hex(&args.reveal_txid)?;
+    let lineage = replay_names_lineage(
+        &mut source,
+        &params,
+        &rendezvous,
+        app_id,
+        reveal_txid,
+        None,
+        None,
+        None,
+        &names_verifier,
+    )?;
+    let expected_status = match args.expected_status {
+        ReclaimResolution::Active => ResolutionStatus::Active,
+        ReclaimResolution::Stale => ResolutionStatus::Stale,
+    };
+    ensure!(
+        lineage.full_status == expected_status
+            && lineage.fresh_status == expected_status
+            && lineage.full_head == lineage.fresh_head,
+        "full replay and FreshResolver did not agree on the expected replacement status"
+    );
+    let replacement = lineage.full_head;
+    ensure!(
+        replacement.data.sequence == 0
+            && replacement.data.record.as_slice() == RECLAIM_RECORD.as_slice()
+            && replacement.data.status == StateStatus::Active
+            && replacement.data.terminal_height == 0
+            && replacement.data.lease_expiry == 79,
+        "replacement head does not have the expected sequence-zero active state"
+    );
+    let transaction = lineage
+        .blocks
+        .values()
+        .flat_map(|block| block.transactions.iter())
+        .find(|transaction| transaction.txid == reveal_txid)
+        .context("canonical replacement REVEAL is absent")?;
+    let block = lineage
+        .blocks
+        .values()
+        .find(|block| block.transactions.iter().any(|tx| tx.txid == reveal_txid))
+        .context("canonical replacement REVEAL block is absent")?;
+    let V2Operation::Reveal {
+        replacement_predecessor,
+        action_index,
+        state_commitment,
+        state_nullifier,
+        ..
+    } = &transaction.operations[0]
+    else {
+        bail!("canonical replacement transaction has the wrong operation kind");
+    };
+    let expected_terminal = StateRef::new(
+        ProducerPosition::new(
+            28,
+            1,
+            parse_txid_hex("d2df7d9769643c8d6255d63a65a2c49bbd0f4a878a5db8cb00f68188fe563b13")?,
+        ),
+        4,
+        0,
+        hex::decode("e3411a420eb53dfe20bd6a774a8f6cfd9050ae7e4748953086c96aa110435a1e")
+            .context("decode qualified RELEASE commitment")?
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("qualified RELEASE commitment has wrong length"))?,
+        hex::decode("4c64584fe56e56e963579f810ec59cb7355ef054a1190dc79fcb98ca9a7d5511")
+            .context("decode qualified RELEASE future nullifier")?
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("qualified RELEASE nullifier has wrong length"))?,
+    );
+    ensure!(
+        *replacement_predecessor == Some(expected_terminal),
+        "replacement REVEAL did not carry the exact canonical RELEASE predecessor"
+    );
+    ensure!(
+        replacement.state_ref.position()
+            == ProducerPosition::new(block.height, transaction.tx_index, reveal_txid)
+            && replacement.state_ref.producer_action_index == *action_index
+            && replacement.commitment == *state_commitment
+            && replacement.state_ref.nullifier == *state_nullifier,
+        "replacement state ref does not match its canonical producer"
+    );
+    println!("NAMES_FULL_REPLAY_STATUS={:?}", expected_status);
+    println!("NAMES_FRESH_RESOLVER_STATUS={:?}", expected_status);
+    println!("NAMES_FULL_FRESH_MATCH=yes");
+    println!("RECLAIM_EXPLICIT_PREDECESSOR=yes");
+    println!("RECLAIM_SEQUENCE={}", replacement.data.sequence);
+    println!("RECLAIM_LEASE_EXPIRY={}", replacement.data.lease_expiry);
+    println!("RECLAIM_CANONICAL_HEIGHT={}", block.height);
+    println!("RECLAIM_CANONICAL_TX_INDEX={}", transaction.tx_index);
+    println!("RECLAIM_ACTION_INDEX={action_index}");
+    println!(
+        "RECLAIM_STATE_COMMITMENT={}",
+        hex::encode(replacement.commitment)
+    );
+    println!(
+        "RECLAIM_STATE_FUTURE_NF={}",
+        hex::encode(replacement.state_ref.nullifier)
+    );
+    Ok(())
+}
+
+fn verify_reclaim_renew(args: VerifyReclaimRenewArgs) -> Result<()> {
+    let params = local_consensus();
+    let mut source = source_for(&args.rpc_url)?;
+    let rendezvous = CoreRendezvous::try_new(
+        &REGTEST.rendezvous.orchard_ivk,
+        &REGTEST.rendezvous.orchard_receiver,
+    )
+    .map_err(|error| anyhow::anyhow!("construct Names rendezvous decoder: {error:?}"))?;
+    let app_id = names_application_id().to_bytes();
+    let (_, transition_verifier, _, genesis_verifier) =
+        orchard::circuit::state_note_binding::keygen();
+    let names_verifier = OrchardV2ProofVerifier::from_parts(transition_verifier, genesis_verifier);
+    let renew_txid = parse_txid_hex(&args.renew_txid)?;
+    let lineage = replay_names_lineage(
+        &mut source,
+        &params,
+        &rendezvous,
+        app_id,
+        parse_txid_hex(&args.reveal_txid)?,
+        None,
+        Some(renew_txid),
+        None,
+        &names_verifier,
+    )?;
+    ensure!(
+        lineage.full_status == ResolutionStatus::Active
+            && lineage.fresh_status == ResolutionStatus::Active
+            && lineage.full_head == lineage.fresh_head
+            && lineage.fresh_available,
+        "full replay and FreshResolver did not restore the same active renewed head"
+    );
+    let renewed = lineage.full_head;
+    ensure!(
+        renewed.data.sequence == 1
+            && renewed.data.record.as_slice() == RECLAIM_RECORD.as_slice()
+            && renewed.data.lease_expiry == 98
+            && renewed.data.status == StateStatus::Active
+            && renewed.data.terminal_height == 0,
+        "renewed replacement state has unexpected lifecycle fields"
+    );
+    ensure!(
+        lineage.fresh_anchor == Some(renewed.state_ref),
+        "FreshResolver did not replace its discovery anchor with the accepted RENEW StateRef"
+    );
+    let renew_transaction = lineage
+        .blocks
+        .values()
+        .flat_map(|block| block.transactions.iter())
+        .find(|transaction| transaction.txid == renew_txid)
+        .context("canonical replacement RENEW is absent")?;
+    let renew_block = lineage
+        .blocks
+        .values()
+        .find(|block| block.transactions.iter().any(|tx| tx.txid == renew_txid))
+        .context("canonical replacement RENEW block is absent")?;
+    ensure!(
+        renewed.state_ref.position()
+            == ProducerPosition::new(renew_block.height, renew_transaction.tx_index, renew_txid),
+        "renewed state does not retain its canonical producer position"
+    );
+    println!("NAMES_FULL_REPLAY_STATUS=Active");
+    println!("NAMES_FRESH_RESOLVER_STATUS=Active");
+    println!("NAMES_FULL_FRESH_MATCH=yes");
+    println!("STALE_RENEW_RECOVERY=yes");
+    println!("RENEW_CANONICAL_HEIGHT={}", renew_block.height);
+    println!("RENEW_SEQUENCE={}", renewed.data.sequence);
+    println!("RENEW_LEASE_EXPIRY={}", renewed.data.lease_expiry);
+    println!("RENEW_FRESH_ANCHOR_MATCH=yes");
+    println!("RENEW_STATE_COMMITMENT={}", hex::encode(renewed.commitment));
+    println!(
+        "RENEW_STATE_FUTURE_NF={}",
+        hex::encode(renewed.state_ref.nullifier)
     );
     Ok(())
 }
@@ -2005,7 +2429,11 @@ fn renew(args: RenewArgs) -> Result<()> {
     let params = local_consensus();
     let v2 = v2_parameters();
     let reveal_txid = parse_txid_hex(&args.reveal_txid)?;
-    let update_txid = parse_txid_hex(&args.update_txid)?;
+    let update_txid = args
+        .update_txid
+        .as_deref()
+        .map(parse_txid_hex)
+        .transpose()?;
     let mut source = source_for(&args.common.rpc_url)?;
     let rendezvous = CoreRendezvous::try_new(
         &REGTEST.rendezvous.orchard_ivk,
@@ -2023,70 +2451,72 @@ fn renew(args: RenewArgs) -> Result<()> {
         &rendezvous,
         app_id,
         reveal_txid,
-        Some(update_txid),
+        update_txid,
         None,
         None,
         &names_verifier,
     )?;
     ensure!(
-        lineage.full_status == ResolutionStatus::Active,
-        "current Names v2 state is not active: {:?}",
+        matches!(
+            lineage.full_status,
+            ResolutionStatus::Active | ResolutionStatus::Stale
+        ),
+        "current Names v2 state is not renewable: {:?}",
         lineage.full_status
     );
     ensure!(
-        lineage.fresh_status == ResolutionStatus::Active,
-        "FreshResolver did not find an active current state: {:?}",
-        lineage.fresh_status
-    );
-    ensure!(
-        lineage.full_head == lineage.fresh_head,
+        !lineage.fresh_available || lineage.full_head == lineage.fresh_head,
         "full replay and FreshResolver disagree before RENEW construction"
     );
     let predecessor = lineage.full_head;
     ensure!(
-        predecessor.data.sequence == 1
-            && predecessor.data.record.as_slice() == UPDATE_RECORD.as_slice()
-            && predecessor.data.lease_expiry == 55
-            && predecessor.data.status == StateStatus::Active
-            && predecessor.data.terminal_height == 0,
-        "qualified RENEW fixture does not have the expected active sequence-one predecessor"
+        predecessor.data.status == StateStatus::Active && predecessor.data.terminal_height == 0,
+        "RENEW predecessor is not an active non-terminal state"
     );
 
-    let update_transaction = lineage
+    let predecessor_txid = update_txid.unwrap_or(reveal_txid);
+    let predecessor_transaction = lineage
         .blocks
         .values()
         .flat_map(|block| block.transactions.iter())
-        .find(|transaction| transaction.txid == update_txid)
-        .context("canonical UPDATE transaction disappeared before RENEW construction")?;
-    let update_block = lineage
+        .find(|transaction| transaction.txid == predecessor_txid)
+        .context("canonical RENEW predecessor transaction disappeared")?;
+    let predecessor_block = lineage
         .blocks
         .values()
-        .find(|block| block.transactions.iter().any(|tx| tx.txid == update_txid))
-        .context("canonical UPDATE block disappeared before RENEW construction")?;
-    let update_operation_index = update_transaction
+        .find(|block| {
+            block
+                .transactions
+                .iter()
+                .any(|tx| tx.txid == predecessor_txid)
+        })
+        .context("canonical RENEW predecessor block disappeared")?;
+    let predecessor_operation_index = predecessor_transaction
         .operations
         .iter()
-        .position(|operation| matches!(operation, V2Operation::Update { .. }))
-        .context("canonical UPDATE operation index missing")?;
-    let V2Operation::Update {
-        action_index: update_action_index,
-        ..
-    } = &update_transaction.operations[update_operation_index]
-    else {
-        bail!("canonical UPDATE operation kind mismatch");
-    };
+        .position(|operation| {
+            if update_txid.is_some() {
+                matches!(operation, V2Operation::Update { .. })
+            } else {
+                matches!(operation, V2Operation::Reveal { .. })
+            }
+        })
+        .context("canonical RENEW predecessor operation index missing")?;
+    let predecessor_action_index = predecessor_transaction.operations[predecessor_operation_index]
+        .action_index()
+        .context("canonical RENEW predecessor has no designated action")?;
     ensure!(
         predecessor.state_ref.position()
             == ProducerPosition::new(
-                update_block.height,
-                update_transaction.tx_index,
-                update_txid
+                predecessor_block.height,
+                predecessor_transaction.tx_index,
+                predecessor_txid
             )
-            && predecessor.state_ref.producer_action_index == *update_action_index
+            && predecessor.state_ref.producer_action_index == predecessor_action_index
             && predecessor.state_ref.producer_operation_index
-                == u32::try_from(update_operation_index)
-                    .context("UPDATE operation index exceeds u32")?,
-        "current Names head is not the exact canonical UPDATE successor"
+                == u32::try_from(predecessor_operation_index)
+                    .context("RENEW predecessor operation index exceeds u32")?,
+        "current Names head is not the exact canonical predecessor successor"
     );
 
     let construction_height = lineage
@@ -2182,7 +2612,11 @@ fn renew(args: RenewArgs) -> Result<()> {
     let predecessor_rho = Option::<Rho>::from(Rho::from_bytes(&predecessor_nf))
         .context("accepted predecessor nullifier is not a valid successor rho")?;
     let successor_rseed = Option::<RandomSeed>::from(RandomSeed::from_bytes(
-        [RENEW_SUCCESSOR_SEED; 32],
+        [if update_txid.is_some() {
+            RENEW_SUCCESSOR_SEED
+        } else {
+            RENEW_SUCCESSOR_SEED + 3
+        }; 32],
         &predecessor_rho,
     ))
     .context("construct deterministic RENEW successor seed")?;
@@ -2216,9 +2650,8 @@ fn renew(args: RenewArgs) -> Result<()> {
         terminal_height: 0,
     };
     ensure!(
-        successor_data.record == predecessor.data.record
-            && successor_data.record.as_slice() == UPDATE_RECORD.as_slice(),
-        "RENEW must preserve the UPDATE record"
+        successor_data.record == predecessor.data.record,
+        "RENEW must preserve the predecessor record"
     );
     ensure!(
         successor_data.lease_expiry > predecessor.data.lease_expiry,
@@ -2262,10 +2695,10 @@ fn renew(args: RenewArgs) -> Result<()> {
         "Names RENEW statement does not reflect the exact predecessor/successor"
     );
     ensure!(
-        statement.predecessor_sequence == 1
-            && statement.successor_sequence == 2
+        statement.predecessor_sequence == predecessor.data.sequence
+            && statement.successor_sequence == predecessor.data.sequence + 1
             && statement.predecessor_record_digest == statement.successor_record_digest
-            && statement.predecessor_lease_expiry == 55
+            && statement.predecessor_lease_expiry == predecessor.data.lease_expiry
             && statement.successor_lease_expiry == successor_lease_expiry
             && statement.predecessor_status == StateStatus::Active.code()
             && statement.successor_status == StateStatus::Active.code()
@@ -2470,7 +2903,7 @@ fn renew(args: RenewArgs) -> Result<()> {
         "node returned a different RENEW txid"
     );
 
-    println!("UPDATE_TXID={}", hex::encode(update_txid));
+    println!("RENEW_PREDECESSOR_TXID={}", hex::encode(predecessor_txid));
     println!("RENEW_CURRENT_TIP={}", lineage.tip_height);
     println!("RENEW_SCHEDULED_HEIGHT={renew_height}");
     println!("RENEW_CONSTRUCTION_HEIGHT={construction_height}");
@@ -4180,5 +4613,10 @@ fn main() -> Result<()> {
         Command::Release(args) => release(args),
         Command::VerifyRelease(args) => verify_release(args),
         Command::VerifyReleaseBoundary(args) => verify_release_boundary(args),
+        Command::ReclaimCommit(args) => build_reclaim_commit(args),
+        Command::ReclaimReveal(args) => reclaim_reveal(args),
+        Command::ReclaimCheck(args) => reclaim_check(args),
+        Command::VerifyReclaim(args) => verify_reclaim(args),
+        Command::VerifyReclaimRenew(args) => verify_reclaim_renew(args),
     }
 }
