@@ -27,14 +27,14 @@ use coppice_names::{
     names_application::names_application_id,
     v2::{
         AppliedOperationKind, AppliedOperationResult, CanonicalBlock, CanonicalTransaction,
-        CommitRef, FreshResolver, GenesisStatement, IronwoodActionRef, NameState,
-        OrchardV2ProofProver, ProducerPosition, RegistrationIntent, ResolutionStatus, StateData,
-        StateRef, StateStatus, V2Operation, V2Parameters, V2StateMachine, decode_operation,
-        encode_operation, operation_footprint,
+        CommitRef, FreshResolver, GenesisStatement, IronwoodActionRef, NameState, OperationKind,
+        OrchardV2ProofProver, OrchardV2ProofVerifier, ProducerPosition, RegistrationIntent,
+        ResolutionStatus, StateData, StateRef, StateStatus, TransitionStatement, V2Operation,
+        V2Parameters, V2StateMachine, decode_operation, encode_operation, operation_footprint,
     },
 };
 use orchard::{
-    circuit::state_note_binding::{GenesisWitness, spend_auth_owner_key_bytes},
+    circuit::state_note_binding::{GenesisWitness, TransitionWitness, spend_auth_owner_key_bytes},
     keys::{FullViewingKey, Scope, SpendAuthorizingKey},
     note::{ExtractedNoteCommitment, Note, NoteVersion, RandomSeed, Rho},
 };
@@ -68,7 +68,7 @@ use zcash_devtool::names_v2_builder::{
     build_names_v2_pczt, extract_names_v2_transaction, finalize_names_v2_pczt_io,
     install_names_v2_ironwood_witnesses, names_v2_ironwood_shape,
     names_v2_ironwood_shape_from_counts, prove_names_v2_ironwood_pczt,
-    required_zip317_fee_for_names_v2, sign_names_v2_ironwood_pczt,
+    required_zip317_fee_for_names_v2, sign_names_v2_ironwood_pczt, verify_designated_action,
 };
 
 const NAME: &str = "footprint";
@@ -76,6 +76,9 @@ const ACTION_INDEX: u32 = 4;
 const RECORD: [u8; 64] = [9; 64];
 const SECRET: [u8; 32] = [8; 32];
 const SUCCESSOR_SEED: u8 = 3;
+const UPDATE_ACTION_INDEX: u32 = 4;
+const UPDATE_RECORD: [u8; 64] = [10; 64];
+const UPDATE_SUCCESSOR_SEED: u8 = 4;
 
 #[derive(Parser)]
 #[command(name = "names-v2-live")]
@@ -95,6 +98,10 @@ enum Command {
     Reveal(RevealArgs),
     /// Replay the canonical chain and verify the initial active state.
     Verify(VerifyArgs),
+    /// Build, authorize, and submit one real v2 UPDATE for the accepted name.
+    Update(UpdateArgs),
+    /// Replay the canonical chain and verify one real v2 UPDATE.
+    VerifyUpdate(VerifyUpdateArgs),
 }
 
 #[derive(Args, Clone)]
@@ -127,6 +134,24 @@ struct VerifyArgs {
     commit_txid: String,
     #[arg(long)]
     reveal_txid: String,
+}
+
+#[derive(Args)]
+struct UpdateArgs {
+    #[command(flatten)]
+    common: CommonArgs,
+    #[arg(long)]
+    reveal_txid: String,
+}
+
+#[derive(Args)]
+struct VerifyUpdateArgs {
+    #[arg(long)]
+    rpc_url: String,
+    #[arg(long)]
+    reveal_txid: String,
+    #[arg(long)]
+    update_txid: String,
 }
 
 fn local_consensus() -> LocalNetwork {
@@ -488,6 +513,321 @@ fn canonical_chain(
         );
     }
     Ok(blocks)
+}
+
+struct ReplayedNamesLineage {
+    blocks: BTreeMap<u32, CanonicalBlock>,
+    tip_height: u32,
+    activation_height: u32,
+    activation_parent_hash: [u8; 32],
+    name_id: [u8; 32],
+    machine: V2StateMachine,
+    full_status: ResolutionStatus,
+    full_head: NameState,
+    fresh_status: ResolutionStatus,
+    fresh_head: NameState,
+}
+
+/// Reconstructs the supplied registration and, optionally, requires one
+/// canonical UPDATE to be accepted by both independent replay paths.
+fn replay_names_lineage(
+    source: &mut coppice_zcash_rpc::RpcCanonicalBlockSource<
+        LocalNetwork,
+        coppice_zcash_rpc::HttpTransport,
+    >,
+    params: &LocalNetwork,
+    rendezvous: &CoreRendezvous,
+    app_id: [u8; 32],
+    reveal_txid: [u8; 32],
+    update_txid: Option<[u8; 32]>,
+    verifier: &OrchardV2ProofVerifier,
+) -> Result<ReplayedNamesLineage> {
+    let blocks = canonical_chain(source, params, rendezvous, app_id)?;
+    let canonical_tip_height = blocks
+        .keys()
+        .next_back()
+        .copied()
+        .context("canonical replay source contains no blocks")?;
+    let reveal = blocks
+        .values()
+        .flat_map(|block| block.transactions.iter())
+        .find(|transaction| transaction.txid == reveal_txid)
+        .context("canonical REVEAL transaction is absent from replay source")?;
+    ensure!(
+        reveal.operations.len() == 1,
+        "canonical REVEAL does not expose exactly one operation"
+    );
+    let V2Operation::Reveal {
+        intent,
+        commit,
+        state,
+        state_commitment,
+        state_nullifier,
+        action_index,
+        ..
+    } = &reveal.operations[0]
+    else {
+        bail!("canonical REVEAL operation kind mismatch");
+    };
+    ensure!(
+        intent.name == NAME,
+        "canonical REVEAL name does not match the live qualification name"
+    );
+    let name_id = intent
+        .name_id()
+        .map_err(|error| anyhow::anyhow!("derive replay name id: {error:?}"))?;
+    ensure!(
+        state.name_id == name_id,
+        "canonical REVEAL state name id differs from its intent"
+    );
+    let reveal_operation_index = reveal
+        .operations
+        .iter()
+        .position(|operation| matches!(operation, V2Operation::Reveal { .. }))
+        .context("canonical REVEAL operation index missing")
+        .and_then(|index| {
+            u32::try_from(index).context("canonical REVEAL operation index exceeds u32")
+        })?;
+    let reveal_action = reveal
+        .action(*action_index)
+        .context("canonical REVEAL designated action is absent")?;
+    ensure!(
+        reveal_action.commitment == *state_commitment,
+        "canonical REVEAL designated CMX mismatch"
+    );
+
+    let commit_txid = commit.position.txid;
+    ensure!(
+        commit_txid != reveal_txid,
+        "canonical COMMIT and REVEAL txids must differ"
+    );
+    let commit_transaction = blocks
+        .values()
+        .flat_map(|block| block.transactions.iter())
+        .find(|transaction| transaction.txid == commit_txid)
+        .context("canonical COMMIT transaction referenced by REVEAL is absent")?;
+    ensure!(
+        commit_transaction.operations.len() == 1,
+        "canonical COMMIT does not expose exactly one operation"
+    );
+    let V2Operation::Commit {
+        commitment: canonical_commitment,
+    } = &commit_transaction.operations[0]
+    else {
+        bail!("canonical COMMIT operation kind mismatch");
+    };
+    let commit_block = blocks
+        .values()
+        .find(|block| block.transactions.iter().any(|tx| tx.txid == commit_txid))
+        .context("COMMIT block missing")?;
+    ensure!(
+        commit.position
+            == ProducerPosition::new(
+                commit_block.height,
+                commit_transaction.tx_index,
+                commit_txid
+            ),
+        "REVEAL CommitRef position does not match canonical COMMIT location"
+    );
+    ensure!(
+        *canonical_commitment == commit.commitment,
+        "REVEAL CommitRef commitment does not match canonical COMMIT"
+    );
+
+    let update_transaction = if let Some(update_txid) = update_txid {
+        ensure!(
+            update_txid != commit_txid && update_txid != reveal_txid,
+            "UPDATE txid must differ from the registration transactions"
+        );
+        let transaction = blocks
+            .values()
+            .flat_map(|block| block.transactions.iter())
+            .find(|transaction| transaction.txid == update_txid)
+            .context("canonical UPDATE transaction is absent from replay source")?;
+        ensure!(
+            transaction.operations.len() == 1,
+            "canonical UPDATE does not expose exactly one operation"
+        );
+        ensure!(
+            matches!(transaction.operations[0], V2Operation::Update { .. }),
+            "canonical UPDATE operation kind mismatch"
+        );
+        Some(transaction)
+    } else {
+        None
+    };
+    let update_operation_index = if let Some(transaction) = update_transaction {
+        let index = transaction
+            .operations
+            .iter()
+            .position(|operation| matches!(operation, V2Operation::Update { .. }))
+            .expect("UPDATE operation was checked above");
+        Some(u32::try_from(index).context("canonical UPDATE operation index exceeds u32")?)
+    } else {
+        None
+    };
+
+    let v2 = v2_parameters();
+    let activation_height = v2.activation_height;
+    let activation_block = blocks
+        .get(&activation_height)
+        .context("canonical replay source is missing the v2 activation block")?;
+    let activation_parent_hash = activation_block.prev_block_hash;
+    let mut machine = V2StateMachine::from_activation_parent(v2, activation_parent_hash)
+        .map_err(|error| anyhow::anyhow!("construct Names v2 replay machine: {error:?}"))?;
+    let mut commit_seen = false;
+    let mut reveal_seen = false;
+    let mut update_seen = false;
+    for height in activation_height..=canonical_tip_height {
+        let block = blocks
+            .get(&height)
+            .context("canonical replay source is missing a sequential block")?;
+        let applied = machine.apply_block(block, verifier).map_err(|error| {
+            anyhow::anyhow!("Names v2 full replay failed at h{height}: {error:?}")
+        })?;
+        for transaction in &block.transactions {
+            if transaction.txid == commit_txid {
+                ensure!(!commit_seen, "canonical COMMIT was replayed more than once");
+                let outcome = applied
+                    .operations
+                    .iter()
+                    .find(|operation| {
+                        operation.tx_index == transaction.tx_index && operation.operation_index == 0
+                    })
+                    .context("full replay did not return the canonical COMMIT result")?;
+                match &outcome.result {
+                    AppliedOperationResult::Accepted(None) => {}
+                    AppliedOperationResult::Accepted(other) => {
+                        bail!("full replay COMMIT result was not Accepted(None): {other:?}")
+                    }
+                    AppliedOperationResult::Rejected(error) => {
+                        bail!("full replay COMMIT was rejected: {error:?}")
+                    }
+                }
+                commit_seen = true;
+            }
+            if transaction.txid == reveal_txid {
+                ensure!(!reveal_seen, "canonical REVEAL was replayed more than once");
+                let outcome = applied
+                    .operations
+                    .iter()
+                    .find(|operation| {
+                        operation.tx_index == transaction.tx_index
+                            && operation.operation_index == reveal_operation_index
+                    })
+                    .context("full replay did not return the canonical REVEAL result")?;
+                match &outcome.result {
+                    AppliedOperationResult::Accepted(Some((accepted_name_id, kind))) => {
+                        ensure!(
+                            *accepted_name_id == name_id,
+                            "full replay REVEAL accepted the wrong name id"
+                        );
+                        ensure!(
+                            *kind == AppliedOperationKind::Reveal,
+                            "full replay REVEAL returned the wrong operation kind"
+                        );
+                    }
+                    AppliedOperationResult::Accepted(other) => {
+                        bail!("full replay REVEAL result was not Accepted(name, Reveal): {other:?}")
+                    }
+                    AppliedOperationResult::Rejected(error) => {
+                        bail!("full replay REVEAL was rejected: {error:?}")
+                    }
+                }
+                reveal_seen = true;
+            }
+            if Some(transaction.txid) == update_txid {
+                ensure!(!update_seen, "canonical UPDATE was replayed more than once");
+                let operation_index =
+                    update_operation_index.context("canonical UPDATE operation index missing")?;
+                let outcome = applied
+                    .operations
+                    .iter()
+                    .find(|operation| {
+                        operation.tx_index == transaction.tx_index
+                            && operation.operation_index == operation_index
+                    })
+                    .context("full replay did not return the canonical UPDATE result")?;
+                match &outcome.result {
+                    AppliedOperationResult::Accepted(Some((accepted_name_id, kind))) => {
+                        ensure!(
+                            *accepted_name_id == name_id,
+                            "full replay UPDATE accepted the wrong name id"
+                        );
+                        ensure!(
+                            *kind == AppliedOperationKind::Update,
+                            "full replay UPDATE returned the wrong operation kind"
+                        );
+                    }
+                    AppliedOperationResult::Accepted(other) => {
+                        bail!("full replay UPDATE result was not Accepted(name, Update): {other:?}")
+                    }
+                    AppliedOperationResult::Rejected(error) => {
+                        bail!("full replay UPDATE was rejected: {error:?}")
+                    }
+                }
+                update_seen = true;
+            }
+        }
+    }
+    ensure!(
+        commit_seen,
+        "full replay did not process the canonical COMMIT"
+    );
+    ensure!(
+        reveal_seen,
+        "full replay did not process the canonical REVEAL"
+    );
+    ensure!(
+        update_txid.is_none() || update_seen,
+        "full replay did not process the canonical UPDATE"
+    );
+
+    let full_status = machine.resolution_at(name_id, canonical_tip_height);
+    let full_head = machine
+        .head(name_id)
+        .context("full replay returned no accepted Names state")?
+        .clone();
+    if update_txid.is_none() {
+        ensure!(
+            full_head.commitment == *state_commitment,
+            "full replay registration commitment mismatch"
+        );
+        ensure!(
+            full_head.state_ref.nullifier == *state_nullifier,
+            "full replay registration future nullifier mismatch"
+        );
+    }
+    let resolver = FreshResolver::new(v2)
+        .map_err(|error| anyhow::anyhow!("construct Names v2 fresh resolver: {error:?}"))?;
+    let fresh_result = resolver
+        .resolve(NAME, &blocks, verifier)
+        .map_err(|error| anyhow::anyhow!("Names v2 FreshResolver failed: {error:?}"))?;
+    let fresh_status = fresh_result.status;
+    let fresh_head = fresh_result
+        .state
+        .context("FreshResolver returned no accepted Names state")?;
+    ensure!(
+        full_status == fresh_status,
+        "full replay and FreshResolver returned different statuses"
+    );
+    ensure!(
+        full_head == fresh_head,
+        "full replay and FreshResolver returned different NameState values"
+    );
+
+    Ok(ReplayedNamesLineage {
+        blocks,
+        tip_height: canonical_tip_height,
+        activation_height,
+        activation_parent_hash,
+        name_id,
+        machine,
+        full_status,
+        full_head,
+        fresh_status,
+        fresh_head,
+    })
 }
 
 fn find_canonical_commit(
@@ -971,6 +1311,592 @@ fn reveal(args: RevealArgs) -> Result<()> {
     Ok(())
 }
 
+fn update(args: UpdateArgs) -> Result<()> {
+    let params = local_consensus();
+    let reveal_txid = parse_txid_hex(&args.reveal_txid)?;
+    let mut source = source_for(&args.common.rpc_url)?;
+    let rendezvous = CoreRendezvous::try_new(
+        &REGTEST.rendezvous.orchard_ivk,
+        &REGTEST.rendezvous.orchard_receiver,
+    )
+    .map_err(|error| anyhow::anyhow!("construct Names rendezvous decoder: {error:?}"))?;
+    let app_id = names_application_id().to_bytes();
+    let (transition_prover, transition_verifier, genesis_prover, genesis_verifier) =
+        orchard::circuit::state_note_binding::keygen();
+    let names_prover = OrchardV2ProofProver::from_parts(transition_prover, genesis_prover);
+    let names_verifier = OrchardV2ProofVerifier::from_parts(transition_verifier, genesis_verifier);
+    let lineage = replay_names_lineage(
+        &mut source,
+        &params,
+        &rendezvous,
+        app_id,
+        reveal_txid,
+        None,
+        &names_verifier,
+    )?;
+    ensure!(
+        lineage.full_status == ResolutionStatus::Active,
+        "current Names v2 state is not active: {:?}",
+        lineage.full_status
+    );
+    ensure!(
+        lineage.fresh_status == ResolutionStatus::Active,
+        "FreshResolver did not find an active current state: {:?}",
+        lineage.fresh_status
+    );
+    ensure!(
+        lineage.full_head == lineage.fresh_head,
+        "full replay and FreshResolver disagree before UPDATE construction"
+    );
+    let predecessor = lineage.full_head;
+    ensure!(
+        predecessor.data.sequence == 0,
+        "qualified UPDATE fixture requires the sequence-zero REVEAL head"
+    );
+    ensure!(
+        predecessor.data.record.as_slice() == RECORD.as_slice(),
+        "qualified UPDATE fixture has an unexpected predecessor record"
+    );
+    ensure!(
+        predecessor.data.lease_expiry == 55,
+        "qualified UPDATE fixture has an unexpected predecessor lease expiry"
+    );
+    ensure!(
+        predecessor.data.status == StateStatus::Active && predecessor.data.terminal_height == 0,
+        "qualified UPDATE fixture predecessor is not active"
+    );
+    let construction_height = lineage
+        .tip_height
+        .checked_add(1)
+        .context("live UPDATE construction height overflow")?;
+    ensure!(
+        lineage.tip_height < predecessor.data.lease_expiry
+            && construction_height < predecessor.data.lease_expiry,
+        "qualified Names v2 lineage is at or beyond its exclusive lease expiry"
+    );
+
+    let usk = wallet_usk(&params)?;
+    let names_fvk = FullViewingKey::from(usk.orchard());
+    let names_ask = SpendAuthorizingKey::from(usk.orchard());
+    let mut db = open_wallet(&args.common.wallet_dir, params)?;
+    let account_id = *db
+        .get_account_ids()?
+        .first()
+        .context("live wallet has no spending account")?;
+    let notes = selected_notes(&db, lineage.tip_height, account_id)?;
+    let predecessor_matches = notes
+        .iter()
+        .enumerate()
+        .filter(|(_, (note, _, _, _))| {
+            ExtractedNoteCommitment::from(note.commitment()).to_bytes() == predecessor.commitment
+        })
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    ensure!(
+        predecessor_matches.len() == 1,
+        "wallet must contain exactly one unspent note for the accepted Names predecessor (found {})",
+        predecessor_matches.len()
+    );
+    let (predecessor_note, predecessor_scope, predecessor_position, predecessor_value) = notes
+        .into_iter()
+        .enumerate()
+        .find_map(|(index, note)| (index == predecessor_matches[0]).then_some(note))
+        .context("wallet predecessor note disappeared during selection")?;
+    let predecessor_nf = predecessor_note.nullifier(&names_fvk).to_bytes();
+    ensure!(
+        predecessor_nf == predecessor.state_ref.nullifier,
+        "wallet predecessor nullifier differs from the accepted Names StateRef"
+    );
+
+    let mut notes = selected_notes(&db, lineage.tip_height, account_id)?;
+    let predecessor_index = notes
+        .iter()
+        .position(|(note, _, _, _)| {
+            ExtractedNoteCommitment::from(note.commitment()).to_bytes() == predecessor.commitment
+        })
+        .context("wallet predecessor note is not available for funding selection")?;
+    notes.swap_remove(predecessor_index);
+    let funding_index = notes
+        .iter()
+        .enumerate()
+        .max_by_key(|(_, (_, _, _, value))| *value)
+        .map(|(index, _)| index)
+        .context("live wallet has no separate Ironwood funding note")?;
+    let (funding_note, _funding_scope, funding_position, funding_value) =
+        notes.swap_remove(funding_index);
+    let funding_nf = funding_note.nullifier(&names_fvk).to_bytes();
+    ensure!(
+        funding_nf != predecessor_nf,
+        "UPDATE funding note must differ from the predecessor note"
+    );
+    ensure!(
+        funding_position != predecessor_position,
+        "UPDATE funding position must differ from the predecessor position"
+    );
+
+    let predecessor_rho = Option::<Rho>::from(Rho::from_bytes(&predecessor_nf))
+        .context("accepted predecessor nullifier is not a valid successor rho")?;
+    let successor_rseed = Option::<RandomSeed>::from(RandomSeed::from_bytes(
+        [UPDATE_SUCCESSOR_SEED; 32],
+        &predecessor_rho,
+    ))
+    .context("construct deterministic UPDATE successor seed")?;
+    let successor_note = Option::<Note>::from(Note::from_parts(
+        names_fvk.address_at(0u32, predecessor_scope),
+        predecessor_note.value(),
+        predecessor_rho,
+        successor_rseed,
+        NoteVersion::V3,
+    ))
+    .context("construct exact UPDATE successor note")?;
+    ensure!(
+        successor_note.value() == predecessor_note.value(),
+        "UPDATE successor note changed the predecessor bond value"
+    );
+    ensure!(
+        successor_note.value().inner() == predecessor_value,
+        "UPDATE successor note value differs from the wallet predecessor value"
+    );
+    let successor_commitment =
+        ExtractedNoteCommitment::from(successor_note.commitment()).to_bytes();
+    let successor_future_nf = successor_note.nullifier(&names_fvk).to_bytes();
+    let successor_data = StateData {
+        name_id: predecessor.data.name_id,
+        owner_pk: predecessor.data.owner_pk,
+        sequence: predecessor
+            .data
+            .sequence
+            .checked_add(1)
+            .context("UPDATE sequence overflow")?,
+        record: UPDATE_RECORD.to_vec(),
+        lease_expiry: predecessor.data.lease_expiry,
+        status: StateStatus::Active,
+        terminal_height: 0,
+    };
+    ensure!(
+        successor_data.record != predecessor.data.record,
+        "UPDATE successor record must change"
+    );
+    ensure!(
+        successor_data.lease_expiry == predecessor.data.lease_expiry,
+        "UPDATE successor lease must remain unchanged"
+    );
+    let action_index = UPDATE_ACTION_INDEX;
+    let successor_state_ref = StateRef::new(
+        ProducerPosition::new(construction_height, 0, [0; 32]),
+        action_index,
+        0,
+        successor_commitment,
+        successor_future_nf,
+    );
+    let successor = NameState::new(
+        successor_data.clone(),
+        successor_commitment,
+        successor_state_ref,
+    )
+    .map_err(|error| anyhow::anyhow!("construct UPDATE successor state: {error:?}"))?;
+    let action = IronwoodActionRef {
+        action_index,
+        nullifier: predecessor_nf,
+        commitment: successor_commitment,
+    };
+    let statement = TransitionStatement::from_states(
+        &predecessor,
+        &successor,
+        action,
+        OperationKind::Update,
+        construction_height,
+    )
+    .map_err(|error| anyhow::anyhow!("construct Names UPDATE statement: {error:?}"))?;
+    ensure!(
+        statement.predecessor_commitment == predecessor.commitment
+            && statement.predecessor_nullifier == predecessor_nf
+            && statement.successor_commitment == successor_commitment
+            && statement.successor_nullifier == successor_future_nf
+            && statement.predecessor_ref_digest == predecessor.state_ref.digest(),
+        "Names UPDATE statement does not reflect the exact predecessor/successor"
+    );
+    ensure!(
+        statement.predecessor_sequence == 0
+            && statement.successor_sequence == 1
+            && statement.predecessor_lease_expiry == 55
+            && statement.successor_lease_expiry == 55
+            && statement.operation_height == construction_height,
+        "Names UPDATE statement has unexpected lifecycle fields"
+    );
+    let transition_witness = TransitionWitness::new(
+        predecessor_note,
+        &names_fvk,
+        predecessor_scope,
+        &names_ask,
+        successor_note,
+    );
+    let names_proof_started = Instant::now();
+    let transition_proof = names_prover
+        .prove_transition(&statement, transition_witness, OsRng)
+        .map_err(|error| anyhow::anyhow!("create Names UPDATE proof: {error:?}"))?;
+    let names_proof_elapsed = names_proof_started.elapsed();
+    ensure!(!transition_proof.is_empty(), "Names UPDATE proof is empty");
+
+    let update_operation = V2Operation::Update {
+        predecessor: predecessor.state_ref,
+        state: successor_data,
+        state_commitment: successor_commitment,
+        state_nullifier: successor_future_nf,
+        action_index,
+        proof: transition_proof.clone(),
+    };
+    let encoded_update = encode_operation(&update_operation)
+        .map_err(|error| anyhow::anyhow!("encode UPDATE operation: {error:?}"))?;
+    let decoded_update = decode_operation(&encoded_update)
+        .map_err(|error| anyhow::anyhow!("decode UPDATE operation: {error:?}"))?;
+    ensure!(
+        decoded_update == update_operation,
+        "UPDATE wire round-trip mismatch"
+    );
+    let footprint = operation_footprint(&update_operation)
+        .map_err(|error| anyhow::anyhow!("measure UPDATE operation: {error:?}"))?;
+    let frames = encode_frames(app_id, &encoded_update)
+        .map_err(|error| anyhow::anyhow!("frame UPDATE operation: {error:?}"))?;
+    let reconstructed = reconstruct_frames(&frames, app_id)
+        .map_err(|error| anyhow::anyhow!("reconstruct UPDATE frames: {error:?}"))?;
+    ensure!(
+        reconstructed == encoded_update,
+        "CPV1 reconstruction changed UPDATE bytes"
+    );
+    let reconstructed_update = decode_operation(&reconstructed)
+        .map_err(|error| anyhow::anyhow!("decode reconstructed UPDATE: {error:?}"))?;
+    ensure!(
+        reconstructed_update == update_operation,
+        "CPV1 decode changed UPDATE operation"
+    );
+    ensure!(
+        frames.len() == footprint.cpv1_frames,
+        "CPV1 footprint disagrees with measured UPDATE operation"
+    );
+
+    let carrier_recipient = names_recipient()?;
+    let carriers = frames
+        .iter()
+        .copied()
+        .map(|memo| CarrierOutput {
+            recipient: carrier_recipient,
+            value: orchard::value::NoteValue::from_raw(1),
+            memo,
+        })
+        .collect::<Vec<_>>();
+    let planned_shape = names_v2_ironwood_shape_from_counts(
+        2,
+        carriers.len(),
+        1,
+        usize::try_from(action_index).context("UPDATE action index does not fit usize")?,
+    )?;
+    let required_fee = required_zip317_fee_for_names_v2(
+        &params,
+        BlockHeight::from_u32(construction_height),
+        planned_shape,
+    )?;
+    let required_fee_value = required_fee.into_u64();
+    let required_fee_balance =
+        i64::try_from(required_fee_value).context("UPDATE ZIP-317 fee does not fit balance")?;
+    let carrier_value = u64::try_from(carriers.len()).context("UPDATE carrier count overflow")?;
+    let change_value = funding_value
+        .checked_sub(carrier_value)
+        .and_then(|value| value.checked_sub(required_fee_value))
+        .context("funding note cannot cover UPDATE carriers and ZIP-317 fee")?;
+    let plan = NamesV2IronwoodPlan {
+        designated_fvk: names_fvk.clone(),
+        designated_spend: predecessor_note,
+        successor_note,
+        successor_ovk: None,
+        successor_memo: [0; 512],
+        carrier_outputs: carriers,
+        funding_spends: vec![FundingSpend {
+            fvk: names_fvk.clone(),
+            note: funding_note,
+        }],
+        change_outputs: vec![ChangeOutput {
+            fvk: names_fvk.clone(),
+            ovk: None,
+            recipient: names_fvk.address_at(0u32, Scope::Internal),
+            value: orchard::value::NoteValue::from_raw(change_value),
+            memo: [0; 512],
+        }],
+        designated_action_index: usize::try_from(action_index)
+            .context("UPDATE action index does not fit usize")?,
+    };
+    ensure!(
+        names_v2_ironwood_shape(&plan)? == planned_shape,
+        "UPDATE plan shape changed after fee planning"
+    );
+    let built = build_names_v2_bundle(plan, OsRng)?;
+    ensure!(
+        built.action_count == planned_shape.action_count,
+        "UPDATE built action count differs from fee-planned shape"
+    );
+    ensure!(
+        built.ironwood_value_balance == required_fee_balance,
+        "UPDATE built value balance differs from ZIP-317 fee"
+    );
+    ensure!(
+        built.designated_nullifier == statement.predecessor_nullifier
+            && built.designated_commitment == statement.successor_commitment,
+        "UPDATE designated action differs from the Names transition statement"
+    );
+    verify_designated_action(
+        &built.bundle,
+        built.designated_action_index,
+        predecessor_nf,
+        successor_commitment,
+    )?;
+
+    let anchor_height = db
+        .get_target_and_anchor_heights(NonZeroU32::MIN)?
+        .context("wallet has no synchronized target/anchor heights")?
+        .1;
+    let (anchor, paths) = wallet_witnesses(
+        &mut db,
+        anchor_height,
+        [predecessor_position, funding_position],
+    )?;
+    let complete = build_names_v2_pczt(NamesV2PcztPlan {
+        ironwood: built,
+        params,
+        consensus_branch_id: BranchId::Nu6_3,
+        expiry_height: BlockHeight::from_u32(construction_height),
+        fallback_lock_time: 0,
+    })?;
+    let finalized = finalize_names_v2_pczt_io(complete)?;
+    let witnessed = install_names_v2_ironwood_witnesses(
+        finalized,
+        NamesV2WitnessPlan {
+            anchor,
+            spends: vec![
+                NamesV2IronwoodWitness {
+                    nullifier: predecessor_nf,
+                    merkle_path: paths[0].clone(),
+                },
+                NamesV2IronwoodWitness {
+                    nullifier: funding_nf,
+                    merkle_path: paths[1].clone(),
+                },
+            ],
+        },
+    )?;
+    let consensus_proving_key = orchard::circuit::ProvingKey::build(
+        orchard::bundle::BundleVersion::ironwood_v3().circuit_version(),
+    );
+    let consensus_proof_started = Instant::now();
+    let proved = prove_names_v2_ironwood_pczt(witnessed, &consensus_proving_key)?;
+    let consensus_proof_elapsed = consensus_proof_started.elapsed();
+    let signed = sign_names_v2_ironwood_pczt(
+        proved,
+        NamesV2SigningPlan {
+            spends: vec![
+                zcash_devtool::names_v2_builder::NamesV2IronwoodSigningKey {
+                    nullifier: predecessor_nf,
+                    ask: SpendAuthorizingKey::from(usk.orchard()),
+                },
+                zcash_devtool::names_v2_builder::NamesV2IronwoodSigningKey {
+                    nullifier: funding_nf,
+                    ask: SpendAuthorizingKey::from(usk.orchard()),
+                },
+            ],
+        },
+    )?;
+    let extracted = extract_names_v2_transaction(signed)?;
+    ensure!(
+        extracted.action_count == planned_shape.action_count
+            && extracted.ironwood_value_balance == required_fee_balance,
+        "extracted UPDATE metadata differs from the planned shape or fee"
+    );
+    let mut raw = Vec::new();
+    extracted.transaction.write(&mut raw)?;
+    let update_txid = submit_raw(&args.common.rpc_url, &raw)?;
+    let final_txid: [u8; 32] = extracted.txid.into();
+    ensure!(
+        update_txid == final_txid,
+        "node returned a different UPDATE txid"
+    );
+
+    println!("REVEAL_TXID={}", hex::encode(reveal_txid));
+    println!("UPDATE_CONSTRUCTION_HEIGHT={construction_height}");
+    println!("UPDATE_NAMES_PROOF_BYTES={}", transition_proof.len());
+    println!(
+        "UPDATE_NAMES_PROOF_ELAPSED_MS={}",
+        names_proof_elapsed.as_millis()
+    );
+    println!("CNV2_UPDATE_BYTES={}", encoded_update.len());
+    println!("CPV1_UPDATE_FRAMES={}", frames.len());
+    println!("UPDATE_TXID={}", hex::encode(final_txid));
+    println!("UPDATE_ACTION_INDEX={action_index}");
+    println!("UPDATE_PREDECESSOR_VALUE={predecessor_value}");
+    println!("UPDATE_ACTION_COUNT={}", extracted.action_count);
+    println!("UPDATE_REAL_SPENDS={}", extracted.real_spend_count);
+    println!("UPDATE_CARRIER_OUTPUTS={}", extracted.carrier_output_count);
+    println!("UPDATE_CHANGE_OUTPUTS={}", extracted.change_output_count);
+    println!("UPDATE_VALUE_BALANCE={}", extracted.ironwood_value_balance);
+    println!("UPDATE_ANCHOR_HEIGHT={anchor_height}");
+    println!("UPDATE_ANCHOR={}", hex::encode(anchor.to_bytes()));
+    println!("UPDATE_PREDECESSOR_NF={}", hex::encode(predecessor_nf));
+    println!("UPDATE_SUCCESSOR_CMX={}", hex::encode(successor_commitment));
+    println!(
+        "UPDATE_SUCCESSOR_FUTURE_NF={}",
+        hex::encode(successor_future_nf)
+    );
+    println!(
+        "CONSENSUS_PROOF_BYTES={}",
+        extracted.ironwood_proof_byte_len
+    );
+    println!(
+        "CONSENSUS_PROOF_ELAPSED_MS={}",
+        consensus_proof_elapsed.as_millis()
+    );
+    println!("UPDATE_TX_BYTES={}", raw.len());
+    println!("NAMES_APPLICATION_ID={}", hex::encode(app_id));
+    println!(
+        "RENDEZVOUS_RECEIVER={}",
+        hex::encode(REGTEST.rendezvous.orchard_receiver)
+    );
+    Ok(())
+}
+
+fn verify_update(args: VerifyUpdateArgs) -> Result<()> {
+    let params = local_consensus();
+    let reveal_txid = parse_txid_hex(&args.reveal_txid)?;
+    let update_txid = parse_txid_hex(&args.update_txid)?;
+    let rendezvous = CoreRendezvous::try_new(
+        &REGTEST.rendezvous.orchard_ivk,
+        &REGTEST.rendezvous.orchard_receiver,
+    )
+    .map_err(|error| anyhow::anyhow!("construct Names rendezvous decoder: {error:?}"))?;
+    let app_id = names_application_id().to_bytes();
+    let mut source = source_for(&args.rpc_url)?;
+    let (_, transition_verifier, _, genesis_verifier) =
+        orchard::circuit::state_note_binding::keygen();
+    let names_verifier = OrchardV2ProofVerifier::from_parts(transition_verifier, genesis_verifier);
+    let lineage = replay_names_lineage(
+        &mut source,
+        &params,
+        &rendezvous,
+        app_id,
+        reveal_txid,
+        Some(update_txid),
+        &names_verifier,
+    )?;
+    ensure!(
+        lineage.full_status == ResolutionStatus::Active,
+        "full replay did not leave the name active: {:?}",
+        lineage.full_status
+    );
+    ensure!(
+        lineage.fresh_status == ResolutionStatus::Active,
+        "FreshResolver did not leave the name active: {:?}",
+        lineage.fresh_status
+    );
+    ensure!(
+        lineage.full_head == lineage.fresh_head,
+        "full replay and FreshResolver disagree after UPDATE"
+    );
+    ensure!(
+        lineage
+            .machine
+            .resolution_at(lineage.name_id, lineage.tip_height)
+            == lineage.full_status,
+        "full replay machine status does not match its recorded final status"
+    );
+    let update = lineage
+        .blocks
+        .values()
+        .flat_map(|block| block.transactions.iter())
+        .find(|transaction| transaction.txid == update_txid)
+        .context("canonical UPDATE transaction disappeared during verification")?;
+    let update_block = lineage
+        .blocks
+        .values()
+        .find(|block| block.transactions.iter().any(|tx| tx.txid == update_txid))
+        .context("canonical UPDATE block missing")?;
+    let update_operation_index = update
+        .operations
+        .iter()
+        .position(|operation| matches!(operation, V2Operation::Update { .. }))
+        .context("canonical UPDATE operation index missing")?;
+    let V2Operation::Update {
+        predecessor,
+        state,
+        state_commitment,
+        state_nullifier,
+        action_index,
+        ..
+    } = &update.operations[update_operation_index]
+    else {
+        bail!("canonical UPDATE operation kind mismatch");
+    };
+    let update_action = update
+        .action(*action_index)
+        .context("canonical UPDATE designated action is absent")?;
+    ensure!(
+        update_action.nullifier == predecessor.nullifier,
+        "canonical UPDATE predecessor NF does not match its designated action"
+    );
+    ensure!(
+        update_action.commitment == *state_commitment,
+        "canonical UPDATE successor CMX does not match its designated action"
+    );
+    let expected_position =
+        ProducerPosition::new(update_block.height, update.tx_index, update.txid);
+    let accepted = &lineage.full_head;
+    ensure!(
+        accepted.state_ref.position() == expected_position
+            && accepted.state_ref.producer_action_index == *action_index
+            && accepted.state_ref.producer_operation_index
+                == u32::try_from(update_operation_index)
+                    .context("UPDATE operation index exceeds u32")?
+            && accepted.commitment == *state_commitment
+            && accepted.state_ref.nullifier == *state_nullifier,
+        "accepted UPDATE state reference does not match the canonical transaction"
+    );
+    ensure!(
+        accepted.data.name_id == lineage.name_id
+            && accepted.data.owner_pk == state.owner_pk
+            && accepted.data.sequence == 1
+            && accepted.data.record.as_slice() == UPDATE_RECORD.as_slice()
+            && accepted.data.lease_expiry == 55
+            && accepted.data.status == StateStatus::Active
+            && accepted.data.terminal_height == 0,
+        "accepted UPDATE state values are not the expected sequence-one successor"
+    );
+    println!("ACTIVATION_HEIGHT={}", lineage.activation_height);
+    println!(
+        "ACTIVATION_PARENT_HASH={}",
+        hex::encode(lineage.activation_parent_hash)
+    );
+    println!("NAMES_FULL_COMMIT_ACCEPTED=yes");
+    println!("NAMES_FULL_REVEAL_ACCEPTED=yes");
+    println!("NAMES_FULL_UPDATE_ACCEPTED=yes");
+    println!("NAMES_FULL_REPLAY_STATUS={:?}", lineage.full_status);
+    println!("NAMES_FRESH_RESOLVER_STATUS={:?}", lineage.fresh_status);
+    println!("NAMES_FULL_FRESH_MATCH=yes");
+    println!("UPDATE_CANONICAL_HEIGHT={}", update_block.height);
+    println!("UPDATE_CANONICAL_TX_INDEX={}", update.tx_index);
+    println!("UPDATE_OPERATION_INDEX={update_operation_index}");
+    println!("UPDATE_ACTION_INDEX={action_index}");
+    println!("ACCEPTED_NAME_ID={}", hex::encode(accepted.data.name_id));
+    println!("ACCEPTED_OWNER_PK={}", hex::encode(accepted.data.owner_pk));
+    println!("ACCEPTED_SEQUENCE={}", accepted.data.sequence);
+    println!("ACCEPTED_RECORD_BYTES={}", accepted.data.record.len());
+    println!("ACCEPTED_LEASE_EXPIRY={}", accepted.data.lease_expiry);
+    println!(
+        "ACCEPTED_STATE_COMMITMENT={}",
+        hex::encode(accepted.commitment)
+    );
+    println!(
+        "ACCEPTED_STATE_FUTURE_NF={}",
+        hex::encode(accepted.state_ref.nullifier)
+    );
+    Ok(())
+}
+
 fn verify(args: VerifyArgs) -> Result<()> {
     let params = local_consensus();
     let app_id = names_application_id().to_bytes();
@@ -1300,5 +2226,7 @@ fn main() -> Result<()> {
         Command::Target(args) => print_target(args),
         Command::Reveal(args) => reveal(args),
         Command::Verify(args) => verify(args),
+        Command::Update(args) => update(args),
+        Command::VerifyUpdate(args) => verify_update(args),
     }
 }
