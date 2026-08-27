@@ -10,10 +10,13 @@ use orchard::{
     value::NoteValue,
 };
 use pczt::roles::{
-    creator::Creator, io_finalizer::IoFinalizer, prover::Prover, signer::Signer, updater::Updater,
+    creator::Creator, io_finalizer::IoFinalizer, prover::Prover, signer::Signer,
+    tx_extractor::TransactionExtractor, updater::Updater,
 };
 use rand::RngCore;
-use zcash_primitives::transaction::{TxVersion as TransactionVersion, builder::PcztParts};
+use zcash_primitives::transaction::{
+    Transaction, TxId, TxVersion as TransactionVersion, builder::PcztParts,
+};
 use zcash_protocol::consensus::{BlockHeight, BranchId, Parameters};
 
 /// One ordinary CPV1 rendezvous output.
@@ -185,6 +188,26 @@ pub struct NamesV2SignedPczt {
     pub change_output_count: usize,
     pub ironwood_value_balance: i64,
     pub ironwood_proof_byte_len: usize,
+}
+
+/// Fully authorized consensus transaction extracted from a signed Names v2 PCZT.
+pub struct NamesV2ExtractedTransaction {
+    pub transaction: Transaction,
+    pub txid: TxId,
+    pub consensus_tx_size: usize,
+    pub anchor: orchard::Anchor,
+    pub designated_action_index: u32,
+    pub designated_nullifier: [u8; 32],
+    pub designated_commitment: [u8; 32],
+    pub action_count: usize,
+    pub real_spend_count: usize,
+    pub requested_output_count: usize,
+    pub carrier_output_count: usize,
+    pub change_output_count: usize,
+    pub ironwood_value_balance: i64,
+    pub ironwood_proof_byte_len: usize,
+    pub ironwood_spend_authorization_count: usize,
+    pub ironwood_binding_signature_present: bool,
 }
 
 struct NamesV2SigningMetadata<'a> {
@@ -1115,6 +1138,176 @@ fn sign_names_v2_ironwood_pczt_core(
     Ok(pczt)
 }
 
+/// Extracts a fully authorized consensus transaction from a signed Names v2 PCZT.
+///
+/// The pinned Transaction Extractor creates the Ironwood binding signature and performs the
+/// authoritative consensus proof and spend-signature verification before returning a frozen
+/// transaction. This wrapper checks only the cheap Names-specific invariants around that role.
+pub fn extract_names_v2_transaction(
+    signed: NamesV2SignedPczt,
+) -> Result<NamesV2ExtractedTransaction> {
+    let NamesV2SignedPczt {
+        pczt,
+        anchor,
+        witnessed_action_indices: _,
+        designated_action_index,
+        designated_nullifier,
+        designated_commitment,
+        action_count,
+        real_spend_count,
+        requested_output_count,
+        carrier_output_count,
+        change_output_count,
+        ironwood_value_balance,
+        ironwood_proof_byte_len,
+    } = signed;
+
+    let proof_bytes = pczt
+        .ironwood()
+        .zkproof()
+        .clone()
+        .context("signed PCZT has no Ironwood proof")?;
+    ensure!(
+        !proof_bytes.is_empty(),
+        "signed PCZT has an empty Ironwood proof"
+    );
+    ensure!(
+        proof_bytes.len() == ironwood_proof_byte_len,
+        "signed PCZT Ironwood proof length differs from its metadata"
+    );
+
+    let before_action_layout = embedded_action_layout(&pczt)?;
+    let before_action_count = pczt.ironwood().actions().len();
+    let before_value_balance = *pczt.ironwood().value_sum();
+    let expected_anchor = anchor.to_bytes();
+    ensure!(
+        before_action_count == action_count,
+        "pre-extraction Ironwood action count changed"
+    );
+    ensure!(
+        before_value_balance == value_sum_parts(ironwood_value_balance)?,
+        "pre-extraction Ironwood value balance changed"
+    );
+    ensure!(
+        pczt.ironwood().anchor().as_ref() == Some(&expected_anchor),
+        "signed PCZT anchor does not match its metadata"
+    );
+    verify_embedded_designated_action(
+        &pczt,
+        designated_action_index,
+        designated_nullifier,
+        designated_commitment,
+    )?;
+
+    let pre_extraction_spend_authorization_count = pczt
+        .ironwood()
+        .actions()
+        .iter()
+        .filter(|action| action.spend().spend_auth_sig().is_some())
+        .count();
+    ensure!(
+        pre_extraction_spend_authorization_count == action_count,
+        "not every Ironwood action has a spend authorization before extraction"
+    );
+
+    let transaction = TransactionExtractor::new(pczt)
+        .extract()
+        .map_err(|error| anyhow::anyhow!("extract Names v2 consensus transaction: {error:?}"))?;
+
+    ensure!(
+        transaction.version() == TransactionVersion::V6,
+        "extracted transaction is not V6"
+    );
+    let ironwood = transaction
+        .ironwood_bundle()
+        .context("extracted transaction has no Ironwood bundle")?;
+    let after_action_count = ironwood.actions().len();
+    ensure!(
+        after_action_count == before_action_count,
+        "transaction extraction changed the Ironwood action count"
+    );
+    let after_action_layout = transaction_action_layout(&transaction)?;
+    ensure!(
+        after_action_layout == before_action_layout,
+        "transaction extraction changed the ordered Ironwood action layout"
+    );
+
+    let designated_action_index_usize = usize::try_from(designated_action_index)
+        .context("convert extracted CNV2 action index to usize")?;
+    let designated_action = ironwood
+        .actions()
+        .get(designated_action_index_usize)
+        .context("extracted designated action index is outside the Ironwood bundle")?;
+    ensure!(
+        designated_action.nullifier().to_bytes() == designated_nullifier,
+        "extracted designated action nullifier mismatch"
+    );
+    ensure!(
+        designated_action.cmx().to_bytes() == designated_commitment,
+        "extracted designated action commitment mismatch"
+    );
+    let matching_designated_pairs = after_action_layout
+        .iter()
+        .filter(|(nullifier, commitment)| {
+            *nullifier == designated_nullifier && *commitment == designated_commitment
+        })
+        .count();
+    ensure!(
+        matching_designated_pairs == 1,
+        "extracted designated NF/CMX pair is not unique"
+    );
+
+    let after_value_balance = i64::from(ironwood.value_balance());
+    ensure!(
+        after_value_balance == ironwood_value_balance,
+        "transaction extraction changed the Ironwood value balance"
+    );
+    ensure!(
+        ironwood.anchor() == &anchor,
+        "transaction extraction changed the Ironwood anchor"
+    );
+    let extracted_proof = ironwood.authorization().proof();
+    ensure!(
+        !extracted_proof.as_ref().is_empty(),
+        "extracted Ironwood proof is empty"
+    );
+    ensure!(
+        extracted_proof.as_ref() == proof_bytes.as_slice(),
+        "transaction extraction changed the Ironwood proof bytes"
+    );
+    let ironwood_spend_authorization_count = ironwood.actions().len();
+    ensure!(
+        ironwood_spend_authorization_count == action_count,
+        "extracted transaction does not contain every Ironwood spend authorization"
+    );
+    let ironwood_binding_signature_present = {
+        let _binding_signature = ironwood.authorization().binding_signature();
+        true
+    };
+
+    let serialized_transaction = serialize_consensus_transaction(&transaction)?;
+    let consensus_tx_size = serialized_transaction.len();
+
+    Ok(NamesV2ExtractedTransaction {
+        txid: transaction.txid(),
+        transaction,
+        consensus_tx_size,
+        anchor,
+        designated_action_index,
+        designated_nullifier,
+        designated_commitment,
+        action_count,
+        real_spend_count,
+        requested_output_count,
+        carrier_output_count,
+        change_output_count,
+        ironwood_value_balance,
+        ironwood_proof_byte_len,
+        ironwood_spend_authorization_count,
+        ironwood_binding_signature_present,
+    })
+}
+
 /// Verifies the exact physical action relation expected by the Names host.
 pub fn verify_designated_action(
     bundle: &orchard::pczt::Bundle,
@@ -1212,6 +1405,25 @@ fn embedded_action_layout(pczt: &pczt::Pczt) -> Result<Vec<([u8; 32], [u8; 32])>
         .collect()
 }
 
+fn transaction_action_layout(transaction: &Transaction) -> Result<Vec<([u8; 32], [u8; 32])>> {
+    let ironwood = transaction
+        .ironwood_bundle()
+        .context("transaction has no Ironwood bundle")?;
+    Ok(ironwood
+        .actions()
+        .iter()
+        .map(|action| (action.nullifier().to_bytes(), action.cmx().to_bytes()))
+        .collect())
+}
+
+fn serialize_consensus_transaction(transaction: &Transaction) -> Result<Vec<u8>> {
+    let mut serialized = Vec::new();
+    transaction
+        .write(&mut serialized)
+        .context("serialize consensus transaction")?;
+    Ok(serialized)
+}
+
 fn value_sum_parts(value_balance: i64) -> Result<(u64, bool)> {
     if value_balance < 0 {
         let magnitude = value_balance
@@ -1239,7 +1451,7 @@ mod tests {
     };
     use rand::{SeedableRng, rngs::StdRng};
     use shardtree::{ShardTree, store::memory::MemoryShardStore};
-    use std::sync::OnceLock;
+    use std::{io::Cursor, sync::OnceLock};
     use zcash_protocol::{
         consensus::BlockHeight,
         constants::{V6_TX_VERSION, V6_VERSION_GROUP_ID},
@@ -2054,7 +2266,7 @@ mod tests {
     }
 
     #[test]
-    fn funded_reveal_creates_one_consensus_ironwood_proof() {
+    fn funded_reveal_proves_signs_and_extracts_one_consensus_transaction() {
         let fixture = funded_reveal_fixture();
         let witness_plan = deterministic_funded_reveal_witness_plan(&fixture);
         let expected_anchor = witness_plan.anchor;
@@ -2191,6 +2403,134 @@ mod tests {
             proved.designated_commitment,
         )
         .unwrap();
+
+        let proved_proof = proved.pczt.ironwood().zkproof().clone();
+        let signed = sign_names_v2_ironwood_pczt(
+            proved,
+            NamesV2SigningPlan {
+                spends: vec![
+                    NamesV2IronwoodSigningKey {
+                        nullifier: fixture.registration_nullifier,
+                        ask: fixture.registration_ask.clone(),
+                    },
+                    NamesV2IronwoodSigningKey {
+                        nullifier: fixture.funding_nullifier,
+                        ask: fixture.funding_ask.clone(),
+                    },
+                ],
+            },
+        )
+        .unwrap();
+        assert_eq!(signed.pczt.ironwood().zkproof(), &proved_proof);
+        assert_eq!(signed.pczt.ironwood().actions().len(), 13);
+        assert_eq!(embedded_action_layout(&signed.pczt).unwrap(), before_layout);
+        assert_eq!(*signed.pczt.ironwood().value_sum(), before_value_balance);
+        assert_eq!(
+            signed.pczt.ironwood().anchor().as_ref().copied(),
+            Some(before_anchor.to_bytes())
+        );
+        assert_eq!(
+            signed
+                .pczt
+                .ironwood()
+                .actions()
+                .iter()
+                .filter(|action| action.spend().spend_auth_sig().is_some())
+                .count(),
+            13
+        );
+
+        let extracted = extract_names_v2_transaction(signed).unwrap();
+        assert_eq!(extracted.transaction.version(), TransactionVersion::V6);
+        assert_eq!(extracted.action_count, before_action_count);
+        assert_eq!(
+            extracted
+                .transaction
+                .ironwood_bundle()
+                .unwrap()
+                .actions()
+                .len(),
+            13
+        );
+        assert_eq!(extracted.designated_action_index, 4);
+        assert_eq!(extracted.designated_nullifier, before_designated_nullifier);
+        assert_eq!(
+            extracted.designated_commitment,
+            before_designated_commitment
+        );
+        assert_eq!(extracted.anchor, before_anchor);
+        assert_eq!(extracted.ironwood_value_balance, 1_000);
+        assert_eq!(extracted.ironwood_proof_byte_len, proof_len);
+        assert_eq!(extracted.ironwood_spend_authorization_count, 13);
+        assert!(extracted.ironwood_binding_signature_present);
+        let extracted_layout = transaction_action_layout(&extracted.transaction).unwrap();
+        assert_eq!(extracted_layout, before_layout);
+        assert_eq!(
+            extracted_layout
+                .iter()
+                .filter(|(nullifier, commitment)| {
+                    *nullifier == before_designated_nullifier
+                        && *commitment == before_designated_commitment
+                })
+                .count(),
+            1
+        );
+        let extracted_designated_action =
+            &extracted.transaction.ironwood_bundle().unwrap().actions()[4];
+        assert_eq!(
+            extracted_designated_action.nullifier().to_bytes(),
+            before_designated_nullifier
+        );
+        assert_eq!(
+            extracted_designated_action.cmx().to_bytes(),
+            before_designated_commitment
+        );
+
+        let mut consensus_bytes = Vec::new();
+        extracted.transaction.write(&mut consensus_bytes).unwrap();
+        assert_eq!(consensus_bytes.len(), extracted.consensus_tx_size);
+        eprintln!(
+            "Names v2 extracted consensus transaction: size={}, txid={}",
+            extracted.consensus_tx_size, extracted.txid
+        );
+
+        let reparsed_transaction =
+            Transaction::read(Cursor::new(&consensus_bytes), BranchId::Nu6_3).unwrap();
+        assert_eq!(reparsed_transaction.txid(), extracted.txid);
+        assert_eq!(reparsed_transaction.version(), TransactionVersion::V6);
+        assert_eq!(
+            reparsed_transaction
+                .ironwood_bundle()
+                .unwrap()
+                .actions()
+                .len(),
+            13
+        );
+        assert_eq!(
+            transaction_action_layout(&reparsed_transaction).unwrap(),
+            before_layout
+        );
+        assert_eq!(
+            reparsed_transaction.ironwood_bundle().unwrap().actions()[4]
+                .nullifier()
+                .to_bytes(),
+            before_designated_nullifier
+        );
+        assert_eq!(
+            reparsed_transaction.ironwood_bundle().unwrap().actions()[4]
+                .cmx()
+                .to_bytes(),
+            before_designated_commitment
+        );
+        assert_eq!(
+            i64::from(
+                reparsed_transaction
+                    .ironwood_bundle()
+                    .unwrap()
+                    .value_balance()
+            ),
+            1_000
+        );
     }
 
     #[test]
