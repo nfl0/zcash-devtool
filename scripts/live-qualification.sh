@@ -10,7 +10,8 @@ IFS=$'\n\t'
 # Phase 6 dispatches to the deterministic Coppice/coppice-librustzcash deep
 # reorg qualification and deliberately does not launch the live stack. Phase 7
 # runs phases 1-5 and then forces a beyond-retention reorg through the real
-# Zakura -> Zaino -> zcash-devtool stack.
+# Zakura -> Zaino -> zcash-devtool stack. Phase 8 runs one disposable v2
+# COMMIT -> REVEAL flow, including canonical replay acceptance.
 # Every node, database, wallet, and log is disposable and lives below one
 # run-specific directory under /tmp.
 
@@ -21,7 +22,8 @@ Usage: live-qualification.sh [--phase N] [--keep-state]
 
 Options:
   --phase N       Run a fresh stack through phase N (1-5), run deterministic
-                  Phase 6, or run all live phases including deep-reorg Phase 7.
+                  Phase 6, run all live phases including deep-reorg Phase 7,
+                  or run the one live v2 COMMIT -> REVEAL flow (Phase 8).
                   The default is 5.
   --resume DIR   Reuse a Phase 4 checkpoint and run only Phase 5. The directory
                   must have been produced with --phase 4 --keep-state.
@@ -35,6 +37,7 @@ Examples:
   ./scripts/live-qualification.sh --resume /tmp/coppice-live-qualification.X --phase 5
   ./scripts/live-qualification.sh --phase 6
   ./scripts/live-qualification.sh --phase 7
+  ./scripts/live-qualification.sh --phase 8 --keep-state
 EOF
 }
 
@@ -71,8 +74,8 @@ while (($# > 0)); do
     esac
 done
 
-[[ "$TARGET_PHASE" =~ ^[1-7]$ ]] || {
-    printf '[FAIL] --phase must be an integer from 1 through 7\n' >&2
+[[ "$TARGET_PHASE" =~ ^[1-8]$ ]] || {
+    printf '[FAIL] --phase must be an integer from 1 through 8\n' >&2
     exit 2
 }
 if [[ -n "$RESUME_DIR" ]]; then
@@ -113,6 +116,7 @@ BIN_DIR="$ROOT_DIR/bin"
 ZAKURA_BIN="$BIN_DIR/zakurad"
 ZAINO_BIN="$BIN_DIR/zainod"
 DEVTOOL_BIN="$BIN_DIR/zcash-devtool"
+NAMES_V2_LIVE_BIN="$ROOT_DIR/zcash-devtool/target/debug/names-v2-live"
 
 ZAKURA_RPC_ADDR="127.0.0.1:18232"
 ZAKURA_RPC_URL="http://$ZAKURA_RPC_ADDR"
@@ -1123,7 +1127,19 @@ done
 require_executable "$ZAKURA_BIN"
 require_executable "$ZAINO_BIN"
 require_executable "$DEVTOOL_BIN"
+if (( TARGET_PHASE == 8 )); then
+    status "Build the narrow live Names v2 COMMIT -> REVEAL entry point"
+    if ! (cd "$ROOT_DIR/zcash-devtool" && cargo build --offline --bin names-v2-live) \
+        >"$LOG_DIR/names-v2-live-build.log" 2>&1; then
+        tail -100 "$LOG_DIR/names-v2-live-build.log" >&2 || true
+        die "could not build names-v2-live"
+    fi
+    require_executable "$NAMES_V2_LIVE_BIN"
+fi
 printf '[INFO] binaries: %s, %s, %s\n' "$ZAKURA_BIN" "$ZAINO_BIN" "$DEVTOOL_BIN"
+if (( TARGET_PHASE == 8 )); then
+    printf '[INFO] live Names v2 binary: %s\n' "$NAMES_V2_LIVE_BIN"
+fi
 printf '[INFO] disposable run directory: %s\n' "$WORK_DIR"
 
 if [[ -z "$RESUME_DIR" ]]; then
@@ -1311,6 +1327,79 @@ printf '\n[PASS] Phase 1 infrastructure qualification complete\n'
 printf '[PASS] Ironwood subtree-root serving: yes (explicit gRPC GetSubtreeRoots, enum value 2)\n'
 printf '[PASS] ordinary Ironwood wallet receive/spend: yes (mined tx %s)\n' "$TXID"
     printf '[PASS] Phase 1 completed before Phase 2 Coppice lifecycle qualification\n'
+
+if (( TARGET_PHASE == 8 )); then
+    status "Phase 8: submit the real v2 COMMIT carrier transaction"
+    # The live helper reads the mnemonic only from its environment. Keeping it
+    # out of the command line also keeps it out of the run log.
+    export NAMES_V2_LIVE_MNEMONIC="$WALLET_MNEMONIC"
+    run_logged names-v2-commit timeout 900 "$NAMES_V2_LIVE_BIN" commit \
+        --wallet-dir "$WALLET_DIR" --rpc-url "$ZAKURA_RPC_URL"
+    COMMIT_LINE="$(rg -a -o '^COMMIT_TXID=[0-9a-f]{64}$' \
+        "$LOG_DIR/names-v2-commit.log" | tail -1 || true)"
+    [[ -n "$COMMIT_LINE" ]] || die "live v2 COMMIT did not emit a transaction id"
+    COMMIT_TXID="${COMMIT_LINE#COMMIT_TXID=}"
+    COMMIT_HEIGHT_START="$(zakura_tip_height)"
+    COMMIT_HEIGHT_EXPECTED=$((COMMIT_HEIGHT_START + 1))
+
+    status "Phase 8: mine the v2 COMMIT canonically"
+    rpc_generate 1
+    wait_for_zaino_tip "$COMMIT_HEIGHT_EXPECTED"
+    wallet_sync_logged names-v2-commit-sync
+
+    status "Phase 8: derive the next legal v2 REVEAL anchor"
+    run_logged names-v2-target timeout 120 "$NAMES_V2_LIVE_BIN" target \
+        --from-height "$COMMIT_HEIGHT_EXPECTED"
+    TARGET_REVEAL_HEIGHT="$(sed -n 's/^TARGET_REVEAL_HEIGHT=//p' \
+        "$LOG_DIR/names-v2-target.log" | tail -1)"
+    [[ "$TARGET_REVEAL_HEIGHT" =~ ^[0-9]+$ ]] \
+        || die "live v2 target command did not emit a target height"
+    MATURITY_DISTANCE=$((TARGET_REVEAL_HEIGHT - COMMIT_HEIGHT_EXPECTED))
+    (( MATURITY_DISTANCE >= 1 && MATURITY_DISTANCE <= 15 )) \
+        || die "live v2 target is outside the current COMMIT maturity/lifetime window"
+
+    CURRENT_TIP="$(zakura_tip_height)"
+    PRE_REVEAL_TIP=$((TARGET_REVEAL_HEIGHT - 1))
+    (( PRE_REVEAL_TIP >= CURRENT_TIP )) \
+        || die "live v2 target height is already behind the current chain tip"
+    BLOCKS_TO_TARGET=$((PRE_REVEAL_TIP - CURRENT_TIP))
+    if (( BLOCKS_TO_TARGET > 0 )); then
+        status "Phase 8: mine to the exact legal v2 REVEAL height"
+        rpc_generate "$BLOCKS_TO_TARGET"
+        wait_for_zaino_tip "$PRE_REVEAL_TIP"
+    fi
+    wallet_sync_logged names-v2-reveal-sync
+
+    status "Phase 8: prove, authorize, and submit the real v2 REVEAL"
+    run_logged names-v2-reveal timeout 1800 "$NAMES_V2_LIVE_BIN" reveal \
+        --wallet-dir "$WALLET_DIR" --rpc-url "$ZAKURA_RPC_URL" \
+        --commit-txid "$COMMIT_TXID"
+    REVEAL_LINE="$(rg -a -o '^REVEAL_TXID=[0-9a-f]{64}$' \
+        "$LOG_DIR/names-v2-reveal.log" | tail -1 || true)"
+    [[ -n "$REVEAL_LINE" ]] || die "live v2 REVEAL did not emit a transaction id"
+    REVEAL_TXID="${REVEAL_LINE#REVEAL_TXID=}"
+    REVEAL_HEIGHT_EXPECTED=$((PRE_REVEAL_TIP + 1))
+
+    status "Phase 8: mine the real v2 REVEAL"
+    rpc_generate 1
+    wait_for_zaino_tip "$REVEAL_HEIGHT_EXPECTED"
+    wallet_sync_logged names-v2-final-sync
+
+    status "Phase 8: replay canonical COMMIT -> REVEAL and verify registration"
+    run_logged names-v2-verify timeout 1200 "$NAMES_V2_LIVE_BIN" verify \
+        --rpc-url "$ZAKURA_RPC_URL" --commit-txid "$COMMIT_TXID" \
+        --reveal-txid "$REVEAL_TXID"
+    rg -a -q '^NAMES_REPLAY_STATUS=Active$' \
+        "$LOG_DIR/names-v2-verify.log" \
+        || die "canonical Names v2 replay did not accept the live registration"
+    printf '[PASS] live v2 COMMIT %s mined at h=%s; REVEAL %s mined at h=%s; Names replay accepted Active registration\n' \
+        "$COMMIT_TXID" "$COMMIT_HEIGHT_EXPECTED" \
+        "$REVEAL_TXID" "$REVEAL_HEIGHT_EXPECTED"
+    printf '[PASS] v2 COMMIT maturity distance=%s blocks; target/reveal height=%s; logs=%s\n' \
+        "$MATURITY_DISTANCE" "$TARGET_REVEAL_HEIGHT" "$LOG_DIR"
+    exit 0
+fi
+
 finish_phase_if_requested 1
 
 status "Phase 2: enable Coppice protection and create a confirmed bond note"
