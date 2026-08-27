@@ -1444,14 +1444,25 @@ fn value_sum_parts(value_balance: i64) -> Result<(u64, bool)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use coppice_names::{
+        carrier::bulletin_address,
+        config::REGTEST,
+        names_application::names_application_id,
+        v2::{
+            CommitRef, GenesisStatement, IronwoodActionRef, NameState, OrchardV2ProofProver,
+            ProducerPosition, RegistrationIntent, StateData, StateRef, StateStatus, V2Operation,
+            decode_operation, encode_operation, operation_footprint,
+        },
+    };
     use incrementalmerkletree::{Marking, Position, Retention};
     use orchard::{
+        circuit::state_note_binding::{GenesisWitness, spend_auth_owner_key_bytes},
         keys::{Scope, SpendAuthorizingKey, SpendingKey},
         note::{NoteVersion, RandomSeed, Rho},
     };
     use rand::{SeedableRng, rngs::StdRng};
     use shardtree::{ShardTree, store::memory::MemoryShardStore};
-    use std::{io::Cursor, sync::OnceLock};
+    use std::{io::Cursor, sync::OnceLock, time::Instant};
     use zcash_protocol::{
         consensus::BlockHeight,
         constants::{V6_TX_VERSION, V6_VERSION_GROUP_ID},
@@ -2263,6 +2274,197 @@ mod tests {
                 Some(*expected_signature)
             );
         }
+    }
+
+    #[test]
+    #[ignore = "expensive Names v2 genesis proving"]
+    fn funded_reveal_embeds_one_real_names_v2_reveal_payload() {
+        const ACTION_INDEX: u32 = 4;
+        const MINIMUM_BOND: u64 = 50_000;
+
+        let fixture = funded_reveal_fixture();
+
+        // These are the exact note/key values that the designated-pair wallet
+        // plan will pass to the Ironwood builder below. Cloning them here only
+        // lets the application proof consume the same immutable note material
+        // before the plan is moved into the builder.
+        let registration_note = fixture.plan.designated_spend.clone();
+        let successor_note = fixture.plan.successor_note.clone();
+        let names_fvk = fixture.plan.designated_fvk.clone();
+        let names_ask = fixture.registration_ask.clone();
+        let registration_nullifier = fixture.registration_nullifier;
+        let successor_commitment =
+            ExtractedNoteCommitment::from(successor_note.commitment()).to_bytes();
+        let successor_future_nullifier = successor_note.nullifier(&names_fvk).to_bytes();
+
+        let owner_pk = spend_auth_owner_key_bytes(&names_ask);
+        let intent = RegistrationIntent {
+            name: "footprint".to_owned(),
+            owner_pk,
+            record: vec![9; 64],
+            secret: [8; 32],
+        };
+        let name_id = intent.name_id().unwrap();
+        let intent_commitment = intent.commitment().unwrap();
+
+        // This CommitRef is deliberately synthetic. It gives the offline
+        // envelope a canonical predecessor shape, but establishes no chain
+        // inclusion, maturity, lifetime, or replay acceptance.
+        let commit = CommitRef::new(ProducerPosition::new(900, 1, [3; 32]), 0, intent_commitment);
+
+        let state_data = StateData {
+            name_id,
+            owner_pk,
+            sequence: 0,
+            record: intent.record.clone(),
+            lease_expiry: 1_000,
+            status: StateStatus::Active,
+            terminal_height: 0,
+        };
+        let state_ref = StateRef::new(
+            ProducerPosition::new(901, 0, [4; 32]),
+            ACTION_INDEX,
+            0,
+            successor_commitment,
+            successor_future_nullifier,
+        );
+        let state = NameState::new(state_data.clone(), successor_commitment, state_ref).unwrap();
+        let action = IronwoodActionRef {
+            action_index: ACTION_INDEX,
+            nullifier: registration_nullifier,
+            commitment: successor_commitment,
+        };
+        let statement = GenesisStatement::from_state(&state, action, MINIMUM_BOND).unwrap();
+
+        assert_eq!(statement.name_id, name_id);
+        assert_eq!(statement.owner_pk, owner_pk);
+        assert_eq!(statement.commitment, successor_commitment);
+        assert_eq!(statement.registration_nullifier, registration_nullifier);
+        assert_eq!(statement.state_nullifier, successor_future_nullifier);
+        assert_eq!(statement.minimum_bond_zatoshis, MINIMUM_BOND);
+
+        let witness = GenesisWitness::new(
+            registration_note,
+            successor_note,
+            &names_fvk,
+            Scope::External,
+            &names_ask,
+            MINIMUM_BOND,
+        )
+        .expect("the funded registration/successor notes form a genesis witness");
+        let names_prover = OrchardV2ProofProver::new();
+        let proving_started = Instant::now();
+        let genesis_proof = names_prover
+            .prove_genesis(&statement, witness, StdRng::from_seed([44; 32]))
+            .unwrap();
+        let proving_elapsed = proving_started.elapsed();
+        assert!(!genesis_proof.is_empty());
+
+        let reveal = V2Operation::Reveal {
+            intent: Box::new(intent),
+            commit,
+            replacement_predecessor: None,
+            state: state_data,
+            state_commitment: successor_commitment,
+            state_nullifier: successor_future_nullifier,
+            action_index: ACTION_INDEX,
+            proof: genesis_proof.clone(),
+        };
+        let encoded_reveal = encode_operation(&reveal).unwrap();
+        assert_eq!(decode_operation(&encoded_reveal).unwrap(), reveal);
+        let footprint = operation_footprint(&reveal).unwrap();
+        assert_eq!(footprint.operation_bytes, encoded_reveal.len());
+        assert_eq!(footprint.proof_bytes, genesis_proof.len());
+
+        let names_application_id = names_application_id().to_bytes();
+        let cpv1_frames =
+            coppice::transport::encode_frames(names_application_id, &encoded_reveal).unwrap();
+        assert_eq!(cpv1_frames.len(), footprint.cpv1_frames);
+        let reconstructed_reveal =
+            coppice::transport::reconstruct_frames(&cpv1_frames, names_application_id).unwrap();
+        assert_eq!(reconstructed_reveal, encoded_reveal);
+        assert_eq!(decode_operation(&reconstructed_reveal).unwrap(), reveal);
+        assert!(
+            coppice::transport::reconstruct_frames(&cpv1_frames, [0x42; 32]).is_err(),
+            "CPV1 frames must be bound to the Names application ID"
+        );
+
+        let rendezvous_recipient = bulletin_address(REGTEST.rendezvous).unwrap();
+        let carrier_outputs = cpv1_frames
+            .iter()
+            .copied()
+            .map(|memo| CarrierOutput {
+                recipient: rendezvous_recipient,
+                value: NoteValue::from_raw(1),
+                memo,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(carrier_outputs.len(), footprint.cpv1_frames);
+        assert!(
+            carrier_outputs
+                .iter()
+                .all(|carrier| carrier.recipient == rendezvous_recipient)
+        );
+
+        // Replace only the structural fixture's carrier bytes. All note
+        // material, the designated index, and the funding halves stay intact.
+        let mut plan = fixture.plan;
+        plan.carrier_outputs = carrier_outputs;
+        let built = build_names_v2_bundle(plan, StdRng::from_seed([10; 32])).unwrap();
+
+        assert_eq!(built.designated_action_index, ACTION_INDEX as usize);
+        assert_eq!(built.real_spend_count, 2);
+        assert_eq!(built.carrier_output_count, footprint.cpv1_frames);
+        assert_eq!(built.requested_output_count, footprint.cpv1_frames + 2);
+        assert_eq!(built.change_output_count, 1);
+        assert_eq!(built.action_count, 13);
+        assert_eq!(built.ironwood_value_balance, 1_000);
+        assert_eq!(built.designated_nullifier, statement.registration_nullifier);
+        assert_eq!(built.designated_commitment, statement.commitment);
+        verify_designated_action(
+            &built.bundle,
+            built.designated_action_index,
+            statement.registration_nullifier,
+            statement.commitment,
+        )
+        .unwrap();
+
+        let complete = build_names_v2_pczt(NamesV2PcztPlan {
+            ironwood: built,
+            params: local_v6_params(),
+            consensus_branch_id: BranchId::Nu6_3,
+            expiry_height: BlockHeight::from_u32(100),
+            fallback_lock_time: 0,
+        })
+        .unwrap();
+        assert_eq!(complete.pczt.ironwood().actions().len(), 13);
+        assert_eq!(*complete.pczt.ironwood().value_sum(), (1_000, false));
+        assert_eq!(complete.designated_action_index, ACTION_INDEX);
+        assert_eq!(complete.carrier_output_count, footprint.cpv1_frames);
+        verify_embedded_designated_action(
+            &complete.pczt,
+            complete.designated_action_index,
+            statement.registration_nullifier,
+            statement.commitment,
+        )
+        .unwrap();
+
+        eprintln!(
+            "Names v2 semantic REVEAL: app_id={}, operation_bytes={}, proof_bytes={}, cpv1_frames={}, minimum_actions={}, actions={}, real_spends={}, outputs={}, value_balance={}, proving_elapsed_ms={}, registration_nf={}, successor_cmx={}, successor_future_nf={}",
+            hex::encode(names_application_id),
+            footprint.operation_bytes,
+            footprint.proof_bytes,
+            footprint.cpv1_frames,
+            footprint.minimum_ironwood_actions,
+            complete.action_count,
+            complete.real_spend_count,
+            complete.requested_output_count,
+            complete.ironwood_value_balance,
+            proving_elapsed.as_millis(),
+            hex::encode(registration_nullifier),
+            hex::encode(successor_commitment),
+            hex::encode(successor_future_nullifier),
+        );
     }
 
     #[test]
