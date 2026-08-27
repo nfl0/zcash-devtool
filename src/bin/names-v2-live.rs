@@ -79,6 +79,8 @@ const SUCCESSOR_SEED: u8 = 3;
 const UPDATE_ACTION_INDEX: u32 = 4;
 const UPDATE_RECORD: [u8; 64] = [10; 64];
 const UPDATE_SUCCESSOR_SEED: u8 = 4;
+const RENEW_ACTION_INDEX: u32 = 4;
+const RENEW_SUCCESSOR_SEED: u8 = 5;
 
 #[derive(Parser)]
 #[command(name = "names-v2-live")]
@@ -102,6 +104,10 @@ enum Command {
     Update(UpdateArgs),
     /// Replay the canonical chain and verify one real v2 UPDATE.
     VerifyUpdate(VerifyUpdateArgs),
+    /// Build, authorize, and submit one real v2 RENEW for the accepted name.
+    Renew(RenewArgs),
+    /// Replay the canonical chain and verify one real v2 RENEW.
+    VerifyRenew(VerifyRenewArgs),
 }
 
 #[derive(Args, Clone)]
@@ -152,6 +158,28 @@ struct VerifyUpdateArgs {
     reveal_txid: String,
     #[arg(long)]
     update_txid: String,
+}
+
+#[derive(Args)]
+struct RenewArgs {
+    #[command(flatten)]
+    common: CommonArgs,
+    #[arg(long)]
+    reveal_txid: String,
+    #[arg(long)]
+    update_txid: String,
+}
+
+#[derive(Args)]
+struct VerifyRenewArgs {
+    #[arg(long)]
+    rpc_url: String,
+    #[arg(long)]
+    reveal_txid: String,
+    #[arg(long)]
+    update_txid: String,
+    #[arg(long)]
+    renew_txid: String,
 }
 
 fn local_consensus() -> LocalNetwork {
@@ -526,10 +554,11 @@ struct ReplayedNamesLineage {
     full_head: NameState,
     fresh_status: ResolutionStatus,
     fresh_head: NameState,
+    fresh_anchor: Option<StateRef>,
 }
 
-/// Reconstructs the supplied registration and, optionally, requires one
-/// canonical UPDATE to be accepted by both independent replay paths.
+/// Reconstructs the supplied registration and, optionally, requires canonical
+/// state transitions to be accepted by both independent replay paths.
 fn replay_names_lineage(
     source: &mut coppice_zcash_rpc::RpcCanonicalBlockSource<
         LocalNetwork,
@@ -540,6 +569,7 @@ fn replay_names_lineage(
     app_id: [u8; 32],
     reveal_txid: [u8; 32],
     update_txid: Option<[u8; 32]>,
+    renew_txid: Option<[u8; 32]>,
     verifier: &OrchardV2ProofVerifier,
 ) -> Result<ReplayedNamesLineage> {
     let blocks = canonical_chain(source, params, rendezvous, app_id)?;
@@ -666,6 +696,40 @@ fn replay_names_lineage(
     } else {
         None
     };
+    let renew_transaction = if let Some(renew_txid) = renew_txid {
+        ensure!(
+            renew_txid != commit_txid
+                && renew_txid != reveal_txid
+                && Some(renew_txid) != update_txid,
+            "RENEW txid must differ from the registration and UPDATE transactions"
+        );
+        let transaction = blocks
+            .values()
+            .flat_map(|block| block.transactions.iter())
+            .find(|transaction| transaction.txid == renew_txid)
+            .context("canonical RENEW transaction is absent from replay source")?;
+        ensure!(
+            transaction.operations.len() == 1,
+            "canonical RENEW does not expose exactly one operation"
+        );
+        ensure!(
+            matches!(transaction.operations[0], V2Operation::Renew { .. }),
+            "canonical RENEW operation kind mismatch"
+        );
+        Some(transaction)
+    } else {
+        None
+    };
+    let renew_operation_index = if let Some(transaction) = renew_transaction {
+        let index = transaction
+            .operations
+            .iter()
+            .position(|operation| matches!(operation, V2Operation::Renew { .. }))
+            .expect("RENEW operation was checked above");
+        Some(u32::try_from(index).context("canonical RENEW operation index exceeds u32")?)
+    } else {
+        None
+    };
 
     let v2 = v2_parameters();
     let activation_height = v2.activation_height;
@@ -678,6 +742,7 @@ fn replay_names_lineage(
     let mut commit_seen = false;
     let mut reveal_seen = false;
     let mut update_seen = false;
+    let mut renew_seen = false;
     for height in activation_height..=canonical_tip_height {
         let block = blocks
             .get(&height)
@@ -768,6 +833,38 @@ fn replay_names_lineage(
                 }
                 update_seen = true;
             }
+            if Some(transaction.txid) == renew_txid {
+                ensure!(!renew_seen, "canonical RENEW was replayed more than once");
+                let operation_index =
+                    renew_operation_index.context("canonical RENEW operation index missing")?;
+                let outcome = applied
+                    .operations
+                    .iter()
+                    .find(|operation| {
+                        operation.tx_index == transaction.tx_index
+                            && operation.operation_index == operation_index
+                    })
+                    .context("full replay did not return the canonical RENEW result")?;
+                match &outcome.result {
+                    AppliedOperationResult::Accepted(Some((accepted_name_id, kind))) => {
+                        ensure!(
+                            *accepted_name_id == name_id,
+                            "full replay RENEW accepted the wrong name id"
+                        );
+                        ensure!(
+                            *kind == AppliedOperationKind::Renew,
+                            "full replay RENEW returned the wrong operation kind"
+                        );
+                    }
+                    AppliedOperationResult::Accepted(other) => {
+                        bail!("full replay RENEW result was not Accepted(name, Renew): {other:?}")
+                    }
+                    AppliedOperationResult::Rejected(error) => {
+                        bail!("full replay RENEW was rejected: {error:?}")
+                    }
+                }
+                renew_seen = true;
+            }
         }
     }
     ensure!(
@@ -781,6 +878,10 @@ fn replay_names_lineage(
     ensure!(
         update_txid.is_none() || update_seen,
         "full replay did not process the canonical UPDATE"
+    );
+    ensure!(
+        renew_txid.is_none() || renew_seen,
+        "full replay did not process the canonical RENEW"
     );
 
     let full_status = machine.resolution_at(name_id, canonical_tip_height);
@@ -804,6 +905,7 @@ fn replay_names_lineage(
         .resolve(NAME, &blocks, verifier)
         .map_err(|error| anyhow::anyhow!("Names v2 FreshResolver failed: {error:?}"))?;
     let fresh_status = fresh_result.status;
+    let fresh_anchor = fresh_result.anchor;
     let fresh_head = fresh_result
         .state
         .context("FreshResolver returned no accepted Names state")?;
@@ -827,6 +929,7 @@ fn replay_names_lineage(
         full_head,
         fresh_status,
         fresh_head,
+        fresh_anchor,
     })
 }
 
@@ -1332,6 +1435,7 @@ fn update(args: UpdateArgs) -> Result<()> {
         app_id,
         reveal_txid,
         None,
+        None,
         &names_verifier,
     )?;
     ensure!(
@@ -1761,6 +1865,519 @@ fn update(args: UpdateArgs) -> Result<()> {
     Ok(())
 }
 
+fn renew(args: RenewArgs) -> Result<()> {
+    let params = local_consensus();
+    let v2 = v2_parameters();
+    let reveal_txid = parse_txid_hex(&args.reveal_txid)?;
+    let update_txid = parse_txid_hex(&args.update_txid)?;
+    let mut source = source_for(&args.common.rpc_url)?;
+    let rendezvous = CoreRendezvous::try_new(
+        &REGTEST.rendezvous.orchard_ivk,
+        &REGTEST.rendezvous.orchard_receiver,
+    )
+    .map_err(|error| anyhow::anyhow!("construct Names rendezvous decoder: {error:?}"))?;
+    let app_id = names_application_id().to_bytes();
+    let (transition_prover, transition_verifier, genesis_prover, genesis_verifier) =
+        orchard::circuit::state_note_binding::keygen();
+    let names_prover = OrchardV2ProofProver::from_parts(transition_prover, genesis_prover);
+    let names_verifier = OrchardV2ProofVerifier::from_parts(transition_verifier, genesis_verifier);
+    let lineage = replay_names_lineage(
+        &mut source,
+        &params,
+        &rendezvous,
+        app_id,
+        reveal_txid,
+        Some(update_txid),
+        None,
+        &names_verifier,
+    )?;
+    ensure!(
+        lineage.full_status == ResolutionStatus::Active,
+        "current Names v2 state is not active: {:?}",
+        lineage.full_status
+    );
+    ensure!(
+        lineage.fresh_status == ResolutionStatus::Active,
+        "FreshResolver did not find an active current state: {:?}",
+        lineage.fresh_status
+    );
+    ensure!(
+        lineage.full_head == lineage.fresh_head,
+        "full replay and FreshResolver disagree before RENEW construction"
+    );
+    let predecessor = lineage.full_head;
+    ensure!(
+        predecessor.data.sequence == 1
+            && predecessor.data.record.as_slice() == UPDATE_RECORD.as_slice()
+            && predecessor.data.lease_expiry == 55
+            && predecessor.data.status == StateStatus::Active
+            && predecessor.data.terminal_height == 0,
+        "qualified RENEW fixture does not have the expected active sequence-one predecessor"
+    );
+
+    let update_transaction = lineage
+        .blocks
+        .values()
+        .flat_map(|block| block.transactions.iter())
+        .find(|transaction| transaction.txid == update_txid)
+        .context("canonical UPDATE transaction disappeared before RENEW construction")?;
+    let update_block = lineage
+        .blocks
+        .values()
+        .find(|block| block.transactions.iter().any(|tx| tx.txid == update_txid))
+        .context("canonical UPDATE block disappeared before RENEW construction")?;
+    let update_operation_index = update_transaction
+        .operations
+        .iter()
+        .position(|operation| matches!(operation, V2Operation::Update { .. }))
+        .context("canonical UPDATE operation index missing")?;
+    let V2Operation::Update {
+        action_index: update_action_index,
+        ..
+    } = &update_transaction.operations[update_operation_index]
+    else {
+        bail!("canonical UPDATE operation kind mismatch");
+    };
+    ensure!(
+        predecessor.state_ref.position()
+            == ProducerPosition::new(
+                update_block.height,
+                update_transaction.tx_index,
+                update_txid
+            )
+            && predecessor.state_ref.producer_action_index == *update_action_index
+            && predecessor.state_ref.producer_operation_index
+                == u32::try_from(update_operation_index)
+                    .context("UPDATE operation index exceeds u32")?,
+        "current Names head is not the exact canonical UPDATE successor"
+    );
+
+    let construction_height = lineage
+        .tip_height
+        .checked_add(1)
+        .context("live RENEW construction height overflow")?;
+    let renew_height =
+        coppice_names::v2::schedule::next_anchor_height(lineage.name_id, construction_height, v2)
+            .context("no future scheduled Names v2 RENEW height exists")?;
+    ensure!(
+        coppice_names::v2::schedule::is_anchor_height(lineage.name_id, renew_height, v2),
+        "derived RENEW height is not a Names v2 anchor"
+    );
+    ensure!(
+        renew_height == construction_height,
+        "RENEW must be constructed at the next scheduled height; current next height is {construction_height}, scheduled height is {renew_height}"
+    );
+    ensure!(
+        renew_height > predecessor.state_ref.producer_height,
+        "RENEW must follow the accepted predecessor anchor"
+    );
+    ensure!(
+        renew_height < predecessor.data.lease_expiry,
+        "next scheduled RENEW height is at or beyond the predecessor lease expiry"
+    );
+    let successor_lease_expiry = v2
+        .lease_expiry(renew_height)
+        .context("Names v2 RENEW lease expiry overflow")?;
+    ensure!(
+        successor_lease_expiry > predecessor.data.lease_expiry,
+        "RENEW lease must strictly extend the predecessor lease"
+    );
+
+    let usk = wallet_usk(&params)?;
+    let names_fvk = FullViewingKey::from(usk.orchard());
+    let names_ask = SpendAuthorizingKey::from(usk.orchard());
+    let mut db = open_wallet(&args.common.wallet_dir, params)?;
+    let account_id = *db
+        .get_account_ids()?
+        .first()
+        .context("live wallet has no spending account")?;
+    let notes = selected_notes(&db, lineage.tip_height, account_id)?;
+    let predecessor_matches = notes
+        .iter()
+        .enumerate()
+        .filter(|(_, (note, _, _, _))| {
+            ExtractedNoteCommitment::from(note.commitment()).to_bytes() == predecessor.commitment
+        })
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    ensure!(
+        predecessor_matches.len() == 1,
+        "wallet must contain exactly one unspent note for the accepted Names predecessor (found {})",
+        predecessor_matches.len()
+    );
+    let (predecessor_note, predecessor_scope, predecessor_position, predecessor_value) = notes
+        .into_iter()
+        .enumerate()
+        .find_map(|(index, note)| (index == predecessor_matches[0]).then_some(note))
+        .context("wallet predecessor note disappeared during selection")?;
+    let predecessor_nf = predecessor_note.nullifier(&names_fvk).to_bytes();
+    ensure!(
+        predecessor_nf == predecessor.state_ref.nullifier,
+        "wallet predecessor nullifier differs from the accepted Names StateRef"
+    );
+
+    let mut notes = selected_notes(&db, lineage.tip_height, account_id)?;
+    let predecessor_index = notes
+        .iter()
+        .position(|(note, _, _, _)| {
+            ExtractedNoteCommitment::from(note.commitment()).to_bytes() == predecessor.commitment
+        })
+        .context("wallet predecessor note is not available for funding selection")?;
+    notes.swap_remove(predecessor_index);
+    let funding_index = notes
+        .iter()
+        .enumerate()
+        .max_by_key(|(_, (_, _, _, value))| *value)
+        .map(|(index, _)| index)
+        .context("live wallet has no separate Ironwood funding note")?;
+    let (funding_note, _funding_scope, funding_position, funding_value) =
+        notes.swap_remove(funding_index);
+    let funding_nf = funding_note.nullifier(&names_fvk).to_bytes();
+    ensure!(
+        funding_nf != predecessor_nf,
+        "RENEW funding note must differ from the predecessor note"
+    );
+    ensure!(
+        funding_position != predecessor_position,
+        "RENEW funding position must differ from the predecessor position"
+    );
+
+    let predecessor_rho = Option::<Rho>::from(Rho::from_bytes(&predecessor_nf))
+        .context("accepted predecessor nullifier is not a valid successor rho")?;
+    let successor_rseed = Option::<RandomSeed>::from(RandomSeed::from_bytes(
+        [RENEW_SUCCESSOR_SEED; 32],
+        &predecessor_rho,
+    ))
+    .context("construct deterministic RENEW successor seed")?;
+    let successor_note = Option::<Note>::from(Note::from_parts(
+        names_fvk.address_at(0u32, predecessor_scope),
+        predecessor_note.value(),
+        predecessor_rho,
+        successor_rseed,
+        NoteVersion::V3,
+    ))
+    .context("construct exact RENEW successor note")?;
+    ensure!(
+        successor_note.value() == predecessor_note.value()
+            && successor_note.value().inner() == predecessor_value,
+        "RENEW successor note changed the predecessor bond value"
+    );
+    let successor_commitment =
+        ExtractedNoteCommitment::from(successor_note.commitment()).to_bytes();
+    let successor_future_nf = successor_note.nullifier(&names_fvk).to_bytes();
+    let successor_data = StateData {
+        name_id: predecessor.data.name_id,
+        owner_pk: predecessor.data.owner_pk,
+        sequence: predecessor
+            .data
+            .sequence
+            .checked_add(1)
+            .context("RENEW sequence overflow")?,
+        record: predecessor.data.record.clone(),
+        lease_expiry: successor_lease_expiry,
+        status: StateStatus::Active,
+        terminal_height: 0,
+    };
+    ensure!(
+        successor_data.record == predecessor.data.record
+            && successor_data.record.as_slice() == UPDATE_RECORD.as_slice(),
+        "RENEW must preserve the UPDATE record"
+    );
+    ensure!(
+        successor_data.lease_expiry > predecessor.data.lease_expiry,
+        "RENEW successor lease did not extend the predecessor"
+    );
+
+    let action_index = RENEW_ACTION_INDEX;
+    let successor_state_ref = StateRef::new(
+        ProducerPosition::new(construction_height, 0, [0; 32]),
+        action_index,
+        0,
+        successor_commitment,
+        successor_future_nf,
+    );
+    let successor = NameState::new(
+        successor_data.clone(),
+        successor_commitment,
+        successor_state_ref,
+    )
+    .map_err(|error| anyhow::anyhow!("construct RENEW successor state: {error:?}"))?;
+    let action = IronwoodActionRef {
+        action_index,
+        nullifier: predecessor_nf,
+        commitment: successor_commitment,
+    };
+    let statement = TransitionStatement::from_states(
+        &predecessor,
+        &successor,
+        action,
+        OperationKind::Renew,
+        construction_height,
+    )
+    .map_err(|error| anyhow::anyhow!("construct Names RENEW statement: {error:?}"))?;
+    ensure!(
+        statement.operation == OperationKind::Renew
+            && statement.predecessor_commitment == predecessor.commitment
+            && statement.predecessor_nullifier == predecessor_nf
+            && statement.successor_commitment == successor_commitment
+            && statement.successor_nullifier == successor_future_nf
+            && statement.predecessor_ref_digest == predecessor.state_ref.digest(),
+        "Names RENEW statement does not reflect the exact predecessor/successor"
+    );
+    ensure!(
+        statement.predecessor_sequence == 1
+            && statement.successor_sequence == 2
+            && statement.predecessor_record_digest == statement.successor_record_digest
+            && statement.predecessor_lease_expiry == 55
+            && statement.successor_lease_expiry == successor_lease_expiry
+            && statement.predecessor_status == StateStatus::Active.code()
+            && statement.successor_status == StateStatus::Active.code()
+            && statement.predecessor_terminal_height == 0
+            && statement.successor_terminal_height == 0
+            && statement.operation_height == renew_height,
+        "Names RENEW statement has unexpected lifecycle fields"
+    );
+
+    let transition_witness = TransitionWitness::new(
+        predecessor_note,
+        &names_fvk,
+        predecessor_scope,
+        &names_ask,
+        successor_note,
+    );
+    let names_proof_started = Instant::now();
+    let transition_proof = names_prover
+        .prove_transition(&statement, transition_witness, OsRng)
+        .map_err(|error| anyhow::anyhow!("create Names RENEW proof: {error:?}"))?;
+    let names_proof_elapsed = names_proof_started.elapsed();
+    ensure!(!transition_proof.is_empty(), "Names RENEW proof is empty");
+
+    let renew_operation = V2Operation::Renew {
+        predecessor: predecessor.state_ref,
+        state: successor_data,
+        state_commitment: successor_commitment,
+        state_nullifier: successor_future_nf,
+        action_index,
+        proof: transition_proof.clone(),
+    };
+    let encoded_renew = encode_operation(&renew_operation)
+        .map_err(|error| anyhow::anyhow!("encode RENEW operation: {error:?}"))?;
+    let decoded_renew = decode_operation(&encoded_renew)
+        .map_err(|error| anyhow::anyhow!("decode RENEW operation: {error:?}"))?;
+    ensure!(
+        decoded_renew == renew_operation,
+        "RENEW wire round-trip mismatch"
+    );
+    let footprint = operation_footprint(&renew_operation)
+        .map_err(|error| anyhow::anyhow!("measure RENEW operation: {error:?}"))?;
+    let frames = encode_frames(app_id, &encoded_renew)
+        .map_err(|error| anyhow::anyhow!("frame RENEW operation: {error:?}"))?;
+    let reconstructed = reconstruct_frames(&frames, app_id)
+        .map_err(|error| anyhow::anyhow!("reconstruct RENEW frames: {error:?}"))?;
+    ensure!(
+        reconstructed == encoded_renew,
+        "CPV1 reconstruction changed RENEW bytes"
+    );
+    let reconstructed_renew = decode_operation(&reconstructed)
+        .map_err(|error| anyhow::anyhow!("decode reconstructed RENEW: {error:?}"))?;
+    ensure!(
+        reconstructed_renew == renew_operation,
+        "CPV1 decode changed RENEW operation"
+    );
+    ensure!(
+        frames.len() == footprint.cpv1_frames,
+        "CPV1 footprint disagrees with measured RENEW operation"
+    );
+
+    let carrier_recipient = names_recipient()?;
+    let carriers = frames
+        .iter()
+        .copied()
+        .map(|memo| CarrierOutput {
+            recipient: carrier_recipient,
+            value: orchard::value::NoteValue::from_raw(1),
+            memo,
+        })
+        .collect::<Vec<_>>();
+    let planned_shape = names_v2_ironwood_shape_from_counts(
+        2,
+        carriers.len(),
+        1,
+        usize::try_from(action_index).context("RENEW action index does not fit usize")?,
+    )?;
+    let required_fee = required_zip317_fee_for_names_v2(
+        &params,
+        BlockHeight::from_u32(construction_height),
+        planned_shape,
+    )?;
+    let required_fee_value = required_fee.into_u64();
+    let required_fee_balance =
+        i64::try_from(required_fee_value).context("RENEW ZIP-317 fee does not fit balance")?;
+    let carrier_value = u64::try_from(carriers.len()).context("RENEW carrier count overflow")?;
+    let change_value = funding_value
+        .checked_sub(carrier_value)
+        .and_then(|value| value.checked_sub(required_fee_value))
+        .context("funding note cannot cover RENEW carriers and ZIP-317 fee")?;
+    let plan = NamesV2IronwoodPlan {
+        designated_fvk: names_fvk.clone(),
+        designated_spend: predecessor_note,
+        successor_note,
+        successor_ovk: None,
+        successor_memo: [0; 512],
+        carrier_outputs: carriers,
+        funding_spends: vec![FundingSpend {
+            fvk: names_fvk.clone(),
+            note: funding_note,
+        }],
+        change_outputs: vec![ChangeOutput {
+            fvk: names_fvk.clone(),
+            ovk: None,
+            recipient: names_fvk.address_at(0u32, Scope::Internal),
+            value: orchard::value::NoteValue::from_raw(change_value),
+            memo: [0; 512],
+        }],
+        designated_action_index: usize::try_from(action_index)
+            .context("RENEW action index does not fit usize")?,
+    };
+    ensure!(
+        names_v2_ironwood_shape(&plan)? == planned_shape,
+        "RENEW plan shape changed after fee planning"
+    );
+    let built = build_names_v2_bundle(plan, OsRng)?;
+    ensure!(
+        built.action_count == planned_shape.action_count,
+        "RENEW built action count differs from fee-planned shape"
+    );
+    ensure!(
+        built.ironwood_value_balance == required_fee_balance,
+        "RENEW built value balance differs from ZIP-317 fee"
+    );
+    ensure!(
+        built.designated_nullifier == statement.predecessor_nullifier
+            && built.designated_commitment == statement.successor_commitment,
+        "RENEW designated action differs from the Names transition statement"
+    );
+    verify_designated_action(
+        &built.bundle,
+        built.designated_action_index,
+        predecessor_nf,
+        successor_commitment,
+    )?;
+
+    let anchor_height = db
+        .get_target_and_anchor_heights(NonZeroU32::MIN)?
+        .context("wallet has no synchronized target/anchor heights")?
+        .1;
+    let (anchor, paths) = wallet_witnesses(
+        &mut db,
+        anchor_height,
+        [predecessor_position, funding_position],
+    )?;
+    let complete = build_names_v2_pczt(NamesV2PcztPlan {
+        ironwood: built,
+        params,
+        consensus_branch_id: BranchId::Nu6_3,
+        expiry_height: BlockHeight::from_u32(construction_height),
+        fallback_lock_time: 0,
+    })?;
+    let finalized = finalize_names_v2_pczt_io(complete)?;
+    let witnessed = install_names_v2_ironwood_witnesses(
+        finalized,
+        NamesV2WitnessPlan {
+            anchor,
+            spends: vec![
+                NamesV2IronwoodWitness {
+                    nullifier: predecessor_nf,
+                    merkle_path: paths[0].clone(),
+                },
+                NamesV2IronwoodWitness {
+                    nullifier: funding_nf,
+                    merkle_path: paths[1].clone(),
+                },
+            ],
+        },
+    )?;
+    let consensus_proving_key = orchard::circuit::ProvingKey::build(
+        orchard::bundle::BundleVersion::ironwood_v3().circuit_version(),
+    );
+    let consensus_proof_started = Instant::now();
+    let proved = prove_names_v2_ironwood_pczt(witnessed, &consensus_proving_key)?;
+    let consensus_proof_elapsed = consensus_proof_started.elapsed();
+    let signed = sign_names_v2_ironwood_pczt(
+        proved,
+        NamesV2SigningPlan {
+            spends: vec![
+                zcash_devtool::names_v2_builder::NamesV2IronwoodSigningKey {
+                    nullifier: predecessor_nf,
+                    ask: names_ask,
+                },
+                zcash_devtool::names_v2_builder::NamesV2IronwoodSigningKey {
+                    nullifier: funding_nf,
+                    ask: SpendAuthorizingKey::from(usk.orchard()),
+                },
+            ],
+        },
+    )?;
+    let extracted = extract_names_v2_transaction(signed)?;
+    ensure!(
+        extracted.action_count == planned_shape.action_count
+            && extracted.ironwood_value_balance == required_fee_balance,
+        "extracted RENEW metadata differs from the planned shape or fee"
+    );
+    let mut raw = Vec::new();
+    extracted.transaction.write(&mut raw)?;
+    let renew_txid = submit_raw(&args.common.rpc_url, &raw)?;
+    let final_txid: [u8; 32] = extracted.txid.into();
+    ensure!(
+        renew_txid == final_txid,
+        "node returned a different RENEW txid"
+    );
+
+    println!("UPDATE_TXID={}", hex::encode(update_txid));
+    println!("RENEW_CURRENT_TIP={}", lineage.tip_height);
+    println!("RENEW_SCHEDULED_HEIGHT={renew_height}");
+    println!("RENEW_CONSTRUCTION_HEIGHT={construction_height}");
+    println!("RENEW_NAMES_PROOF_BYTES={}", transition_proof.len());
+    println!(
+        "RENEW_NAMES_PROOF_ELAPSED_MS={}",
+        names_proof_elapsed.as_millis()
+    );
+    println!("CNV2_RENEW_BYTES={}", encoded_renew.len());
+    println!("CPV1_RENEW_FRAMES={}", frames.len());
+    println!("RENEW_TXID={}", hex::encode(final_txid));
+    println!("RENEW_ACTION_INDEX={action_index}");
+    println!("RENEW_PREDECESSOR_VALUE={predecessor_value}");
+    println!("RENEW_SUCCESSOR_LEASE_EXPIRY={successor_lease_expiry}");
+    println!("RENEW_ACTION_COUNT={}", extracted.action_count);
+    println!("RENEW_REAL_SPENDS={}", extracted.real_spend_count);
+    println!("RENEW_CARRIER_OUTPUTS={}", extracted.carrier_output_count);
+    println!("RENEW_CHANGE_OUTPUTS={}", extracted.change_output_count);
+    println!("RENEW_VALUE_BALANCE={}", extracted.ironwood_value_balance);
+    println!("RENEW_ANCHOR_HEIGHT={anchor_height}");
+    println!("RENEW_ANCHOR={}", hex::encode(anchor.to_bytes()));
+    println!("RENEW_PREDECESSOR_NF={}", hex::encode(predecessor_nf));
+    println!("RENEW_SUCCESSOR_CMX={}", hex::encode(successor_commitment));
+    println!(
+        "RENEW_SUCCESSOR_FUTURE_NF={}",
+        hex::encode(successor_future_nf)
+    );
+    println!(
+        "CONSENSUS_PROOF_BYTES={}",
+        extracted.ironwood_proof_byte_len
+    );
+    println!(
+        "CONSENSUS_PROOF_ELAPSED_MS={}",
+        consensus_proof_elapsed.as_millis()
+    );
+    println!("RENEW_TX_BYTES={}", raw.len());
+    println!("NAMES_APPLICATION_ID={}", hex::encode(app_id));
+    println!(
+        "RENDEZVOUS_RECEIVER={}",
+        hex::encode(REGTEST.rendezvous.orchard_receiver)
+    );
+    Ok(())
+}
+
 fn verify_update(args: VerifyUpdateArgs) -> Result<()> {
     let params = local_consensus();
     let reveal_txid = parse_txid_hex(&args.reveal_txid)?;
@@ -1782,6 +2399,7 @@ fn verify_update(args: VerifyUpdateArgs) -> Result<()> {
         app_id,
         reveal_txid,
         Some(update_txid),
+        None,
         &names_verifier,
     )?;
     ensure!(
@@ -1881,6 +2499,198 @@ fn verify_update(args: VerifyUpdateArgs) -> Result<()> {
     println!("UPDATE_CANONICAL_TX_INDEX={}", update.tx_index);
     println!("UPDATE_OPERATION_INDEX={update_operation_index}");
     println!("UPDATE_ACTION_INDEX={action_index}");
+    println!("ACCEPTED_NAME_ID={}", hex::encode(accepted.data.name_id));
+    println!("ACCEPTED_OWNER_PK={}", hex::encode(accepted.data.owner_pk));
+    println!("ACCEPTED_SEQUENCE={}", accepted.data.sequence);
+    println!("ACCEPTED_RECORD_BYTES={}", accepted.data.record.len());
+    println!("ACCEPTED_LEASE_EXPIRY={}", accepted.data.lease_expiry);
+    println!(
+        "ACCEPTED_STATE_COMMITMENT={}",
+        hex::encode(accepted.commitment)
+    );
+    println!(
+        "ACCEPTED_STATE_FUTURE_NF={}",
+        hex::encode(accepted.state_ref.nullifier)
+    );
+    Ok(())
+}
+
+fn verify_renew(args: VerifyRenewArgs) -> Result<()> {
+    let params = local_consensus();
+    let v2 = v2_parameters();
+    let reveal_txid = parse_txid_hex(&args.reveal_txid)?;
+    let update_txid = parse_txid_hex(&args.update_txid)?;
+    let renew_txid = parse_txid_hex(&args.renew_txid)?;
+    let rendezvous = CoreRendezvous::try_new(
+        &REGTEST.rendezvous.orchard_ivk,
+        &REGTEST.rendezvous.orchard_receiver,
+    )
+    .map_err(|error| anyhow::anyhow!("construct Names rendezvous decoder: {error:?}"))?;
+    let app_id = names_application_id().to_bytes();
+    let mut source = source_for(&args.rpc_url)?;
+    let (_, transition_verifier, _, genesis_verifier) =
+        orchard::circuit::state_note_binding::keygen();
+    let names_verifier = OrchardV2ProofVerifier::from_parts(transition_verifier, genesis_verifier);
+    let lineage = replay_names_lineage(
+        &mut source,
+        &params,
+        &rendezvous,
+        app_id,
+        reveal_txid,
+        Some(update_txid),
+        Some(renew_txid),
+        &names_verifier,
+    )?;
+    ensure!(
+        lineage.full_status == ResolutionStatus::Active,
+        "full replay did not leave the name active after RENEW: {:?}",
+        lineage.full_status
+    );
+    ensure!(
+        lineage.fresh_status == ResolutionStatus::Active,
+        "FreshResolver did not leave the name active after RENEW: {:?}",
+        lineage.fresh_status
+    );
+    ensure!(
+        lineage.full_head == lineage.fresh_head,
+        "full replay and FreshResolver disagree after RENEW"
+    );
+    ensure!(
+        lineage
+            .machine
+            .resolution_at(lineage.name_id, lineage.tip_height)
+            == lineage.full_status,
+        "full replay machine status does not match its recorded final status"
+    );
+    let update_block = lineage
+        .blocks
+        .values()
+        .find(|block| block.transactions.iter().any(|tx| tx.txid == update_txid))
+        .context("canonical UPDATE block missing during RENEW verification")?;
+    let renew = lineage
+        .blocks
+        .values()
+        .flat_map(|block| block.transactions.iter())
+        .find(|transaction| transaction.txid == renew_txid)
+        .context("canonical RENEW transaction disappeared during verification")?;
+    let renew_block = lineage
+        .blocks
+        .values()
+        .find(|block| block.transactions.iter().any(|tx| tx.txid == renew_txid))
+        .context("canonical RENEW block missing")?;
+    let renew_operation_index = renew
+        .operations
+        .iter()
+        .position(|operation| matches!(operation, V2Operation::Renew { .. }))
+        .context("canonical RENEW operation index missing")?;
+    let V2Operation::Renew {
+        predecessor,
+        state,
+        state_commitment,
+        state_nullifier,
+        action_index,
+        ..
+    } = &renew.operations[renew_operation_index]
+    else {
+        bail!("canonical RENEW operation kind mismatch");
+    };
+    let renew_action = renew
+        .action(*action_index)
+        .context("canonical RENEW designated action is absent")?;
+    ensure!(
+        renew_action.nullifier == predecessor.nullifier,
+        "canonical RENEW predecessor NF does not match its designated action"
+    );
+    ensure!(
+        renew_action.commitment == *state_commitment,
+        "canonical RENEW successor CMX does not match its designated action"
+    );
+    let expected_renew_height = coppice_names::v2::schedule::next_anchor_height(
+        lineage.name_id,
+        update_block
+            .height
+            .checked_add(1)
+            .context("RENEW schedule height overflow")?,
+        v2,
+    )
+    .context("no scheduled RENEW height follows the accepted UPDATE")?;
+    ensure!(
+        renew_block.height == expected_renew_height
+            && coppice_names::v2::schedule::is_anchor_height(
+                lineage.name_id,
+                renew_block.height,
+                v2,
+            ),
+        "canonical RENEW was not mined at the next scheduled anchor height"
+    );
+    let expected_lease_expiry = v2
+        .lease_expiry(renew_block.height)
+        .context("canonical RENEW lease expiry overflow")?;
+    let expected_position = ProducerPosition::new(renew_block.height, renew.tx_index, renew.txid);
+    let accepted = &lineage.full_head;
+    ensure!(
+        accepted.state_ref.position() == expected_position
+            && accepted.state_ref.producer_action_index == *action_index
+            && accepted.state_ref.producer_operation_index
+                == u32::try_from(renew_operation_index)
+                    .context("RENEW operation index exceeds u32")?
+            && accepted.commitment == *state_commitment
+            && accepted.state_ref.nullifier == *state_nullifier,
+        "accepted RENEW state reference does not match the canonical transaction"
+    );
+    ensure!(
+        accepted.data.name_id == lineage.name_id
+            && accepted.data.owner_pk == state.owner_pk
+            && accepted.data.sequence == 2
+            && accepted.data.record.as_slice() == UPDATE_RECORD.as_slice()
+            && accepted.data.lease_expiry == expected_lease_expiry
+            && accepted.data.lease_expiry > 55
+            && accepted.data.status == StateStatus::Active
+            && accepted.data.terminal_height == 0,
+        "accepted RENEW state values are not the expected sequence-two successor"
+    );
+    ensure!(
+        lineage.fresh_anchor == Some(accepted.state_ref),
+        "FreshResolver did not identify the accepted RENEW state as its latest anchor"
+    );
+    println!("ACTIVATION_HEIGHT={}", lineage.activation_height);
+    println!(
+        "ACTIVATION_PARENT_HASH={}",
+        hex::encode(lineage.activation_parent_hash)
+    );
+    println!("NAMES_FULL_COMMIT_ACCEPTED=yes");
+    println!("NAMES_FULL_REVEAL_ACCEPTED=yes");
+    println!("NAMES_FULL_UPDATE_ACCEPTED=yes");
+    println!("NAMES_FULL_RENEW_ACCEPTED=yes");
+    println!("NAMES_FULL_REPLAY_STATUS={:?}", lineage.full_status);
+    println!("NAMES_FRESH_RESOLVER_STATUS={:?}", lineage.fresh_status);
+    println!("NAMES_FULL_FRESH_MATCH=yes");
+    println!("RENEW_SCHEDULED_HEIGHT={expected_renew_height}");
+    println!("RENEW_CANONICAL_HEIGHT={}", renew_block.height);
+    println!("RENEW_CANONICAL_TX_INDEX={}", renew.tx_index);
+    println!("RENEW_OPERATION_INDEX={renew_operation_index}");
+    println!("RENEW_ACTION_INDEX={action_index}");
+    println!("RENEW_LEASE_EXPIRY={expected_lease_expiry}");
+    println!(
+        "RENEW_FRESH_ANCHOR_HEIGHT={}",
+        accepted.state_ref.producer_height
+    );
+    println!(
+        "RENEW_FRESH_ANCHOR_TX_INDEX={}",
+        accepted.state_ref.producer_tx_index
+    );
+    println!(
+        "RENEW_FRESH_ANCHOR_TXID={}",
+        hex::encode(accepted.state_ref.producer_txid)
+    );
+    println!(
+        "RENEW_FRESH_ANCHOR_ACTION_INDEX={}",
+        accepted.state_ref.producer_action_index
+    );
+    println!(
+        "RENEW_FRESH_ANCHOR_OPERATION_INDEX={}",
+        accepted.state_ref.producer_operation_index
+    );
     println!("ACCEPTED_NAME_ID={}", hex::encode(accepted.data.name_id));
     println!("ACCEPTED_OWNER_PK={}", hex::encode(accepted.data.owner_pk));
     println!("ACCEPTED_SEQUENCE={}", accepted.data.sequence);
@@ -2228,5 +3038,7 @@ fn main() -> Result<()> {
         Command::Verify(args) => verify(args),
         Command::Update(args) => update(args),
         Command::VerifyUpdate(args) => verify_update(args),
+        Command::Renew(args) => renew(args),
+        Command::VerifyRenew(args) => verify_renew(args),
     }
 }
