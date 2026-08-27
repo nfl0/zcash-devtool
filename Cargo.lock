@@ -1392,6 +1392,7 @@ dependencies = [
  "incrementalmerkletree",
  "orchard",
  "pasta_curves",
+ "postcard",
  "rand_chacha 0.3.1",
  "rand_core 0.6.4",
  "serde",
@@ -4604,7 +4605,7 @@ checksum = "04744f49eae99ab78e0d5c0b603ab218f515ea8cfe5a456d7629ad883a3b6e7d"
 [[package]]
 name = "orchard"
 version = "0.15.3"
-source = "git+https://github.com/nfl0/orchard-coppice.git?rev=9907318813ceb8d66a9f3fa9fe7ea773a53899a4#9907318813ceb8d66a9f3fa9fe7ea773a53899a4"
+source = "git+https://github.com/nfl0/orchard-coppice.git?rev=bc7d644a93706923e5d6151301751aad6886f636#bc7d644a93706923e5d6151301751aad6886f636"
 dependencies = [
  "aes",
  "bitvec",
