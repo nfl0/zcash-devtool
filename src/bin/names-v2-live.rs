@@ -81,6 +81,8 @@ const UPDATE_RECORD: [u8; 64] = [10; 64];
 const UPDATE_SUCCESSOR_SEED: u8 = 4;
 const RENEW_ACTION_INDEX: u32 = 4;
 const RENEW_SUCCESSOR_SEED: u8 = 5;
+const RELEASE_ACTION_INDEX: u32 = 4;
+const RELEASE_SUCCESSOR_SEED: u8 = 6;
 
 #[derive(Parser)]
 #[command(name = "names-v2-live")]
@@ -108,6 +110,10 @@ enum Command {
     Renew(RenewArgs),
     /// Replay the canonical chain and verify one real v2 RENEW.
     VerifyRenew(VerifyRenewArgs),
+    /// Build, authorize, and submit one real v2 RELEASE for the accepted name.
+    Release(ReleaseArgs),
+    /// Replay the canonical chain and verify one real v2 RELEASE.
+    VerifyRelease(VerifyReleaseArgs),
 }
 
 #[derive(Args, Clone)]
@@ -180,6 +186,32 @@ struct VerifyRenewArgs {
     update_txid: String,
     #[arg(long)]
     renew_txid: String,
+}
+
+#[derive(Args)]
+struct ReleaseArgs {
+    #[command(flatten)]
+    common: CommonArgs,
+    #[arg(long)]
+    reveal_txid: String,
+    #[arg(long)]
+    update_txid: String,
+    #[arg(long)]
+    renew_txid: String,
+}
+
+#[derive(Args)]
+struct VerifyReleaseArgs {
+    #[arg(long)]
+    rpc_url: String,
+    #[arg(long)]
+    reveal_txid: String,
+    #[arg(long)]
+    update_txid: String,
+    #[arg(long)]
+    renew_txid: String,
+    #[arg(long)]
+    release_txid: String,
 }
 
 fn local_consensus() -> LocalNetwork {
@@ -570,6 +602,7 @@ fn replay_names_lineage(
     reveal_txid: [u8; 32],
     update_txid: Option<[u8; 32]>,
     renew_txid: Option<[u8; 32]>,
+    release_txid: Option<[u8; 32]>,
     verifier: &OrchardV2ProofVerifier,
 ) -> Result<ReplayedNamesLineage> {
     let blocks = canonical_chain(source, params, rendezvous, app_id)?;
@@ -730,6 +763,41 @@ fn replay_names_lineage(
     } else {
         None
     };
+    let release_transaction = if let Some(release_txid) = release_txid {
+        ensure!(
+            release_txid != commit_txid
+                && release_txid != reveal_txid
+                && Some(release_txid) != update_txid
+                && Some(release_txid) != renew_txid,
+            "RELEASE txid must differ from the registration, UPDATE, and RENEW transactions"
+        );
+        let transaction = blocks
+            .values()
+            .flat_map(|block| block.transactions.iter())
+            .find(|transaction| transaction.txid == release_txid)
+            .context("canonical RELEASE transaction is absent from replay source")?;
+        ensure!(
+            transaction.operations.len() == 1,
+            "canonical RELEASE does not expose exactly one operation"
+        );
+        ensure!(
+            matches!(transaction.operations[0], V2Operation::Release { .. }),
+            "canonical RELEASE operation kind mismatch"
+        );
+        Some(transaction)
+    } else {
+        None
+    };
+    let release_operation_index = if let Some(transaction) = release_transaction {
+        let index = transaction
+            .operations
+            .iter()
+            .position(|operation| matches!(operation, V2Operation::Release { .. }))
+            .expect("RELEASE operation was checked above");
+        Some(u32::try_from(index).context("canonical RELEASE operation index exceeds u32")?)
+    } else {
+        None
+    };
 
     let v2 = v2_parameters();
     let activation_height = v2.activation_height;
@@ -743,6 +811,7 @@ fn replay_names_lineage(
     let mut reveal_seen = false;
     let mut update_seen = false;
     let mut renew_seen = false;
+    let mut release_seen = false;
     for height in activation_height..=canonical_tip_height {
         let block = blocks
             .get(&height)
@@ -865,6 +934,43 @@ fn replay_names_lineage(
                 }
                 renew_seen = true;
             }
+            if Some(transaction.txid) == release_txid {
+                ensure!(
+                    !release_seen,
+                    "canonical RELEASE was replayed more than once"
+                );
+                let operation_index =
+                    release_operation_index.context("canonical RELEASE operation index missing")?;
+                let outcome = applied
+                    .operations
+                    .iter()
+                    .find(|operation| {
+                        operation.tx_index == transaction.tx_index
+                            && operation.operation_index == operation_index
+                    })
+                    .context("full replay did not return the canonical RELEASE result")?;
+                match &outcome.result {
+                    AppliedOperationResult::Accepted(Some((accepted_name_id, kind))) => {
+                        ensure!(
+                            *accepted_name_id == name_id,
+                            "full replay RELEASE accepted the wrong name id"
+                        );
+                        ensure!(
+                            *kind == AppliedOperationKind::Release,
+                            "full replay RELEASE returned the wrong operation kind"
+                        );
+                    }
+                    AppliedOperationResult::Accepted(other) => {
+                        bail!(
+                            "full replay RELEASE result was not Accepted(name, Release): {other:?}"
+                        )
+                    }
+                    AppliedOperationResult::Rejected(error) => {
+                        bail!("full replay RELEASE was rejected: {error:?}")
+                    }
+                }
+                release_seen = true;
+            }
         }
     }
     ensure!(
@@ -882,6 +988,10 @@ fn replay_names_lineage(
     ensure!(
         renew_txid.is_none() || renew_seen,
         "full replay did not process the canonical RENEW"
+    );
+    ensure!(
+        release_txid.is_none() || release_seen,
+        "full replay did not process the canonical RELEASE"
     );
 
     let full_status = machine.resolution_at(name_id, canonical_tip_height);
@@ -1436,6 +1546,7 @@ fn update(args: UpdateArgs) -> Result<()> {
         reveal_txid,
         None,
         None,
+        None,
         &names_verifier,
     )?;
     ensure!(
@@ -1888,6 +1999,7 @@ fn renew(args: RenewArgs) -> Result<()> {
         app_id,
         reveal_txid,
         Some(update_txid),
+        None,
         None,
         &names_verifier,
     )?;
@@ -2378,6 +2490,742 @@ fn renew(args: RenewArgs) -> Result<()> {
     Ok(())
 }
 
+fn release(args: ReleaseArgs) -> Result<()> {
+    let params = local_consensus();
+    let reveal_txid = parse_txid_hex(&args.reveal_txid)?;
+    let update_txid = parse_txid_hex(&args.update_txid)?;
+    let renew_txid = parse_txid_hex(&args.renew_txid)?;
+    let mut source = source_for(&args.common.rpc_url)?;
+    let rendezvous = CoreRendezvous::try_new(
+        &REGTEST.rendezvous.orchard_ivk,
+        &REGTEST.rendezvous.orchard_receiver,
+    )
+    .map_err(|error| anyhow::anyhow!("construct Names rendezvous decoder: {error:?}"))?;
+    let app_id = names_application_id().to_bytes();
+    let (transition_prover, transition_verifier, genesis_prover, genesis_verifier) =
+        orchard::circuit::state_note_binding::keygen();
+    let names_prover = OrchardV2ProofProver::from_parts(transition_prover, genesis_prover);
+    let names_verifier = OrchardV2ProofVerifier::from_parts(transition_verifier, genesis_verifier);
+    let lineage = replay_names_lineage(
+        &mut source,
+        &params,
+        &rendezvous,
+        app_id,
+        reveal_txid,
+        Some(update_txid),
+        Some(renew_txid),
+        None,
+        &names_verifier,
+    )?;
+    ensure!(
+        lineage.full_status == ResolutionStatus::Active,
+        "current Names v2 state is not active: {:?}",
+        lineage.full_status
+    );
+    ensure!(
+        lineage.fresh_status == ResolutionStatus::Active,
+        "FreshResolver did not find an active current state: {:?}",
+        lineage.fresh_status
+    );
+    ensure!(
+        lineage.full_head == lineage.fresh_head,
+        "full replay and FreshResolver disagree before RELEASE construction"
+    );
+    let predecessor = lineage.full_head;
+    ensure!(
+        predecessor.data.sequence == 2
+            && predecessor.data.record.as_slice() == UPDATE_RECORD.as_slice()
+            && predecessor.data.lease_expiry == 59
+            && predecessor.data.status == StateStatus::Active
+            && predecessor.data.terminal_height == 0,
+        "qualified RELEASE fixture does not have the expected active sequence-two predecessor"
+    );
+
+    let renew_transaction = lineage
+        .blocks
+        .values()
+        .flat_map(|block| block.transactions.iter())
+        .find(|transaction| transaction.txid == renew_txid)
+        .context("canonical RENEW transaction disappeared before RELEASE construction")?;
+    let renew_block = lineage
+        .blocks
+        .values()
+        .find(|block| block.transactions.iter().any(|tx| tx.txid == renew_txid))
+        .context("canonical RENEW block disappeared before RELEASE construction")?;
+    let renew_operation_index = renew_transaction
+        .operations
+        .iter()
+        .position(|operation| matches!(operation, V2Operation::Renew { .. }))
+        .context("canonical RENEW operation index missing")?;
+    let V2Operation::Renew {
+        action_index: renew_action_index,
+        ..
+    } = &renew_transaction.operations[renew_operation_index]
+    else {
+        bail!("canonical RENEW operation kind mismatch");
+    };
+    ensure!(
+        predecessor.state_ref.position()
+            == ProducerPosition::new(renew_block.height, renew_transaction.tx_index, renew_txid,)
+            && predecessor.state_ref.producer_action_index == *renew_action_index
+            && predecessor.state_ref.producer_operation_index
+                == u32::try_from(renew_operation_index)
+                    .context("RENEW operation index exceeds u32")?,
+        "current Names head is not the exact canonical RENEW successor"
+    );
+
+    let construction_height = lineage
+        .tip_height
+        .checked_add(1)
+        .context("live RELEASE construction height overflow")?;
+    ensure!(
+        lineage.tip_height < predecessor.data.lease_expiry
+            && construction_height < predecessor.data.lease_expiry,
+        "qualified Names v2 lineage is at or beyond its exclusive lease expiry"
+    );
+    let release_height = construction_height;
+
+    let usk = wallet_usk(&params)?;
+    let names_fvk = FullViewingKey::from(usk.orchard());
+    let names_ask = SpendAuthorizingKey::from(usk.orchard());
+    let mut db = open_wallet(&args.common.wallet_dir, params)?;
+    let account_id = *db
+        .get_account_ids()?
+        .first()
+        .context("live wallet has no spending account")?;
+    let notes = selected_notes(&db, lineage.tip_height, account_id)?;
+    let predecessor_matches = notes
+        .iter()
+        .enumerate()
+        .filter(|(_, (note, _, _, _))| {
+            ExtractedNoteCommitment::from(note.commitment()).to_bytes() == predecessor.commitment
+        })
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    ensure!(
+        predecessor_matches.len() == 1,
+        "wallet must contain exactly one unspent note for the accepted Names predecessor (found {})",
+        predecessor_matches.len()
+    );
+    let (predecessor_note, predecessor_scope, predecessor_position, predecessor_value) = notes
+        .into_iter()
+        .enumerate()
+        .find_map(|(index, note)| (index == predecessor_matches[0]).then_some(note))
+        .context("wallet predecessor note disappeared during selection")?;
+    let predecessor_nf = predecessor_note.nullifier(&names_fvk).to_bytes();
+    ensure!(
+        predecessor_nf == predecessor.state_ref.nullifier,
+        "wallet predecessor nullifier differs from the accepted Names StateRef"
+    );
+
+    let mut notes = selected_notes(&db, lineage.tip_height, account_id)?;
+    let predecessor_index = notes
+        .iter()
+        .position(|(note, _, _, _)| {
+            ExtractedNoteCommitment::from(note.commitment()).to_bytes() == predecessor.commitment
+        })
+        .context("wallet predecessor note is not available for funding selection")?;
+    notes.swap_remove(predecessor_index);
+    let funding_index = notes
+        .iter()
+        .enumerate()
+        .max_by_key(|(_, (_, _, _, value))| *value)
+        .map(|(index, _)| index)
+        .context("live wallet has no separate Ironwood funding note")?;
+    let (funding_note, _funding_scope, funding_position, funding_value) =
+        notes.swap_remove(funding_index);
+    let funding_nf = funding_note.nullifier(&names_fvk).to_bytes();
+    ensure!(
+        funding_nf != predecessor_nf,
+        "RELEASE funding note must differ from the predecessor note"
+    );
+    ensure!(
+        funding_position != predecessor_position,
+        "RELEASE funding position must differ from the predecessor position"
+    );
+
+    let predecessor_rho = Option::<Rho>::from(Rho::from_bytes(&predecessor_nf))
+        .context("accepted predecessor nullifier is not a valid successor rho")?;
+    let successor_rseed = Option::<RandomSeed>::from(RandomSeed::from_bytes(
+        [RELEASE_SUCCESSOR_SEED; 32],
+        &predecessor_rho,
+    ))
+    .context("construct deterministic RELEASE successor seed")?;
+    let successor_note = Option::<Note>::from(Note::from_parts(
+        names_fvk.address_at(0u32, predecessor_scope),
+        predecessor_note.value(),
+        predecessor_rho,
+        successor_rseed,
+        NoteVersion::V3,
+    ))
+    .context("construct exact RELEASE successor note")?;
+    ensure!(
+        successor_note.value() == predecessor_note.value()
+            && successor_note.value().inner() == predecessor_value,
+        "RELEASE successor note changed the predecessor bond value"
+    );
+    let successor_commitment =
+        ExtractedNoteCommitment::from(successor_note.commitment()).to_bytes();
+    let successor_future_nf = successor_note.nullifier(&names_fvk).to_bytes();
+    let successor_data = StateData {
+        name_id: predecessor.data.name_id,
+        owner_pk: predecessor.data.owner_pk,
+        sequence: predecessor
+            .data
+            .sequence
+            .checked_add(1)
+            .context("RELEASE sequence overflow")?,
+        record: predecessor.data.record.clone(),
+        lease_expiry: predecessor.data.lease_expiry,
+        status: StateStatus::Released,
+        terminal_height: release_height,
+    };
+    ensure!(
+        successor_data.record == predecessor.data.record
+            && successor_data.record.as_slice() == UPDATE_RECORD.as_slice(),
+        "RELEASE must preserve the predecessor record"
+    );
+    ensure!(
+        successor_data.lease_expiry == predecessor.data.lease_expiry,
+        "RELEASE must preserve the predecessor lease expiry"
+    );
+    ensure!(
+        successor_data.status == StateStatus::Released
+            && successor_data.terminal_height == release_height,
+        "RELEASE successor must be terminal at its construction height"
+    );
+
+    let action_index = RELEASE_ACTION_INDEX;
+    let successor_state_ref = StateRef::new(
+        ProducerPosition::new(construction_height, 0, [0; 32]),
+        action_index,
+        0,
+        successor_commitment,
+        successor_future_nf,
+    );
+    let successor = NameState::new(
+        successor_data.clone(),
+        successor_commitment,
+        successor_state_ref,
+    )
+    .map_err(|error| anyhow::anyhow!("construct RELEASE successor state: {error:?}"))?;
+    let action = IronwoodActionRef {
+        action_index,
+        nullifier: predecessor_nf,
+        commitment: successor_commitment,
+    };
+    let statement = TransitionStatement::from_states(
+        &predecessor,
+        &successor,
+        action,
+        OperationKind::Release,
+        construction_height,
+    )
+    .map_err(|error| anyhow::anyhow!("construct Names RELEASE statement: {error:?}"))?;
+    ensure!(
+        statement.operation == OperationKind::Release
+            && statement.predecessor_commitment == predecessor.commitment
+            && statement.predecessor_nullifier == predecessor_nf
+            && statement.successor_commitment == successor_commitment
+            && statement.successor_nullifier == successor_future_nf
+            && statement.predecessor_ref_digest == predecessor.state_ref.digest(),
+        "Names RELEASE statement does not reflect the exact predecessor/successor"
+    );
+    ensure!(
+        statement.predecessor_sequence == 2
+            && statement.successor_sequence == 3
+            && statement.predecessor_record_digest == statement.successor_record_digest
+            && statement.predecessor_lease_expiry == 59
+            && statement.successor_lease_expiry == 59
+            && statement.predecessor_status == StateStatus::Active.code()
+            && statement.successor_status == StateStatus::Released.code()
+            && statement.predecessor_terminal_height == 0
+            && statement.successor_terminal_height == release_height
+            && statement.operation_height == release_height,
+        "Names RELEASE statement has unexpected lifecycle fields"
+    );
+
+    let transition_witness = TransitionWitness::new(
+        predecessor_note,
+        &names_fvk,
+        predecessor_scope,
+        &names_ask,
+        successor_note,
+    );
+    let names_proof_started = Instant::now();
+    let transition_proof = names_prover
+        .prove_transition(&statement, transition_witness, OsRng)
+        .map_err(|error| anyhow::anyhow!("create Names RELEASE proof: {error:?}"))?;
+    let names_proof_elapsed = names_proof_started.elapsed();
+    ensure!(!transition_proof.is_empty(), "Names RELEASE proof is empty");
+
+    let release_operation = V2Operation::Release {
+        predecessor: predecessor.state_ref,
+        state: successor_data,
+        state_commitment: successor_commitment,
+        state_nullifier: successor_future_nf,
+        action_index,
+        proof: transition_proof.clone(),
+    };
+    let encoded_release = encode_operation(&release_operation)
+        .map_err(|error| anyhow::anyhow!("encode RELEASE operation: {error:?}"))?;
+    let decoded_release = decode_operation(&encoded_release)
+        .map_err(|error| anyhow::anyhow!("decode RELEASE operation: {error:?}"))?;
+    ensure!(
+        decoded_release == release_operation,
+        "RELEASE wire round-trip mismatch"
+    );
+    let footprint = operation_footprint(&release_operation)
+        .map_err(|error| anyhow::anyhow!("measure RELEASE operation: {error:?}"))?;
+    let frames = encode_frames(app_id, &encoded_release)
+        .map_err(|error| anyhow::anyhow!("frame RELEASE operation: {error:?}"))?;
+    let reconstructed = reconstruct_frames(&frames, app_id)
+        .map_err(|error| anyhow::anyhow!("reconstruct RELEASE frames: {error:?}"))?;
+    ensure!(
+        reconstructed == encoded_release,
+        "CPV1 reconstruction changed RELEASE bytes"
+    );
+    let reconstructed_release = decode_operation(&reconstructed)
+        .map_err(|error| anyhow::anyhow!("decode reconstructed RELEASE: {error:?}"))?;
+    ensure!(
+        reconstructed_release == release_operation,
+        "CPV1 decode changed RELEASE operation"
+    );
+    ensure!(
+        frames.len() == footprint.cpv1_frames,
+        "CPV1 footprint disagrees with measured RELEASE operation"
+    );
+
+    let carrier_recipient = names_recipient()?;
+    let carriers = frames
+        .iter()
+        .copied()
+        .map(|memo| CarrierOutput {
+            recipient: carrier_recipient,
+            value: orchard::value::NoteValue::from_raw(1),
+            memo,
+        })
+        .collect::<Vec<_>>();
+    let planned_shape = names_v2_ironwood_shape_from_counts(
+        2,
+        carriers.len(),
+        1,
+        usize::try_from(action_index).context("RELEASE action index does not fit usize")?,
+    )?;
+    let required_fee = required_zip317_fee_for_names_v2(
+        &params,
+        BlockHeight::from_u32(construction_height),
+        planned_shape,
+    )?;
+    let required_fee_value = required_fee.into_u64();
+    let required_fee_balance =
+        i64::try_from(required_fee_value).context("RELEASE ZIP-317 fee does not fit balance")?;
+    let carrier_value = u64::try_from(carriers.len()).context("RELEASE carrier count overflow")?;
+    let change_value = funding_value
+        .checked_sub(carrier_value)
+        .and_then(|value| value.checked_sub(required_fee_value))
+        .context("funding note cannot cover RELEASE carriers and ZIP-317 fee")?;
+    let plan = NamesV2IronwoodPlan {
+        designated_fvk: names_fvk.clone(),
+        designated_spend: predecessor_note,
+        successor_note,
+        successor_ovk: None,
+        successor_memo: [0; 512],
+        carrier_outputs: carriers,
+        funding_spends: vec![FundingSpend {
+            fvk: names_fvk.clone(),
+            note: funding_note,
+        }],
+        change_outputs: vec![ChangeOutput {
+            fvk: names_fvk.clone(),
+            ovk: None,
+            recipient: names_fvk.address_at(0u32, Scope::Internal),
+            value: orchard::value::NoteValue::from_raw(change_value),
+            memo: [0; 512],
+        }],
+        designated_action_index: usize::try_from(action_index)
+            .context("RELEASE action index does not fit usize")?,
+    };
+    ensure!(
+        names_v2_ironwood_shape(&plan)? == planned_shape,
+        "RELEASE plan shape changed after fee planning"
+    );
+    let built = build_names_v2_bundle(plan, OsRng)?;
+    ensure!(
+        built.action_count == planned_shape.action_count,
+        "RELEASE built action count differs from fee-planned shape"
+    );
+    ensure!(
+        built.ironwood_value_balance == required_fee_balance,
+        "RELEASE built value balance differs from ZIP-317 fee"
+    );
+    ensure!(
+        built.designated_nullifier == statement.predecessor_nullifier
+            && built.designated_commitment == statement.successor_commitment,
+        "RELEASE designated action differs from the Names transition statement"
+    );
+    verify_designated_action(
+        &built.bundle,
+        built.designated_action_index,
+        predecessor_nf,
+        successor_commitment,
+    )?;
+
+    let anchor_height = db
+        .get_target_and_anchor_heights(NonZeroU32::MIN)?
+        .context("wallet has no synchronized target/anchor heights")?
+        .1;
+    let (anchor, paths) = wallet_witnesses(
+        &mut db,
+        anchor_height,
+        [predecessor_position, funding_position],
+    )?;
+    let complete = build_names_v2_pczt(NamesV2PcztPlan {
+        ironwood: built,
+        params,
+        consensus_branch_id: BranchId::Nu6_3,
+        expiry_height: BlockHeight::from_u32(construction_height),
+        fallback_lock_time: 0,
+    })?;
+    let finalized = finalize_names_v2_pczt_io(complete)?;
+    let witnessed = install_names_v2_ironwood_witnesses(
+        finalized,
+        NamesV2WitnessPlan {
+            anchor,
+            spends: vec![
+                NamesV2IronwoodWitness {
+                    nullifier: predecessor_nf,
+                    merkle_path: paths[0].clone(),
+                },
+                NamesV2IronwoodWitness {
+                    nullifier: funding_nf,
+                    merkle_path: paths[1].clone(),
+                },
+            ],
+        },
+    )?;
+    let consensus_proving_key = orchard::circuit::ProvingKey::build(
+        orchard::bundle::BundleVersion::ironwood_v3().circuit_version(),
+    );
+    let consensus_proof_started = Instant::now();
+    let proved = prove_names_v2_ironwood_pczt(witnessed, &consensus_proving_key)?;
+    let consensus_proof_elapsed = consensus_proof_started.elapsed();
+    let signed = sign_names_v2_ironwood_pczt(
+        proved,
+        NamesV2SigningPlan {
+            spends: vec![
+                zcash_devtool::names_v2_builder::NamesV2IronwoodSigningKey {
+                    nullifier: predecessor_nf,
+                    ask: names_ask,
+                },
+                zcash_devtool::names_v2_builder::NamesV2IronwoodSigningKey {
+                    nullifier: funding_nf,
+                    ask: SpendAuthorizingKey::from(usk.orchard()),
+                },
+            ],
+        },
+    )?;
+    let extracted = extract_names_v2_transaction(signed)?;
+    ensure!(
+        extracted.action_count == planned_shape.action_count
+            && extracted.ironwood_value_balance == required_fee_balance,
+        "extracted RELEASE metadata differs from the planned shape or fee"
+    );
+    let mut raw = Vec::new();
+    extracted.transaction.write(&mut raw)?;
+    let release_txid = submit_raw(&args.common.rpc_url, &raw)?;
+    let final_txid: [u8; 32] = extracted.txid.into();
+    ensure!(
+        release_txid == final_txid,
+        "node returned a different RELEASE txid"
+    );
+
+    println!("RENEW_TXID={}", hex::encode(renew_txid));
+    println!("RELEASE_CURRENT_TIP={}", lineage.tip_height);
+    println!("RELEASE_CONSTRUCTION_HEIGHT={construction_height}");
+    println!("RELEASE_NAMES_PROOF_BYTES={}", transition_proof.len());
+    println!(
+        "RELEASE_NAMES_PROOF_ELAPSED_MS={}",
+        names_proof_elapsed.as_millis()
+    );
+    println!("CNV2_RELEASE_BYTES={}", encoded_release.len());
+    println!("CPV1_RELEASE_FRAMES={}", frames.len());
+    println!("RELEASE_TXID={}", hex::encode(final_txid));
+    println!("RELEASE_ACTION_INDEX={action_index}");
+    println!("RELEASE_PREDECESSOR_VALUE={predecessor_value}");
+    println!("RELEASE_SUCCESSOR_SEQUENCE=3");
+    println!("RELEASE_SUCCESSOR_LEASE_EXPIRY=59");
+    println!("RELEASE_TERMINAL_HEIGHT={release_height}");
+    println!("RELEASE_ACTION_COUNT={}", extracted.action_count);
+    println!("RELEASE_REAL_SPENDS={}", extracted.real_spend_count);
+    println!("RELEASE_CARRIER_OUTPUTS={}", extracted.carrier_output_count);
+    println!("RELEASE_CHANGE_OUTPUTS={}", extracted.change_output_count);
+    println!("RELEASE_VALUE_BALANCE={}", extracted.ironwood_value_balance);
+    println!("RELEASE_ANCHOR_HEIGHT={anchor_height}");
+    println!("RELEASE_ANCHOR={}", hex::encode(anchor.to_bytes()));
+    println!("RELEASE_PREDECESSOR_NF={}", hex::encode(predecessor_nf));
+    println!(
+        "RELEASE_SUCCESSOR_CMX={}",
+        hex::encode(successor_commitment)
+    );
+    println!(
+        "RELEASE_SUCCESSOR_FUTURE_NF={}",
+        hex::encode(successor_future_nf)
+    );
+    println!(
+        "CONSENSUS_PROOF_BYTES={}",
+        extracted.ironwood_proof_byte_len
+    );
+    println!(
+        "CONSENSUS_PROOF_ELAPSED_MS={}",
+        consensus_proof_elapsed.as_millis()
+    );
+    println!("RELEASE_TX_BYTES={}", raw.len());
+    println!("NAMES_APPLICATION_ID={}", hex::encode(app_id));
+    println!(
+        "RENDEZVOUS_RECEIVER={}",
+        hex::encode(REGTEST.rendezvous.orchard_receiver)
+    );
+    Ok(())
+}
+
+fn verify_release(args: VerifyReleaseArgs) -> Result<()> {
+    let params = local_consensus();
+    let v2 = v2_parameters();
+    let reveal_txid = parse_txid_hex(&args.reveal_txid)?;
+    let update_txid = parse_txid_hex(&args.update_txid)?;
+    let renew_txid = parse_txid_hex(&args.renew_txid)?;
+    let release_txid = parse_txid_hex(&args.release_txid)?;
+    let rendezvous = CoreRendezvous::try_new(
+        &REGTEST.rendezvous.orchard_ivk,
+        &REGTEST.rendezvous.orchard_receiver,
+    )
+    .map_err(|error| anyhow::anyhow!("construct Names rendezvous decoder: {error:?}"))?;
+    let app_id = names_application_id().to_bytes();
+    let mut source = source_for(&args.rpc_url)?;
+    let (_, transition_verifier, _, genesis_verifier) =
+        orchard::circuit::state_note_binding::keygen();
+    let names_verifier = OrchardV2ProofVerifier::from_parts(transition_verifier, genesis_verifier);
+    let lineage = replay_names_lineage(
+        &mut source,
+        &params,
+        &rendezvous,
+        app_id,
+        reveal_txid,
+        Some(update_txid),
+        Some(renew_txid),
+        Some(release_txid),
+        &names_verifier,
+    )?;
+    ensure!(
+        lineage.full_status == ResolutionStatus::Released,
+        "full replay did not leave the name released: {:?}",
+        lineage.full_status
+    );
+    ensure!(
+        lineage.fresh_status == ResolutionStatus::Released,
+        "FreshResolver did not find a released current state: {:?}",
+        lineage.fresh_status
+    );
+    ensure!(
+        lineage.full_head == lineage.fresh_head,
+        "full replay and FreshResolver disagree after RELEASE"
+    );
+    ensure!(
+        lineage
+            .machine
+            .resolution_at(lineage.name_id, lineage.tip_height)
+            == ResolutionStatus::Released,
+        "full replay machine did not classify the terminal state as Released"
+    );
+
+    let renew = lineage
+        .blocks
+        .values()
+        .flat_map(|block| block.transactions.iter())
+        .find(|transaction| transaction.txid == renew_txid)
+        .context("canonical RENEW transaction disappeared during RELEASE verification")?;
+    let renew_block = lineage
+        .blocks
+        .values()
+        .find(|block| block.transactions.iter().any(|tx| tx.txid == renew_txid))
+        .context("canonical RENEW block missing during RELEASE verification")?;
+    let renew_operation_index = renew
+        .operations
+        .iter()
+        .position(|operation| matches!(operation, V2Operation::Renew { .. }))
+        .context("canonical RENEW operation index missing")?;
+    let V2Operation::Renew {
+        state_commitment,
+        state_nullifier,
+        action_index: renew_action_index,
+        ..
+    } = &renew.operations[renew_operation_index]
+    else {
+        bail!("canonical RENEW operation kind mismatch");
+    };
+    let renew_state_ref = StateRef::new(
+        ProducerPosition::new(renew_block.height, renew.tx_index, renew.txid),
+        *renew_action_index,
+        u32::try_from(renew_operation_index).context("RENEW operation index exceeds u32")?,
+        *state_commitment,
+        *state_nullifier,
+    );
+    ensure!(
+        lineage.fresh_anchor == Some(renew_state_ref),
+        "FreshResolver changed its scheduled anchor to the RELEASE state"
+    );
+
+    let release = lineage
+        .blocks
+        .values()
+        .flat_map(|block| block.transactions.iter())
+        .find(|transaction| transaction.txid == release_txid)
+        .context("canonical RELEASE transaction disappeared during verification")?;
+    let release_block = lineage
+        .blocks
+        .values()
+        .find(|block| block.transactions.iter().any(|tx| tx.txid == release_txid))
+        .context("canonical RELEASE block missing")?;
+    let release_operation_index = release
+        .operations
+        .iter()
+        .position(|operation| matches!(operation, V2Operation::Release { .. }))
+        .context("canonical RELEASE operation index missing")?;
+    let V2Operation::Release {
+        predecessor,
+        state,
+        state_commitment,
+        state_nullifier,
+        action_index,
+        ..
+    } = &release.operations[release_operation_index]
+    else {
+        bail!("canonical RELEASE operation kind mismatch");
+    };
+    ensure!(
+        *predecessor == renew_state_ref,
+        "canonical RELEASE predecessor is not the exact accepted RENEW state"
+    );
+    let release_action = release
+        .action(*action_index)
+        .context("canonical RELEASE designated action is absent")?;
+    ensure!(
+        release_action.nullifier == predecessor.nullifier,
+        "canonical RELEASE predecessor NF does not match its designated action"
+    );
+    ensure!(
+        release_action.commitment == *state_commitment,
+        "canonical RELEASE successor CMX does not match its designated action"
+    );
+    ensure!(
+        release_block.height == renew_block.height + 1,
+        "canonical RELEASE was not mined in the block immediately after RENEW"
+    );
+    ensure!(
+        release_block.height < state.lease_expiry,
+        "canonical RELEASE was mined at or beyond its predecessor lease expiry"
+    );
+    let accepted = &lineage.full_head;
+    let expected_position =
+        ProducerPosition::new(release_block.height, release.tx_index, release.txid);
+    ensure!(
+        accepted.state_ref.position() == expected_position
+            && accepted.state_ref.producer_action_index == *action_index
+            && accepted.state_ref.producer_operation_index
+                == u32::try_from(release_operation_index)
+                    .context("RELEASE operation index exceeds u32")?
+            && accepted.commitment == *state_commitment
+            && accepted.state_ref.nullifier == *state_nullifier,
+        "accepted RELEASE state reference does not match the canonical transaction"
+    );
+    ensure!(
+        accepted.data.name_id == lineage.name_id
+            && accepted.data.owner_pk == state.owner_pk
+            && accepted.data.sequence == 3
+            && accepted.data.record.as_slice() == UPDATE_RECORD.as_slice()
+            && accepted.data.lease_expiry == 59
+            && accepted.data.status == StateStatus::Released
+            && accepted.data.terminal_height == release_block.height,
+        "accepted RELEASE state values are not the expected terminal successor"
+    );
+    let claimable_height = v2
+        .claimable_from(
+            accepted.data.status,
+            accepted.data.lease_expiry,
+            accepted.data.terminal_height,
+        )
+        .context("RELEASE claimable height overflow")?;
+    ensure!(
+        lineage.tip_height < claimable_height
+            && lineage
+                .machine
+                .resolution_at(lineage.name_id, lineage.tip_height)
+                == ResolutionStatus::Released,
+        "post-RELEASE tip crossed the reuse-delay claimability boundary"
+    );
+    ensure!(
+        lineage.fresh_anchor != Some(accepted.state_ref),
+        "FreshResolver incorrectly replaced its anchor with RELEASE"
+    );
+
+    println!("ACTIVATION_HEIGHT={}", lineage.activation_height);
+    println!(
+        "ACTIVATION_PARENT_HASH={}",
+        hex::encode(lineage.activation_parent_hash)
+    );
+    println!("NAMES_FULL_COMMIT_ACCEPTED=yes");
+    println!("NAMES_FULL_REVEAL_ACCEPTED=yes");
+    println!("NAMES_FULL_UPDATE_ACCEPTED=yes");
+    println!("NAMES_FULL_RENEW_ACCEPTED=yes");
+    println!("NAMES_FULL_RELEASE_ACCEPTED=yes");
+    println!("NAMES_FULL_REPLAY_STATUS={:?}", lineage.full_status);
+    println!("NAMES_FRESH_RESOLVER_STATUS={:?}", lineage.fresh_status);
+    println!("NAMES_FULL_FRESH_MATCH=yes");
+    println!("RELEASE_CANONICAL_HEIGHT={}", release_block.height);
+    println!("RELEASE_CANONICAL_TX_INDEX={}", release.tx_index);
+    println!("RELEASE_OPERATION_INDEX={release_operation_index}");
+    println!("RELEASE_ACTION_INDEX={action_index}");
+    println!("RELEASE_LEASE_EXPIRY={}", accepted.data.lease_expiry);
+    println!("RELEASE_TERMINAL_HEIGHT={}", accepted.data.terminal_height);
+    println!("CLAIMABLE_HEIGHT={claimable_height}");
+    println!(
+        "RELEASE_FRESH_ANCHOR_HEIGHT={}",
+        renew_state_ref.producer_height
+    );
+    println!(
+        "RELEASE_FRESH_ANCHOR_TX_INDEX={}",
+        renew_state_ref.producer_tx_index
+    );
+    println!(
+        "RELEASE_FRESH_ANCHOR_TXID={}",
+        hex::encode(renew_state_ref.producer_txid)
+    );
+    println!(
+        "RELEASE_FRESH_ANCHOR_ACTION_INDEX={}",
+        renew_state_ref.producer_action_index
+    );
+    println!(
+        "RELEASE_FRESH_ANCHOR_OPERATION_INDEX={}",
+        renew_state_ref.producer_operation_index
+    );
+    println!("ACCEPTED_NAME_ID={}", hex::encode(accepted.data.name_id));
+    println!("ACCEPTED_OWNER_PK={}", hex::encode(accepted.data.owner_pk));
+    println!("ACCEPTED_SEQUENCE={}", accepted.data.sequence);
+    println!("ACCEPTED_RECORD_BYTES={}", accepted.data.record.len());
+    println!("ACCEPTED_LEASE_EXPIRY={}", accepted.data.lease_expiry);
+    println!("ACCEPTED_TERMINAL_HEIGHT={}", accepted.data.terminal_height);
+    println!(
+        "ACCEPTED_STATE_COMMITMENT={}",
+        hex::encode(accepted.commitment)
+    );
+    println!(
+        "ACCEPTED_STATE_FUTURE_NF={}",
+        hex::encode(accepted.state_ref.nullifier)
+    );
+    Ok(())
+}
+
 fn verify_update(args: VerifyUpdateArgs) -> Result<()> {
     let params = local_consensus();
     let reveal_txid = parse_txid_hex(&args.reveal_txid)?;
@@ -2399,6 +3247,7 @@ fn verify_update(args: VerifyUpdateArgs) -> Result<()> {
         app_id,
         reveal_txid,
         Some(update_txid),
+        None,
         None,
         &names_verifier,
     )?;
@@ -2539,6 +3388,7 @@ fn verify_renew(args: VerifyRenewArgs) -> Result<()> {
         reveal_txid,
         Some(update_txid),
         Some(renew_txid),
+        None,
         &names_verifier,
     )?;
     ensure!(
@@ -3040,5 +3890,7 @@ fn main() -> Result<()> {
         Command::VerifyUpdate(args) => verify_update(args),
         Command::Renew(args) => renew(args),
         Command::VerifyRenew(args) => verify_renew(args),
+        Command::Release(args) => release(args),
+        Command::VerifyRelease(args) => verify_release(args),
     }
 }
