@@ -165,7 +165,7 @@ tui = [
 # extension. A git dependency's own nested patches do not propagate to ours,
 # so this workspace needs its own matching entry or the graph disagrees on
 # which orchard it is building against.
-orchard = { git = "https://github.com/nfl0/orchard-coppice.git", rev = "bc7d644a93706923e5d6151301751aad6886f636" }
+orchard = { git = "https://github.com/nfl0/orchard-coppice.git", rev = "14c3fd9633297787c3a34a13c0c93fb89e35908c" }
 equihash = { git = "https://github.com/zcash/librustzcash.git", rev = "6c07e5f3297febf469e5cc8d0b91321e0767cdd7" }
 f4jumble = { git = "https://github.com/zcash/librustzcash.git", rev = "6c07e5f3297febf469e5cc8d0b91321e0767cdd7" }
 zcash_address = { git = "https://github.com/zcash/librustzcash.git", rev = "6c07e5f3297febf469e5cc8d0b91321e0767cdd7" }
