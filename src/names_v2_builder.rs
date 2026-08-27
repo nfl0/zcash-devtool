@@ -9,7 +9,9 @@ use orchard::{
     note::{ExtractedNoteCommitment, Note},
     value::NoteValue,
 };
-use pczt::roles::{creator::Creator, io_finalizer::IoFinalizer, prover::Prover, updater::Updater};
+use pczt::roles::{
+    creator::Creator, io_finalizer::IoFinalizer, prover::Prover, signer::Signer, updater::Updater,
+};
 use rand::RngCore;
 use zcash_primitives::transaction::{TxVersion as TransactionVersion, builder::PcztParts};
 use zcash_protocol::consensus::{BlockHeight, BranchId, Parameters};
@@ -153,6 +155,47 @@ pub struct NamesV2ProvedPczt {
     pub change_output_count: usize,
     pub ironwood_value_balance: i64,
     pub ironwood_proof_byte_len: usize,
+}
+
+/// A real Ironwood spend authorization key, keyed by its canonical nullifier.
+pub struct NamesV2IronwoodSigningKey {
+    pub nullifier: [u8; 32],
+    pub ask: orchard::keys::SpendAuthorizingKey,
+}
+
+/// Wallet signing requests for the real Ironwood spends in a Names v2 PCZT.
+pub struct NamesV2SigningPlan {
+    pub spends: Vec<NamesV2IronwoodSigningKey>,
+}
+
+/// Names v2 PCZT after both real Ironwood spends have been authorized.
+pub struct NamesV2SignedPczt {
+    pub pczt: pczt::Pczt,
+    pub anchor: orchard::Anchor,
+    /// `(nullifier, final PCZT action index)` entries in witness-plan order.
+    pub witnessed_action_indices: Vec<([u8; 32], usize)>,
+    /// The canonical CNV2 action index, encoded as `u32` at this boundary.
+    pub designated_action_index: u32,
+    pub designated_nullifier: [u8; 32],
+    pub designated_commitment: [u8; 32],
+    pub action_count: usize,
+    pub real_spend_count: usize,
+    pub requested_output_count: usize,
+    pub carrier_output_count: usize,
+    pub change_output_count: usize,
+    pub ironwood_value_balance: i64,
+    pub ironwood_proof_byte_len: usize,
+}
+
+struct NamesV2SigningMetadata<'a> {
+    anchor: orchard::Anchor,
+    witnessed_action_indices: &'a [([u8; 32], usize)],
+    designated_action_index: u32,
+    designated_nullifier: [u8; 32],
+    designated_commitment: [u8; 32],
+    action_count: usize,
+    real_spend_count: usize,
+    ironwood_value_balance: i64,
 }
 
 /// Builds the Ironwood portion of a Names v2 PCZT without proving or signing.
@@ -776,6 +819,302 @@ pub fn prove_names_v2_ironwood_pczt(
     })
 }
 
+/// Signs the two real Ironwood spends in a proved Names v2 PCZT.
+pub fn sign_names_v2_ironwood_pczt(
+    proved: NamesV2ProvedPczt,
+    plan: NamesV2SigningPlan,
+) -> Result<NamesV2SignedPczt> {
+    let NamesV2ProvedPczt {
+        pczt,
+        anchor,
+        witnessed_action_indices,
+        designated_action_index,
+        designated_nullifier,
+        designated_commitment,
+        action_count,
+        real_spend_count,
+        requested_output_count,
+        carrier_output_count,
+        change_output_count,
+        ironwood_value_balance,
+        ironwood_proof_byte_len,
+    } = proved;
+    let proof_byte_len = pczt
+        .ironwood()
+        .zkproof()
+        .as_ref()
+        .map(Vec::len)
+        .context("proved PCZT has no Ironwood proof")?;
+    ensure!(
+        proof_byte_len > 0,
+        "proved PCZT has an empty Ironwood proof"
+    );
+    ensure!(
+        proof_byte_len == ironwood_proof_byte_len,
+        "proved PCZT Ironwood proof length differs from its metadata"
+    );
+
+    let pczt = sign_names_v2_ironwood_pczt_core(
+        pczt,
+        NamesV2SigningMetadata {
+            anchor,
+            witnessed_action_indices: &witnessed_action_indices,
+            designated_action_index,
+            designated_nullifier,
+            designated_commitment,
+            action_count,
+            real_spend_count,
+            ironwood_value_balance,
+        },
+        plan,
+    )?;
+
+    ensure!(
+        pczt.ironwood().zkproof().as_ref().map(Vec::len) == Some(proof_byte_len),
+        "signed PCZT Ironwood proof length changed"
+    );
+
+    Ok(NamesV2SignedPczt {
+        pczt,
+        anchor,
+        witnessed_action_indices,
+        designated_action_index,
+        designated_nullifier,
+        designated_commitment,
+        action_count,
+        real_spend_count,
+        requested_output_count,
+        carrier_output_count,
+        change_output_count,
+        ironwood_value_balance,
+        ironwood_proof_byte_len,
+    })
+}
+
+/// Applies real Ironwood signatures while keeping the same logic usable by the
+/// cheap unproved fixture test. The public wrapper above additionally requires
+/// the consensus proof carried by `NamesV2ProvedPczt`.
+fn sign_names_v2_ironwood_pczt_core(
+    pczt: pczt::Pczt,
+    metadata: NamesV2SigningMetadata<'_>,
+    plan: NamesV2SigningPlan,
+) -> Result<pczt::Pczt> {
+    let NamesV2SigningMetadata {
+        anchor,
+        witnessed_action_indices,
+        designated_action_index,
+        designated_nullifier,
+        designated_commitment,
+        action_count,
+        real_spend_count,
+        ironwood_value_balance,
+    } = metadata;
+    ensure!(
+        real_spend_count == 2,
+        "Names v2 Ironwood signing requires exactly two real spends"
+    );
+
+    let before_action_layout = embedded_action_layout(&pczt)?;
+    let before_action_count = pczt.ironwood().actions().len();
+    let before_value_balance = *pczt.ironwood().value_sum();
+    let before_anchor = *pczt.ironwood().anchor();
+    let before_proof = pczt.ironwood().zkproof().clone();
+    let expected_anchor = anchor.to_bytes();
+
+    ensure!(
+        before_anchor.as_ref() == Some(&expected_anchor),
+        "signing PCZT anchor does not match the expected anchor"
+    );
+    ensure!(
+        before_action_count == action_count,
+        "pre-sign Ironwood action count changed"
+    );
+    ensure!(
+        before_value_balance == value_sum_parts(ironwood_value_balance)?,
+        "pre-sign Ironwood value balance changed"
+    );
+    verify_embedded_designated_action(
+        &pczt,
+        designated_action_index,
+        designated_nullifier,
+        designated_commitment,
+    )?;
+
+    let mut witnessed_indices = Vec::with_capacity(witnessed_action_indices.len());
+    for (position, (nullifier, action_index)) in witnessed_action_indices.iter().enumerate() {
+        ensure!(
+            *action_index < before_action_count,
+            "witness metadata contains an invalid Ironwood action index"
+        );
+        ensure!(
+            !witnessed_action_indices[..position]
+                .iter()
+                .any(|(prior_nullifier, _)| prior_nullifier == nullifier),
+            "witness metadata contains duplicate real-spend nullifiers"
+        );
+        ensure!(
+            !witnessed_indices.contains(action_index),
+            "witness metadata contains duplicate real-spend action indices"
+        );
+        let action = &pczt.ironwood().actions()[*action_index];
+        ensure!(
+            *action.spend().nullifier() == *nullifier,
+            "witness metadata nullifier does not match its Ironwood action"
+        );
+        ensure!(
+            action.spend().witness().is_some(),
+            "a real Ironwood spend is missing its witness before signing"
+        );
+        ensure!(
+            action.spend().spend_auth_sig().is_none(),
+            "a real Ironwood spend is already signed before signing"
+        );
+        witnessed_indices.push(*action_index);
+    }
+    ensure!(
+        witnessed_indices.len() == real_spend_count,
+        "witness metadata does not cover exactly the real Ironwood spends"
+    );
+
+    let dummy_signatures = pczt
+        .ironwood()
+        .actions()
+        .iter()
+        .enumerate()
+        .filter_map(|(action_index, action)| {
+            action
+                .spend()
+                .spend_auth_sig()
+                .as_ref()
+                .copied()
+                .map(|signature| (action_index, signature))
+        })
+        .collect::<Vec<_>>();
+    ensure!(
+        dummy_signatures.len()
+            == action_count
+                .checked_sub(real_spend_count)
+                .context("real spend count exceeds Ironwood action count")?,
+        "unexpected number of pre-existing Ironwood spend signatures"
+    );
+
+    let NamesV2SigningPlan { spends } = plan;
+    ensure!(
+        spends.len() == real_spend_count,
+        "signing plan does not cover exactly the real Ironwood spends"
+    );
+    let mut signing_targets = Vec::with_capacity(spends.len());
+    for signing_key in &spends {
+        let mut matching_actions = witnessed_action_indices
+            .iter()
+            .filter(|(nullifier, _)| *nullifier == signing_key.nullifier);
+        let Some((_, action_index)) = matching_actions.next() else {
+            bail!(
+                "signing nullifier is not one of the real witnessed Ironwood spends: {:02x?}",
+                signing_key.nullifier
+            );
+        };
+        ensure!(
+            matching_actions.next().is_none(),
+            "signing nullifier maps to more than one witnessed Ironwood spend"
+        );
+        ensure!(
+            !signing_targets.iter().any(
+                |(resolved_index, _): &(usize, &orchard::keys::SpendAuthorizingKey)| {
+                    *resolved_index == *action_index
+                }
+            ),
+            "signing plan contains a duplicate real-spend target"
+        );
+        ensure!(
+            *pczt.ironwood().actions()[*action_index].spend().nullifier() == signing_key.nullifier,
+            "resolved signing action has an unexpected nullifier"
+        );
+        signing_targets.push((*action_index, &signing_key.ask));
+    }
+
+    let mut resolved_indices = signing_targets
+        .iter()
+        .map(|(action_index, _)| *action_index)
+        .collect::<Vec<_>>();
+    resolved_indices.sort_unstable();
+    witnessed_indices.sort_unstable();
+    ensure!(
+        resolved_indices == witnessed_indices,
+        "signing plan does not cover every real witnessed Ironwood spend"
+    );
+
+    let mut signer = Signer::new(pczt)
+        .map_err(|error| anyhow::anyhow!("initialize Names v2 PCZT signer: {error:?}"))?;
+    for (action_index, ask) in signing_targets {
+        signer
+            .sign_ironwood(action_index, ask)
+            .map_err(|error| anyhow::anyhow!("sign Names v2 Ironwood spend: {error:?}"))?;
+    }
+    let pczt = signer.finish();
+
+    ensure!(
+        pczt.ironwood().actions().len() == before_action_count,
+        "Signer changed the Ironwood action count"
+    );
+    ensure!(
+        embedded_action_layout(&pczt)? == before_action_layout,
+        "Signer changed the ordered Ironwood action layout"
+    );
+    ensure!(
+        *pczt.ironwood().value_sum() == before_value_balance,
+        "Signer changed the Ironwood value balance"
+    );
+    ensure!(
+        pczt.ironwood().anchor() == &before_anchor,
+        "Signer changed the Ironwood anchor"
+    );
+    ensure!(
+        pczt.ironwood().zkproof() == &before_proof,
+        "Signer changed the Ironwood proof"
+    );
+    verify_embedded_designated_action(
+        &pczt,
+        designated_action_index,
+        designated_nullifier,
+        designated_commitment,
+    )?;
+
+    for action_index in &witnessed_indices {
+        let action = &pczt.ironwood().actions()[*action_index];
+        ensure!(
+            action.spend().witness().is_some(),
+            "Signer removed a real Ironwood spend witness"
+        );
+        ensure!(
+            action.spend().spend_auth_sig().is_some(),
+            "Signer did not authorize a real Ironwood spend"
+        );
+    }
+    for (action_index, expected_signature) in dummy_signatures {
+        ensure!(
+            pczt.ironwood().actions()[action_index]
+                .spend()
+                .spend_auth_sig()
+                .as_ref()
+                .copied()
+                == Some(expected_signature),
+            "Signer changed a dummy Ironwood spend signature"
+        );
+    }
+    ensure!(
+        pczt.ironwood()
+            .actions()
+            .iter()
+            .filter(|action| action.spend().spend_auth_sig().is_some())
+            .count()
+            == action_count,
+        "Signer did not authorize every Ironwood action"
+    );
+
+    Ok(pczt)
+}
+
 /// Verifies the exact physical action relation expected by the Names host.
 pub fn verify_designated_action(
     bundle: &orchard::pczt::Bundle,
@@ -895,7 +1234,7 @@ mod tests {
     use super::*;
     use incrementalmerkletree::{Marking, Position, Retention};
     use orchard::{
-        keys::{Scope, SpendingKey},
+        keys::{Scope, SpendAuthorizingKey, SpendingKey},
         note::{NoteVersion, RandomSeed, Rho},
     };
     use rand::{SeedableRng, rngs::StdRng};
@@ -963,17 +1302,23 @@ mod tests {
         plan: NamesV2IronwoodPlan,
         registration_nullifier: [u8; 32],
         registration_commitment: ExtractedNoteCommitment,
+        registration_ask: SpendAuthorizingKey,
         funding_nullifier: [u8; 32],
         funding_commitment: ExtractedNoteCommitment,
+        funding_ask: SpendAuthorizingKey,
     }
 
     fn funded_reveal_fixture() -> FundedRevealFixture {
-        let names_fvk = fvk(7);
+        let registration_sk = SpendingKey::from_bytes([7; 32]).unwrap();
+        let names_fvk = FullViewingKey::from(&registration_sk);
+        let registration_ask = SpendAuthorizingKey::from(&registration_sk);
         let input = note(&names_fvk, 50_000, 1, 2);
         let successor = successor(&names_fvk, &input, 50_000, 3);
         let registration_nullifier = input.nullifier(&names_fvk).to_bytes();
         let registration_commitment = ExtractedNoteCommitment::from(input.commitment());
-        let funding_fvk = fvk(8);
+        let funding_sk = SpendingKey::from_bytes([8; 32]).unwrap();
+        let funding_fvk = FullViewingKey::from(&funding_sk);
+        let funding_ask = SpendAuthorizingKey::from(&funding_sk);
         let funding = note(&funding_fvk, 10_000, 4, 5);
         let funding_nullifier = funding.nullifier(&funding_fvk).to_bytes();
         let funding_commitment = ExtractedNoteCommitment::from(funding.commitment());
@@ -1006,8 +1351,10 @@ mod tests {
             },
             registration_nullifier,
             registration_commitment,
+            registration_ask,
             funding_nullifier,
             funding_commitment,
+            funding_ask,
         }
     }
 
@@ -1509,6 +1856,201 @@ mod tests {
                     .copied()
                     == *signature
         }));
+    }
+
+    #[test]
+    fn funded_reveal_signs_two_real_ironwood_spends_by_nullifier() {
+        let fixture = funded_reveal_fixture();
+        let witness_plan = deterministic_funded_reveal_witness_plan(&fixture);
+        let built = build_names_v2_bundle(fixture.plan, StdRng::from_seed([10; 32])).unwrap();
+        let complete = build_names_v2_pczt(NamesV2PcztPlan {
+            ironwood: built,
+            params: local_v6_params(),
+            consensus_branch_id: BranchId::Nu6_3,
+            expiry_height: BlockHeight::from_u32(100),
+            fallback_lock_time: 0,
+        })
+        .unwrap();
+        let finalized = finalize_names_v2_pczt_io(complete).unwrap();
+        let witnessed = install_names_v2_ironwood_witnesses(finalized, witness_plan).unwrap();
+        let NamesV2WitnessedPczt {
+            pczt,
+            anchor,
+            witnessed_action_indices,
+            designated_action_index,
+            designated_nullifier,
+            designated_commitment,
+            action_count,
+            real_spend_count,
+            requested_output_count: _,
+            carrier_output_count: _,
+            change_output_count: _,
+            ironwood_value_balance,
+        } = witnessed;
+
+        let before_layout = embedded_action_layout(&pczt).unwrap();
+        let before_action_count = pczt.ironwood().actions().len();
+        let before_value_balance = *pczt.ironwood().value_sum();
+        let before_anchor = anchor;
+        let before_proof = pczt.ironwood().zkproof().clone();
+        assert_eq!(before_action_count, 13);
+        assert_eq!(before_value_balance, (1_000, false));
+        assert_eq!(action_count, before_action_count);
+        assert_eq!(real_spend_count, 2);
+        assert_eq!(ironwood_value_balance, 1_000);
+        assert_eq!(designated_action_index, 4);
+        assert_eq!(designated_nullifier, fixture.registration_nullifier);
+        assert!(before_proof.is_none());
+
+        let mut real_action_indices = witnessed_action_indices
+            .iter()
+            .map(|(_, action_index)| *action_index)
+            .collect::<Vec<_>>();
+        real_action_indices.sort_unstable();
+        assert_eq!(real_action_indices, vec![4, 7]);
+        assert!(real_action_indices.iter().all(|action_index| {
+            pczt.ironwood().actions()[*action_index]
+                .spend()
+                .witness()
+                .is_some()
+                && pczt.ironwood().actions()[*action_index]
+                    .spend()
+                    .spend_auth_sig()
+                    .is_none()
+        }));
+        let dummy_signatures = pczt
+            .ironwood()
+            .actions()
+            .iter()
+            .enumerate()
+            .filter_map(|(action_index, action)| {
+                action
+                    .spend()
+                    .spend_auth_sig()
+                    .as_ref()
+                    .copied()
+                    .map(|signature| (action_index, signature))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(dummy_signatures.len(), 11);
+
+        // Deliberately request registration first even though the witness metadata is
+        // in funding-first order; both actions must be resolved by nullifier.
+        let signing_plan = NamesV2SigningPlan {
+            spends: vec![
+                NamesV2IronwoodSigningKey {
+                    nullifier: fixture.registration_nullifier,
+                    ask: fixture.registration_ask.clone(),
+                },
+                NamesV2IronwoodSigningKey {
+                    nullifier: fixture.funding_nullifier,
+                    ask: fixture.funding_ask.clone(),
+                },
+            ],
+        };
+        // Exercise the same signing core as the proved-stage public wrapper without
+        // constructing a proving key or generating another consensus proof.
+        let signed = sign_names_v2_ironwood_pczt_core(
+            pczt,
+            NamesV2SigningMetadata {
+                anchor: before_anchor,
+                witnessed_action_indices: &witnessed_action_indices,
+                designated_action_index,
+                designated_nullifier,
+                designated_commitment,
+                action_count,
+                real_spend_count,
+                ironwood_value_balance,
+            },
+            signing_plan,
+        )
+        .unwrap();
+
+        assert_eq!(signed.ironwood().actions().len(), before_action_count);
+        assert_eq!(*signed.ironwood().value_sum(), before_value_balance);
+        assert_eq!(signed.ironwood().anchor(), &Some(before_anchor.to_bytes()));
+        assert_eq!(signed.ironwood().zkproof(), &before_proof);
+        assert_eq!(embedded_action_layout(&signed).unwrap(), before_layout);
+        verify_embedded_designated_action(
+            &signed,
+            designated_action_index,
+            designated_nullifier,
+            designated_commitment,
+        )
+        .unwrap();
+        for (nullifier, action_index) in &witnessed_action_indices {
+            let action = &signed.ironwood().actions()[*action_index];
+            assert_eq!(*action.spend().nullifier(), *nullifier);
+            assert!(action.spend().witness().is_some());
+            assert!(action.spend().spend_auth_sig().is_some());
+        }
+        for (action_index, expected_signature) in &dummy_signatures {
+            assert_eq!(
+                signed.ironwood().actions()[*action_index]
+                    .spend()
+                    .spend_auth_sig()
+                    .as_ref()
+                    .copied(),
+                Some(*expected_signature)
+            );
+        }
+        assert_eq!(
+            signed
+                .ironwood()
+                .actions()
+                .iter()
+                .filter(|action| action.spend().spend_auth_sig().is_some())
+                .count(),
+            13
+        );
+
+        let signed_bytes = signed.clone().serialize().unwrap();
+        let parsed = pczt::Pczt::parse(&signed_bytes).unwrap();
+        assert_eq!(parsed.ironwood().actions().len(), before_action_count);
+        assert_eq!(*parsed.ironwood().value_sum(), before_value_balance);
+        assert_eq!(parsed.ironwood().anchor(), &Some(before_anchor.to_bytes()));
+        assert_eq!(parsed.ironwood().zkproof(), &before_proof);
+        assert_eq!(embedded_action_layout(&parsed).unwrap(), before_layout);
+        verify_embedded_designated_action(
+            &parsed,
+            designated_action_index,
+            designated_nullifier,
+            designated_commitment,
+        )
+        .unwrap();
+        assert_eq!(
+            parsed
+                .ironwood()
+                .actions()
+                .iter()
+                .filter(|action| action.spend().spend_auth_sig().is_some())
+                .count(),
+            13
+        );
+        for (_, action_index) in &witnessed_action_indices {
+            assert!(
+                parsed.ironwood().actions()[*action_index]
+                    .spend()
+                    .witness()
+                    .is_some()
+            );
+            assert!(
+                parsed.ironwood().actions()[*action_index]
+                    .spend()
+                    .spend_auth_sig()
+                    .is_some()
+            );
+        }
+        for (action_index, expected_signature) in &dummy_signatures {
+            assert_eq!(
+                parsed.ironwood().actions()[*action_index]
+                    .spend()
+                    .spend_auth_sig()
+                    .as_ref()
+                    .copied(),
+                Some(*expected_signature)
+            );
+        }
     }
 
     #[test]
