@@ -14,10 +14,14 @@ use pczt::roles::{
     tx_extractor::TransactionExtractor, updater::Updater,
 };
 use rand::RngCore;
+use zcash_client_backend::fees::StandardFeeRule;
 use zcash_primitives::transaction::{
-    Transaction, TxId, TxVersion as TransactionVersion, builder::PcztParts,
+    Transaction, TxId, TxVersion as TransactionVersion,
+    builder::PcztParts,
+    fees::{FeeRule, transparent::InputSize},
 };
 use zcash_protocol::consensus::{BlockHeight, BranchId, Parameters};
+use zcash_protocol::value::Zatoshis;
 
 /// One ordinary CPV1 rendezvous output.
 pub struct CarrierOutput {
@@ -54,6 +58,16 @@ pub struct NamesV2IronwoodPlan {
     pub change_outputs: Vec<ChangeOutput>,
     /// Canonical action index carried by the CNV2 operation.
     pub designated_action_index: usize,
+}
+
+/// The public physical shape of a manually assembled Names v2 Ironwood bundle.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NamesV2IronwoodShape {
+    pub real_spend_count: usize,
+    pub requested_output_count: usize,
+    pub carrier_output_count: usize,
+    pub change_output_count: usize,
+    pub action_count: usize,
 }
 
 /// Constructed, unproved Ironwood PCZT bundle and verified layout metadata.
@@ -221,11 +235,87 @@ struct NamesV2SigningMetadata<'a> {
     ironwood_value_balance: i64,
 }
 
+/// Computes the exact requested and padded action counts used by the Orchard
+/// builder for a Names v2 plan.
+pub fn names_v2_ironwood_shape(plan: &NamesV2IronwoodPlan) -> Result<NamesV2IronwoodShape> {
+    let real_spend_count = 1usize
+        .checked_add(plan.funding_spends.len())
+        .context("Names v2 real-spend count overflowed usize")?;
+    names_v2_ironwood_shape_from_counts(
+        real_spend_count,
+        plan.carrier_outputs.len(),
+        plan.change_outputs.len(),
+        plan.designated_action_index,
+    )
+}
+
+/// Computes a Names v2 bundle shape when the note objects are not yet needed.
+///
+/// `real_spend_count` includes the one designated state-operation spend;
+/// `requested_output_count` is therefore one successor output plus the
+/// supplied carrier and change counts. The action count is delegated to the
+/// same `BundleType::UNPADDED` implementation used by the actual builder.
+pub fn names_v2_ironwood_shape_from_counts(
+    real_spend_count: usize,
+    carrier_output_count: usize,
+    change_output_count: usize,
+    designated_action_index: usize,
+) -> Result<NamesV2IronwoodShape> {
+    ensure!(
+        real_spend_count > 0,
+        "Names v2 bundle must contain a designated real spend"
+    );
+    let requested_output_count = 1usize
+        .checked_add(carrier_output_count)
+        .and_then(|count| count.checked_add(change_output_count))
+        .context("Names v2 requested-output count overflowed usize")?;
+    let action_count = BundleType::UNPADDED
+        .num_actions(Flags::ENABLED, real_spend_count, requested_output_count)
+        .map_err(|error| anyhow::anyhow!("compute Names v2 Ironwood action count: {error}"))?;
+    ensure!(
+        designated_action_index < action_count,
+        "designated Names action index is outside the planned Ironwood shape"
+    );
+    Ok(NamesV2IronwoodShape {
+        real_spend_count,
+        requested_output_count,
+        carrier_output_count,
+        change_output_count,
+        action_count,
+    })
+}
+
+/// Computes the conventional ZIP-317 fee for a manually assembled Names v2
+/// shielded-only transaction.
+///
+/// The pinned fee rule receives no transparent inputs or outputs and no
+/// Sapling or Orchard actions; the shared physical action count represents the
+/// complete Ironwood logical-action contribution.
+pub fn required_zip317_fee_for_names_v2<P: Parameters>(
+    params: &P,
+    target_height: BlockHeight,
+    shape: NamesV2IronwoodShape,
+) -> Result<Zatoshis> {
+    StandardFeeRule::Zip317
+        .fee_required(
+            params,
+            target_height,
+            std::iter::empty::<InputSize>(),
+            std::iter::empty::<usize>(),
+            0,
+            0,
+            0,
+            shape.action_count,
+        )
+        .map_err(|error| anyhow::anyhow!("compute ZIP-317 Names v2 fee: {error:?}"))
+}
+
 /// Builds the Ironwood portion of a Names v2 PCZT without proving or signing.
 pub fn build_names_v2_bundle(
     plan: NamesV2IronwoodPlan,
     rng: impl RngCore,
 ) -> Result<NamesV2BuiltBundle> {
+    let shape = names_v2_ironwood_shape(&plan)?;
     let designated_nullifier = plan.designated_spend.nullifier(&plan.designated_fvk);
     let designated_commitment = ExtractedNoteCommitment::from(plan.successor_note.commitment());
     ensure!(
@@ -243,7 +333,6 @@ pub fn build_names_v2_bundle(
     builder
         .add_spend_unwitnessed(plan.designated_fvk, plan.designated_spend)
         .context("add designated Names spend")?;
-    let real_spend_count = 1 + plan.funding_spends.len();
     for funding in plan.funding_spends {
         builder
             .add_spend_unwitnessed(funding.fvk, funding.note)
@@ -253,13 +342,11 @@ pub fn build_names_v2_bundle(
     builder
         .add_output_note(plan.successor_ovk, plan.successor_note, plan.successor_memo)
         .context("add exact Names successor note")?;
-    let carrier_output_count = plan.carrier_outputs.len();
     for carrier in plan.carrier_outputs {
         builder
             .add_output(None, carrier.recipient, carrier.value, carrier.memo)
             .context("add CPV1 carrier output")?;
     }
-    let change_output_count = plan.change_outputs.len();
     for change in plan.change_outputs {
         builder
             .add_change_output(
@@ -271,7 +358,6 @@ pub fn build_names_v2_bundle(
             )
             .context("add Ironwood change output")?;
     }
-    let requested_output_count = 1 + carrier_output_count + change_output_count;
     let ironwood_value_balance = builder
         .value_balance::<i64>()
         .context("compute Ironwood value balance")?;
@@ -312,16 +398,20 @@ pub fn build_names_v2_bundle(
     );
 
     let action_count = bundle.actions().len();
+    ensure!(
+        action_count == shape.action_count,
+        "built Ironwood action count differs from the planned shape"
+    );
     Ok(NamesV2BuiltBundle {
         bundle,
         designated_action_index: plan.designated_action_index,
         designated_nullifier: designated_nullifier.to_bytes(),
         designated_commitment: designated_commitment.to_bytes(),
         action_count,
-        real_spend_count,
-        requested_output_count,
-        carrier_output_count,
-        change_output_count,
+        real_spend_count: shape.real_spend_count,
+        requested_output_count: shape.requested_output_count,
+        carrier_output_count: shape.carrier_output_count,
+        change_output_count: shape.change_output_count,
         ironwood_value_balance,
     })
 }
@@ -1706,6 +1796,78 @@ mod tests {
                 built.designated_commitment,
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn zip317_fee_planning_uses_shared_reveal_shape_and_previews_update() {
+        let fixture = funded_reveal_fixture();
+        let reveal_shape = names_v2_ironwood_shape(&fixture.plan).unwrap();
+        assert_eq!(reveal_shape.real_spend_count, 2);
+        assert_eq!(reveal_shape.requested_output_count, 13);
+        assert_eq!(reveal_shape.carrier_output_count, 11);
+        assert_eq!(reveal_shape.change_output_count, 1);
+        assert_eq!(reveal_shape.action_count, 13);
+        assert_eq!(
+            required_zip317_fee_for_names_v2(
+                &local_v6_params(),
+                BlockHeight::from_u32(100),
+                reveal_shape,
+            )
+            .unwrap(),
+            Zatoshis::from_u64(65_000).unwrap()
+        );
+
+        let built = build_names_v2_bundle(fixture.plan, StdRng::from_seed([10; 32])).unwrap();
+        assert_eq!(built.action_count, reveal_shape.action_count);
+        assert_eq!(built.real_spend_count, reveal_shape.real_spend_count);
+        assert_eq!(
+            built.requested_output_count,
+            reveal_shape.requested_output_count
+        );
+
+        let update = V2Operation::Update {
+            predecessor: StateRef::new(
+                ProducerPosition::new(950, 2, [4; 32]),
+                0,
+                0,
+                [6; 32],
+                [7; 32],
+            ),
+            state: StateData {
+                name_id: [1; 32],
+                owner_pk: [5; 32],
+                sequence: 1,
+                record: vec![6; 65],
+                lease_expiry: 2_000,
+                status: StateStatus::Active,
+                terminal_height: 0,
+            },
+            state_commitment: [8; 32],
+            state_nullifier: [9; 32],
+            action_index: 0,
+            proof: vec![0; 4_640],
+        };
+        let update_footprint = operation_footprint(&update).unwrap();
+        assert_eq!(update_footprint.operation_bytes, 4_950);
+        assert_eq!(update_footprint.proof_bytes, 4_640);
+        assert_eq!(update_footprint.cpv1_frames, 10);
+
+        let update_shape =
+            names_v2_ironwood_shape_from_counts(2, update_footprint.cpv1_frames, 1, 0).unwrap();
+        assert_eq!(update_shape.real_spend_count, 2);
+        assert_eq!(update_shape.requested_output_count, 12);
+        assert_eq!(update_shape.carrier_output_count, 10);
+        assert_eq!(update_shape.change_output_count, 1);
+        assert_eq!(update_shape.action_count, 12);
+        assert_eq!(
+            required_zip317_fee_for_names_v2(
+                &local_v6_params(),
+                BlockHeight::from_u32(100),
+                update_shape,
+            )
+            .unwrap(),
+            Zatoshis::from_u64(60_000).unwrap()
         );
     }
 

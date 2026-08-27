@@ -66,7 +66,9 @@ use zcash_devtool::names_v2_builder::{
     CarrierOutput, ChangeOutput, FundingSpend, NamesV2IronwoodPlan, NamesV2IronwoodWitness,
     NamesV2PcztPlan, NamesV2SigningPlan, NamesV2WitnessPlan, build_names_v2_bundle,
     build_names_v2_pczt, extract_names_v2_transaction, finalize_names_v2_pczt_io,
-    install_names_v2_ironwood_witnesses, prove_names_v2_ironwood_pczt, sign_names_v2_ironwood_pczt,
+    install_names_v2_ironwood_witnesses, names_v2_ironwood_shape,
+    names_v2_ironwood_shape_from_counts, prove_names_v2_ironwood_pczt,
+    required_zip317_fee_for_names_v2, sign_names_v2_ironwood_pczt,
 };
 
 const NAME: &str = "footprint";
@@ -74,10 +76,6 @@ const ACTION_INDEX: u32 = 4;
 const RECORD: [u8; 64] = [9; 64];
 const SECRET: [u8; 32] = [8; 32];
 const SUCCESSOR_SEED: u8 = 3;
-// Zakura enforces ZIP-317's zero unpaid-action limit. The funded REVEAL has
-// thirteen Ironwood actions, so its value balance must pay the conventional
-// 13 * 5,000-zatoshi fee rather than the smaller offline fixture balance.
-const DESIRED_VALUE_BALANCE: i64 = 65_000;
 
 #[derive(Parser)]
 #[command(name = "names-v2-live")]
@@ -787,11 +785,6 @@ fn reveal(args: RevealArgs) -> Result<()> {
         "CPV1 footprint disagrees with measured operation"
     );
 
-    let anchor_height = db
-        .get_target_and_anchor_heights(NonZeroU32::MIN)?
-        .context("wallet has no synchronized target/anchor heights")?
-        .1;
-    let (anchor, paths) = wallet_witnesses(&mut db, anchor_height, [registration.2, funding.2])?;
     let carrier_recipient = names_recipient()?;
     let carriers = frames
         .iter()
@@ -802,11 +795,38 @@ fn reveal(args: RevealArgs) -> Result<()> {
             memo,
         })
         .collect::<Vec<_>>();
+    let funding_spend_count = 1usize;
+    let change_output_count = 1usize;
+    let real_spend_count = 1usize
+        .checked_add(funding_spend_count)
+        .context("Names v2 real-spend count overflow")?;
+    let designated_action_index =
+        usize::try_from(ACTION_INDEX).context("designated action index does not fit usize")?;
+    let planned_shape = names_v2_ironwood_shape_from_counts(
+        real_spend_count,
+        carriers.len(),
+        change_output_count,
+        designated_action_index,
+    )?;
+    let required_fee = required_zip317_fee_for_names_v2(
+        &params,
+        BlockHeight::from_u32(construction_height),
+        planned_shape,
+    )?;
+    let required_fee_value = required_fee.into_u64();
+    let required_fee_balance =
+        i64::try_from(required_fee_value).context("ZIP-317 fee does not fit signed balance")?;
+
+    let anchor_height = db
+        .get_target_and_anchor_heights(NonZeroU32::MIN)?
+        .context("wallet has no synchronized target/anchor heights")?
+        .1;
+    let (anchor, paths) = wallet_witnesses(&mut db, anchor_height, [registration.2, funding.2])?;
     let funding_value = funding.3;
     let carrier_value = u64::try_from(carriers.len()).context("carrier count does not fit u64")?;
     let change_value = funding_value
         .checked_sub(carrier_value)
-        .and_then(|value| value.checked_sub(u64::try_from(DESIRED_VALUE_BALANCE).ok()?))
+        .and_then(|value| value.checked_sub(required_fee_value))
         .context("funding note cannot cover carrier outputs and the requested value balance")?;
     let plan = NamesV2IronwoodPlan {
         designated_fvk: names_fvk.clone(),
@@ -826,10 +846,21 @@ fn reveal(args: RevealArgs) -> Result<()> {
             value: orchard::value::NoteValue::from_raw(change_value),
             memo: [0; 512],
         }],
-        designated_action_index: usize::try_from(ACTION_INDEX)
-            .context("designated action index does not fit usize")?,
+        designated_action_index,
     };
+    ensure!(
+        names_v2_ironwood_shape(&plan)? == planned_shape,
+        "Names v2 plan shape changed after fee planning"
+    );
     let built = build_names_v2_bundle(plan, OsRng)?;
+    ensure!(
+        built.action_count == planned_shape.action_count,
+        "built Names v2 action count differs from fee-planned shape"
+    );
+    ensure!(
+        built.ironwood_value_balance == required_fee_balance,
+        "built Names v2 value balance differs from required ZIP-317 fee"
+    );
     ensure!(
         built.designated_nullifier == statement.registration_nullifier,
         "wallet designated NF differs from Names genesis statement"
