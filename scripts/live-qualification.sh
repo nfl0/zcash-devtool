@@ -1389,9 +1389,15 @@ if (( TARGET_PHASE == 8 )); then
     run_logged names-v2-verify timeout 1200 "$NAMES_V2_LIVE_BIN" verify \
         --rpc-url "$ZAKURA_RPC_URL" --commit-txid "$COMMIT_TXID" \
         --reveal-txid "$REVEAL_TXID"
-    rg -a -q '^NAMES_REPLAY_STATUS=Active$' \
+    rg -a -q '^NAMES_FULL_REPLAY_STATUS=Active$' \
         "$LOG_DIR/names-v2-verify.log" \
-        || die "canonical Names v2 replay did not accept the live registration"
+        || die "canonical Names v2 full replay did not accept the live registration"
+    rg -a -q '^NAMES_FRESH_RESOLVER_STATUS=Active$' \
+        "$LOG_DIR/names-v2-verify.log" \
+        || die "canonical Names v2 FreshResolver did not accept the live registration"
+    rg -a -q '^NAMES_FULL_FRESH_MATCH=yes$' \
+        "$LOG_DIR/names-v2-verify.log" \
+        || die "canonical Names v2 full replay and FreshResolver disagree"
     printf '[PASS] live v2 COMMIT %s mined at h=%s; REVEAL %s mined at h=%s; Names replay accepted Active registration\n' \
         "$COMMIT_TXID" "$COMMIT_HEIGHT_EXPECTED" \
         "$REVEAL_TXID" "$REVEAL_HEIGHT_EXPECTED"

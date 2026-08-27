@@ -26,10 +26,11 @@ use coppice_names::{
     config::REGTEST,
     names_application::names_application_id,
     v2::{
-        CanonicalBlock, CanonicalTransaction, CommitRef, FreshResolver, GenesisStatement,
-        IronwoodActionRef, NameState, OrchardV2ProofProver, ProducerPosition, RegistrationIntent,
-        ResolutionStatus, StateData, StateRef, StateStatus, V2Operation, V2Parameters,
-        decode_operation, encode_operation, operation_footprint,
+        AppliedOperationKind, AppliedOperationResult, CanonicalBlock, CanonicalTransaction,
+        CommitRef, FreshResolver, GenesisStatement, IronwoodActionRef, NameState,
+        OrchardV2ProofProver, ProducerPosition, RegistrationIntent, ResolutionStatus, StateData,
+        StateRef, StateStatus, V2Operation, V2Parameters, V2StateMachine, decode_operation,
+        encode_operation, operation_footprint,
     },
 };
 use orchard::{
@@ -1033,17 +1034,139 @@ fn verify(args: VerifyArgs) -> Result<()> {
         reveal_action.commitment == *state_commitment,
         "canonical REVEAL designated CMX mismatch"
     );
-    let _ = (intent, state);
-    let resolver = FreshResolver::new(v2_parameters())
-        .map_err(|error| anyhow::anyhow!("construct Names v2 fresh resolver: {error:?}"))?;
-    // The verifier key is generated once for this disposable replay process;
-    // this is verification only and does not create another application proof.
+    ensure!(
+        commit_txid != reveal_txid,
+        "COMMIT and REVEAL txids must differ"
+    );
+    let v2 = v2_parameters();
+    let intent_name_id = intent
+        .name_id()
+        .map_err(|error| anyhow::anyhow!("derive replay intent name id: {error:?}"))?;
+    let reveal_operation_index = reveal
+        .operations
+        .iter()
+        .position(|operation| matches!(operation, V2Operation::Reveal { .. }))
+        .context("canonical REVEAL operation index missing")
+        .and_then(|index| {
+            u32::try_from(index).context("canonical REVEAL operation index exceeds u32")
+        })?;
+    let activation_height = v2.activation_height;
+    let canonical_tip_height = blocks
+        .keys()
+        .next_back()
+        .copied()
+        .context("canonical replay source contains no blocks")?;
+    let activation_block = blocks
+        .get(&activation_height)
+        .context("canonical replay source is missing the v2 activation block")?;
+    // The parent is taken from the canonical activation block itself. The
+    // state machine still authenticates this value against the first block
+    // and every subsequent predecessor in apply_block.
+    let activation_parent_hash = activation_block.prev_block_hash;
     let (_, transition_verifier, _, genesis_verifier) =
         orchard::circuit::state_note_binding::keygen();
     let verifier = coppice_names::v2::transition::OrchardV2ProofVerifier::from_parts(
         transition_verifier,
         genesis_verifier,
     );
+    let mut machine = V2StateMachine::from_activation_parent(v2, activation_parent_hash)
+        .map_err(|error| anyhow::anyhow!("construct Names v2 full replay machine: {error:?}"))?;
+    let mut commit_full_replay_seen = false;
+    let mut reveal_full_replay_seen = false;
+    for height in activation_height..=canonical_tip_height {
+        let block = blocks
+            .get(&height)
+            .context("canonical replay source is missing a sequential block")?;
+        let applied = machine.apply_block(block, &verifier).map_err(|error| {
+            anyhow::anyhow!("Names v2 full replay failed at h{height}: {error:?}")
+        })?;
+        for transaction in &block.transactions {
+            if transaction.txid == commit_txid {
+                ensure!(
+                    !commit_full_replay_seen,
+                    "canonical COMMIT was processed more than once by full replay"
+                );
+                let operation_index = transaction
+                    .operations
+                    .iter()
+                    .position(|operation| matches!(operation, V2Operation::Commit { .. }))
+                    .context("full replay COMMIT operation index missing")
+                    .and_then(|index| {
+                        u32::try_from(index)
+                            .context("full replay COMMIT operation index exceeds u32")
+                    })?;
+                let outcome = applied
+                    .operations
+                    .iter()
+                    .find(|operation| {
+                        operation.tx_index == transaction.tx_index
+                            && operation.operation_index == operation_index
+                    })
+                    .context("full replay did not return the canonical COMMIT result")?;
+                match &outcome.result {
+                    AppliedOperationResult::Accepted(None) => {}
+                    AppliedOperationResult::Accepted(other) => {
+                        bail!("full replay COMMIT result was not Accepted(None): {other:?}")
+                    }
+                    AppliedOperationResult::Rejected(error) => {
+                        bail!("full replay COMMIT was rejected: {error:?}")
+                    }
+                }
+                commit_full_replay_seen = true;
+            } else if transaction.txid == reveal_txid {
+                ensure!(
+                    !reveal_full_replay_seen,
+                    "canonical REVEAL was processed more than once by full replay"
+                );
+                let outcome = applied
+                    .operations
+                    .iter()
+                    .find(|operation| {
+                        operation.tx_index == transaction.tx_index
+                            && operation.operation_index == reveal_operation_index
+                    })
+                    .context("full replay did not return the canonical REVEAL result")?;
+                match &outcome.result {
+                    AppliedOperationResult::Accepted(Some((accepted_name_id, kind))) => {
+                        ensure!(
+                            *accepted_name_id == intent_name_id,
+                            "full replay REVEAL accepted the wrong name id"
+                        );
+                        ensure!(
+                            *kind == AppliedOperationKind::Reveal,
+                            "full replay REVEAL returned the wrong operation kind"
+                        );
+                    }
+                    AppliedOperationResult::Accepted(other) => {
+                        bail!("full replay REVEAL result was not Accepted(name, Reveal): {other:?}")
+                    }
+                    AppliedOperationResult::Rejected(error) => {
+                        bail!("full replay REVEAL was rejected: {error:?}")
+                    }
+                }
+                reveal_full_replay_seen = true;
+            }
+        }
+    }
+    ensure!(
+        commit_full_replay_seen,
+        "full replay did not process the canonical COMMIT"
+    );
+    ensure!(
+        reveal_full_replay_seen,
+        "full replay did not process the canonical REVEAL"
+    );
+    let full_status = machine.resolution_at(intent_name_id, canonical_tip_height);
+    ensure!(
+        full_status == ResolutionStatus::Active,
+        "full Names v2 replay did not accept an active registration: {full_status:?}"
+    );
+    let full_head = machine
+        .head(intent_name_id)
+        .context("full Names v2 replay returned no accepted state")?;
+
+    let resolver = FreshResolver::new(v2)
+        .map_err(|error| anyhow::anyhow!("construct Names v2 fresh resolver: {error:?}"))?;
     let result = resolver
         .resolve(NAME, &blocks, &verifier)
         .map_err(|error| anyhow::anyhow!("Names v2 canonical replay failed: {error:?}"))?;
@@ -1055,9 +1178,6 @@ fn verify(args: VerifyArgs) -> Result<()> {
     let accepted = result
         .state
         .context("Names v2 replay returned no accepted state")?;
-    let intent_name_id = intent
-        .name_id()
-        .map_err(|error| anyhow::anyhow!("derive replay intent name id: {error:?}"))?;
     ensure!(
         accepted.data.name_id == intent_name_id,
         "accepted state name id mismatch"
@@ -1103,7 +1223,24 @@ fn verify(args: VerifyArgs) -> Result<()> {
         accepted.state_ref.producer_operation_index == 0,
         "accepted state operation index mismatch"
     );
-    println!("NAMES_REPLAY_STATUS=Active");
+    ensure!(
+        full_head == &accepted,
+        "full replay and FreshResolver returned different NameState values"
+    );
+    ensure!(
+        machine.resolution_at(intent_name_id, canonical_tip_height) == result.status,
+        "full replay and FreshResolver returned different resolution statuses"
+    );
+    println!("ACTIVATION_HEIGHT={activation_height}");
+    println!(
+        "ACTIVATION_PARENT_HASH={}",
+        hex::encode(activation_parent_hash)
+    );
+    println!("NAMES_FULL_COMMIT_ACCEPTED=yes");
+    println!("NAMES_FULL_REVEAL_ACCEPTED=yes");
+    println!("NAMES_FULL_REPLAY_STATUS={full_status:?}");
+    println!("NAMES_FRESH_RESOLVER_STATUS={:?}", result.status);
+    println!("NAMES_FULL_FRESH_MATCH=yes");
     println!("COMMIT_CANONICAL_HEIGHT={}", commit_block.height);
     println!("COMMIT_CANONICAL_TX_INDEX={}", commit.tx_index);
     println!("COMMIT_OPERATION_INDEX={canonical_commit}");
