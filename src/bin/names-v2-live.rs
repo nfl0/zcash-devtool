@@ -15,7 +15,7 @@ use std::{
 
 use anyhow::{Context, Result, bail, ensure};
 use bip0039::{English, Mnemonic};
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use coppice::{
     carrier::CoreRendezvous,
     transport::{encode_frames, reconstruct_frames},
@@ -114,6 +114,8 @@ enum Command {
     Release(ReleaseArgs),
     /// Replay the canonical chain and verify one real v2 RELEASE.
     VerifyRelease(VerifyReleaseArgs),
+    /// Verify the exact Released -> Expired claimability boundary.
+    VerifyReleaseBoundary(VerifyReleaseBoundaryArgs),
 }
 
 #[derive(Args, Clone)]
@@ -212,6 +214,29 @@ struct VerifyReleaseArgs {
     renew_txid: String,
     #[arg(long)]
     release_txid: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+#[value(rename_all = "lower")]
+enum ReleaseBoundaryStatus {
+    Released,
+    Expired,
+}
+
+#[derive(Args)]
+struct VerifyReleaseBoundaryArgs {
+    #[arg(long)]
+    rpc_url: String,
+    #[arg(long)]
+    reveal_txid: String,
+    #[arg(long)]
+    update_txid: String,
+    #[arg(long)]
+    renew_txid: String,
+    #[arg(long)]
+    release_txid: String,
+    #[arg(long, value_enum)]
+    expected_status: ReleaseBoundaryStatus,
 }
 
 fn local_consensus() -> LocalNetwork {
@@ -3226,6 +3251,268 @@ fn verify_release(args: VerifyReleaseArgs) -> Result<()> {
     Ok(())
 }
 
+fn verify_release_boundary(args: VerifyReleaseBoundaryArgs) -> Result<()> {
+    let params = local_consensus();
+    let v2 = v2_parameters();
+    let reveal_txid = parse_txid_hex(&args.reveal_txid)?;
+    let update_txid = parse_txid_hex(&args.update_txid)?;
+    let renew_txid = parse_txid_hex(&args.renew_txid)?;
+    let release_txid = parse_txid_hex(&args.release_txid)?;
+    let rendezvous = CoreRendezvous::try_new(
+        &REGTEST.rendezvous.orchard_ivk,
+        &REGTEST.rendezvous.orchard_receiver,
+    )
+    .map_err(|error| anyhow::anyhow!("construct Names rendezvous decoder: {error:?}"))?;
+    let app_id = names_application_id().to_bytes();
+    let mut source = source_for(&args.rpc_url)?;
+    let (_, transition_verifier, _, genesis_verifier) =
+        orchard::circuit::state_note_binding::keygen();
+    let names_verifier = OrchardV2ProofVerifier::from_parts(transition_verifier, genesis_verifier);
+    let lineage = replay_names_lineage(
+        &mut source,
+        &params,
+        &rendezvous,
+        app_id,
+        reveal_txid,
+        Some(update_txid),
+        Some(renew_txid),
+        Some(release_txid),
+        &names_verifier,
+    )?;
+    let expected_status = match args.expected_status {
+        ReleaseBoundaryStatus::Released => ResolutionStatus::Released,
+        ReleaseBoundaryStatus::Expired => ResolutionStatus::Expired,
+    };
+    ensure!(
+        lineage.full_status == expected_status,
+        "full replay status was {:?}, expected {:?}",
+        lineage.full_status,
+        expected_status
+    );
+    ensure!(
+        lineage.fresh_status == expected_status,
+        "FreshResolver status was {:?}, expected {:?}",
+        lineage.fresh_status,
+        expected_status
+    );
+    ensure!(
+        lineage.full_status == lineage.fresh_status,
+        "full replay and FreshResolver returned different statuses"
+    );
+    ensure!(
+        lineage.full_head == lineage.fresh_head,
+        "full replay and FreshResolver disagree at the RELEASE boundary"
+    );
+    ensure!(
+        lineage
+            .machine
+            .resolution_at(lineage.name_id, lineage.tip_height)
+            == expected_status,
+        "full replay machine status differs from the recorded boundary status"
+    );
+
+    let renew = lineage
+        .blocks
+        .values()
+        .flat_map(|block| block.transactions.iter())
+        .find(|transaction| transaction.txid == renew_txid)
+        .context("canonical RENEW transaction disappeared during boundary verification")?;
+    let renew_block = lineage
+        .blocks
+        .values()
+        .find(|block| block.transactions.iter().any(|tx| tx.txid == renew_txid))
+        .context("canonical RENEW block missing during boundary verification")?;
+    let renew_operation_index = renew
+        .operations
+        .iter()
+        .position(|operation| matches!(operation, V2Operation::Renew { .. }))
+        .context("canonical RENEW operation index missing")?;
+    let V2Operation::Renew {
+        state_commitment: renew_commitment,
+        state_nullifier: renew_nullifier,
+        action_index: renew_action_index,
+        ..
+    } = &renew.operations[renew_operation_index]
+    else {
+        bail!("canonical RENEW operation kind mismatch");
+    };
+    let renew_state_ref = StateRef::new(
+        ProducerPosition::new(renew_block.height, renew.tx_index, renew.txid),
+        *renew_action_index,
+        u32::try_from(renew_operation_index).context("RENEW operation index exceeds u32")?,
+        *renew_commitment,
+        *renew_nullifier,
+    );
+
+    let release = lineage
+        .blocks
+        .values()
+        .flat_map(|block| block.transactions.iter())
+        .find(|transaction| transaction.txid == release_txid)
+        .context("canonical RELEASE transaction disappeared during boundary verification")?;
+    let release_block = lineage
+        .blocks
+        .values()
+        .find(|block| block.transactions.iter().any(|tx| tx.txid == release_txid))
+        .context("canonical RELEASE block missing during boundary verification")?;
+    let release_operation_index = release
+        .operations
+        .iter()
+        .position(|operation| matches!(operation, V2Operation::Release { .. }))
+        .context("canonical RELEASE operation index missing")?;
+    let V2Operation::Release {
+        predecessor,
+        state,
+        state_commitment,
+        state_nullifier,
+        action_index,
+        ..
+    } = &release.operations[release_operation_index]
+    else {
+        bail!("canonical RELEASE operation kind mismatch");
+    };
+    ensure!(
+        *predecessor == renew_state_ref,
+        "canonical RELEASE predecessor is not the exact h27 RENEW state"
+    );
+    let release_action = release
+        .action(*action_index)
+        .context("canonical RELEASE designated action is absent")?;
+    ensure!(
+        release_action.nullifier == predecessor.nullifier
+            && release_action.commitment == *state_commitment,
+        "canonical RELEASE designated action does not match its operation"
+    );
+    let release_state_ref = StateRef::new(
+        ProducerPosition::new(release_block.height, release.tx_index, release.txid),
+        *action_index,
+        u32::try_from(release_operation_index).context("RELEASE operation index exceeds u32")?,
+        *state_commitment,
+        *state_nullifier,
+    );
+    ensure!(
+        renew_block.height == 27
+            && renew_state_ref.producer_action_index == 4
+            && renew_state_ref.producer_operation_index == 0
+            && release_block.height == 28
+            && release_state_ref.producer_action_index == 4
+            && release_state_ref.producer_operation_index == 0,
+        "canonical RELEASE lineage is not the qualified h27 -> h28 fixture"
+    );
+    ensure!(
+        lineage.fresh_anchor == Some(renew_state_ref),
+        "FreshResolver anchor changed away from the h27 RENEW state"
+    );
+    ensure!(
+        lineage.fresh_anchor != Some(release_state_ref),
+        "FreshResolver incorrectly used RELEASE as its discovery anchor"
+    );
+
+    let accepted = &lineage.full_head;
+    ensure!(
+        accepted.state_ref == release_state_ref,
+        "accepted RELEASE state reference does not match the canonical RELEASE"
+    );
+    ensure!(
+        accepted.data.name_id == lineage.name_id
+            && accepted.data.owner_pk == state.owner_pk
+            && accepted.data.sequence == 3
+            && accepted.data.record.as_slice() == UPDATE_RECORD.as_slice()
+            && accepted.data.lease_expiry == 59
+            && accepted.data.status == StateStatus::Released
+            && accepted.data.terminal_height == 28
+            && accepted.commitment == *state_commitment
+            && accepted.state_ref.nullifier == *state_nullifier,
+        "terminal RELEASE NameState changed across the claimability boundary"
+    );
+    let claimable_height = v2
+        .claimable_from(
+            accepted.data.status,
+            accepted.data.lease_expiry,
+            accepted.data.terminal_height,
+        )
+        .context("RELEASE claimable height overflow")?;
+    let last_blocked_height = claimable_height
+        .checked_sub(1)
+        .context("RELEASE claimable height has no preceding blocked height")?;
+    ensure!(
+        claimable_height == 32,
+        "qualified RELEASE claimability boundary changed: expected 32, got {claimable_height}"
+    );
+    match expected_status {
+        ResolutionStatus::Released => ensure!(
+            lineage.tip_height == last_blocked_height
+                && lineage.tip_height.checked_add(1) == Some(claimable_height),
+            "Released boundary verification must run at h{last_blocked_height}"
+        ),
+        ResolutionStatus::Expired => ensure!(
+            lineage.tip_height == claimable_height,
+            "Expired boundary verification must run at h{claimable_height}"
+        ),
+        _ => unreachable!("boundary verifier only admits Released or Expired"),
+    }
+
+    println!("ACTIVATION_HEIGHT={}", lineage.activation_height);
+    println!(
+        "ACTIVATION_PARENT_HASH={}",
+        hex::encode(lineage.activation_parent_hash)
+    );
+    println!("RELEASE_BOUNDARY_TIP={}", lineage.tip_height);
+    println!("RELEASE_CLAIMABLE_HEIGHT={claimable_height}");
+    println!("RELEASE_LAST_BLOCKED_HEIGHT={last_blocked_height}");
+    println!("NAMES_FULL_COMMIT_ACCEPTED=yes");
+    println!("NAMES_FULL_REVEAL_ACCEPTED=yes");
+    println!("NAMES_FULL_UPDATE_ACCEPTED=yes");
+    println!("NAMES_FULL_RENEW_ACCEPTED=yes");
+    println!("NAMES_FULL_RELEASE_ACCEPTED=yes");
+    println!("NAMES_FULL_REPLAY_STATUS={:?}", lineage.full_status);
+    println!("NAMES_FRESH_RESOLVER_STATUS={:?}", lineage.fresh_status);
+    println!("NAMES_FULL_FRESH_MATCH=yes");
+    println!("RELEASE_STATE_UNCHANGED=yes");
+    println!("RELEASE_FRESH_ANCHOR_UNCHANGED=yes");
+    println!("RELEASE_CANONICAL_HEIGHT={}", release_block.height);
+    println!("RELEASE_CANONICAL_TX_INDEX={}", release.tx_index);
+    println!("RELEASE_OPERATION_INDEX={release_operation_index}");
+    println!("RELEASE_ACTION_INDEX={action_index}");
+    println!("RELEASE_LEASE_EXPIRY={}", accepted.data.lease_expiry);
+    println!("RELEASE_TERMINAL_HEIGHT={}", accepted.data.terminal_height);
+    println!(
+        "RELEASE_FRESH_ANCHOR_HEIGHT={}",
+        renew_state_ref.producer_height
+    );
+    println!(
+        "RELEASE_FRESH_ANCHOR_TX_INDEX={}",
+        renew_state_ref.producer_tx_index
+    );
+    println!(
+        "RELEASE_FRESH_ANCHOR_TXID={}",
+        hex::encode(renew_state_ref.producer_txid)
+    );
+    println!(
+        "RELEASE_FRESH_ANCHOR_ACTION_INDEX={}",
+        renew_state_ref.producer_action_index
+    );
+    println!(
+        "RELEASE_FRESH_ANCHOR_OPERATION_INDEX={}",
+        renew_state_ref.producer_operation_index
+    );
+    println!("ACCEPTED_NAME_ID={}", hex::encode(accepted.data.name_id));
+    println!("ACCEPTED_OWNER_PK={}", hex::encode(accepted.data.owner_pk));
+    println!("ACCEPTED_SEQUENCE={}", accepted.data.sequence);
+    println!("ACCEPTED_RECORD_BYTES={}", accepted.data.record.len());
+    println!("ACCEPTED_LEASE_EXPIRY={}", accepted.data.lease_expiry);
+    println!("ACCEPTED_TERMINAL_HEIGHT={}", accepted.data.terminal_height);
+    println!(
+        "ACCEPTED_STATE_COMMITMENT={}",
+        hex::encode(accepted.commitment)
+    );
+    println!(
+        "ACCEPTED_STATE_FUTURE_NF={}",
+        hex::encode(accepted.state_ref.nullifier)
+    );
+    Ok(())
+}
+
 fn verify_update(args: VerifyUpdateArgs) -> Result<()> {
     let params = local_consensus();
     let reveal_txid = parse_txid_hex(&args.reveal_txid)?;
@@ -3892,5 +4179,6 @@ fn main() -> Result<()> {
         Command::VerifyRenew(args) => verify_renew(args),
         Command::Release(args) => release(args),
         Command::VerifyRelease(args) => verify_release(args),
+        Command::VerifyReleaseBoundary(args) => verify_release_boundary(args),
     }
 }
