@@ -109,6 +109,10 @@ enum Command {
     Update(UpdateArgs),
     /// Replay the canonical chain and verify one real v2 UPDATE.
     VerifyUpdate(VerifyUpdateArgs),
+    /// Spend the accepted state note without publishing a Names operation.
+    Abandon(AbandonArgs),
+    /// Replay and independently resolve an out-of-band state-note spend.
+    VerifyAbandon(VerifyAbandonArgs),
     /// Build, authorize, and submit one real v2 RENEW for the accepted name.
     Renew(RenewArgs),
     /// Replay the canonical chain and verify one real v2 RENEW.
@@ -123,6 +127,8 @@ enum Command {
     ReclaimCommit(CommonArgs),
     /// Build, authorize, and submit the replacement REVEAL for the claimable fixture name.
     ReclaimReveal(ReclaimRevealArgs),
+    /// Build, authorize, and submit a no-predecessor reset REVEAL.
+    ReclaimResetReveal(RevealArgs),
     /// Validate the canonical replacement lineage and COMMIT without proving.
     ReclaimCheck(ReclaimRevealArgs),
     /// Replay and independently resolve the accepted explicit replacement registration.
@@ -169,6 +175,21 @@ struct UpdateArgs {
     common: CommonArgs,
     #[arg(long)]
     reveal_txid: String,
+    /// Optional preceding RENEW, used by the retained-lineage fork probe.
+    #[arg(long)]
+    renew_txid: Option<String>,
+    /// Use a deterministic 64-byte replacement record for a fork probe.
+    #[arg(long)]
+    record_byte: Option<u8>,
+    /// Use a deterministic successor seed for a fork probe.
+    #[arg(long)]
+    successor_seed: Option<u8>,
+    /// Preserve the extracted transaction at this path instead of only submitting it.
+    #[arg(long)]
+    raw_path: Option<PathBuf>,
+    /// Build and extract without submitting; requires --raw-path.
+    #[arg(long)]
+    no_submit: bool,
 }
 
 #[derive(Args)]
@@ -177,8 +198,47 @@ struct VerifyUpdateArgs {
     rpc_url: String,
     #[arg(long)]
     reveal_txid: String,
+    /// Optional accepted RENEW immediately preceding this UPDATE.
+    #[arg(long)]
+    renew_txid: Option<String>,
     #[arg(long)]
     update_txid: String,
+    /// Expected deterministic record byte for the successor state.
+    #[arg(long)]
+    record_byte: Option<u8>,
+}
+
+#[derive(Args)]
+struct AbandonArgs {
+    #[command(flatten)]
+    common: CommonArgs,
+    #[arg(long)]
+    reveal_txid: String,
+    #[arg(long)]
+    update_txid: String,
+}
+
+#[derive(Args)]
+struct VerifyAbandonArgs {
+    #[arg(long)]
+    rpc_url: String,
+    #[arg(long)]
+    reveal_txid: String,
+    #[arg(long)]
+    update_txid: String,
+    #[arg(long)]
+    abandon_txid: String,
+    #[arg(long, default_value_t = 13)]
+    record_byte: u8,
+    #[arg(long, value_enum)]
+    expected_status: AbandonResolution,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+#[value(rename_all = "lower")]
+enum AbandonResolution {
+    Abandoned,
+    Expired,
 }
 
 #[derive(Args)]
@@ -1975,7 +2035,19 @@ fn verify_reclaim_renew(args: VerifyReclaimRenewArgs) -> Result<()> {
 
 fn update(args: UpdateArgs) -> Result<()> {
     let params = local_consensus();
+    let label = if args.no_submit {
+        "FORK_UPDATE"
+    } else {
+        "UPDATE"
+    };
     let reveal_txid = parse_txid_hex(&args.reveal_txid)?;
+    let renew_txid = args.renew_txid.as_deref().map(parse_txid_hex).transpose()?;
+    let update_record = args.record_byte.map_or(UPDATE_RECORD, |byte| [byte; 64]);
+    let successor_seed = args.successor_seed.unwrap_or(UPDATE_SUCCESSOR_SEED);
+    ensure!(
+        !args.no_submit || args.raw_path.is_some(),
+        "--no-submit requires --raw-path"
+    );
     let mut source = source_for(&args.common.rpc_url)?;
     let rendezvous = CoreRendezvous::try_new(
         &REGTEST.rendezvous.orchard_ivk,
@@ -1994,7 +2066,7 @@ fn update(args: UpdateArgs) -> Result<()> {
         app_id,
         reveal_txid,
         None,
-        None,
+        renew_txid,
         None,
         &names_verifier,
     )?;
@@ -2013,18 +2085,20 @@ fn update(args: UpdateArgs) -> Result<()> {
         "full replay and FreshResolver disagree before UPDATE construction"
     );
     let predecessor = lineage.full_head;
-    ensure!(
-        predecessor.data.sequence == 0,
-        "qualified UPDATE fixture requires the sequence-zero REVEAL head"
-    );
-    ensure!(
-        predecessor.data.record.as_slice() == RECORD.as_slice(),
-        "qualified UPDATE fixture has an unexpected predecessor record"
-    );
-    ensure!(
-        predecessor.data.lease_expiry == 55,
-        "qualified UPDATE fixture has an unexpected predecessor lease expiry"
-    );
+    if renew_txid.is_none() {
+        ensure!(
+            predecessor.data.sequence == 0,
+            "qualified UPDATE fixture requires the sequence-zero REVEAL head"
+        );
+        ensure!(
+            predecessor.data.record.as_slice() == RECORD.as_slice(),
+            "qualified UPDATE fixture has an unexpected predecessor record"
+        );
+        ensure!(
+            predecessor.data.lease_expiry == 55,
+            "qualified UPDATE fixture has an unexpected predecessor lease expiry"
+        );
+    }
     ensure!(
         predecessor.data.status == StateStatus::Active && predecessor.data.terminal_height == 0,
         "qualified UPDATE fixture predecessor is not active"
@@ -2101,7 +2175,7 @@ fn update(args: UpdateArgs) -> Result<()> {
     let predecessor_rho = Option::<Rho>::from(Rho::from_bytes(&predecessor_nf))
         .context("accepted predecessor nullifier is not a valid successor rho")?;
     let successor_rseed = Option::<RandomSeed>::from(RandomSeed::from_bytes(
-        [UPDATE_SUCCESSOR_SEED; 32],
+        [successor_seed; 32],
         &predecessor_rho,
     ))
     .context("construct deterministic UPDATE successor seed")?;
@@ -2132,7 +2206,7 @@ fn update(args: UpdateArgs) -> Result<()> {
             .sequence
             .checked_add(1)
             .context("UPDATE sequence overflow")?,
-        record: UPDATE_RECORD.to_vec(),
+        record: update_record.to_vec(),
         lease_expiry: predecessor.data.lease_expiry,
         status: StateStatus::Active,
         terminal_height: 0,
@@ -2181,10 +2255,15 @@ fn update(args: UpdateArgs) -> Result<()> {
         "Names UPDATE statement does not reflect the exact predecessor/successor"
     );
     ensure!(
-        statement.predecessor_sequence == 0
-            && statement.successor_sequence == 1
-            && statement.predecessor_lease_expiry == 55
-            && statement.successor_lease_expiry == 55
+        statement.predecessor_sequence == predecessor.data.sequence
+            && statement.successor_sequence
+                == predecessor
+                    .data
+                    .sequence
+                    .checked_add(1)
+                    .context("UPDATE statement sequence overflow")?
+            && statement.predecessor_lease_expiry == predecessor.data.lease_expiry
+            && statement.successor_lease_expiry == predecessor.data.lease_expiry
             && statement.operation_height == construction_height,
         "Names UPDATE statement has unexpected lifecycle fields"
     );
@@ -2376,52 +2455,328 @@ fn update(args: UpdateArgs) -> Result<()> {
     );
     let mut raw = Vec::new();
     extracted.transaction.write(&mut raw)?;
-    let update_txid = submit_raw(&args.common.rpc_url, &raw)?;
     let final_txid: [u8; 32] = extracted.txid.into();
-    ensure!(
-        update_txid == final_txid,
-        "node returned a different UPDATE txid"
-    );
+    if let Some(raw_path) = &args.raw_path {
+        std::fs::write(raw_path, &raw)
+            .with_context(|| format!("write extracted {label} transaction"))?;
+    }
+    if args.no_submit {
+        println!("{label}_SUBMITTED=no");
+    } else {
+        let submitted_txid = submit_raw(&args.common.rpc_url, &raw)?;
+        ensure!(
+            submitted_txid == final_txid,
+            "node returned a different {label} txid"
+        );
+        println!("{label}_SUBMITTED=yes");
+    }
 
-    println!("REVEAL_TXID={}", hex::encode(reveal_txid));
-    println!("UPDATE_CONSTRUCTION_HEIGHT={construction_height}");
-    println!("UPDATE_NAMES_PROOF_BYTES={}", transition_proof.len());
+    println!("{label}_REVEAL_TXID={}", hex::encode(reveal_txid));
+    if let Some(renew_txid) = renew_txid {
+        println!("{label}_RENEW_TXID={}", hex::encode(renew_txid));
+    }
+    println!("{label}_CONSTRUCTION_HEIGHT={construction_height}");
+    println!("{label}_NAMES_PROOF_BYTES={}", transition_proof.len());
     println!(
-        "UPDATE_NAMES_PROOF_ELAPSED_MS={}",
+        "{label}_NAMES_PROOF_ELAPSED_MS={}",
         names_proof_elapsed.as_millis()
     );
-    println!("CNV2_UPDATE_BYTES={}", encoded_update.len());
-    println!("CPV1_UPDATE_FRAMES={}", frames.len());
-    println!("UPDATE_TXID={}", hex::encode(final_txid));
-    println!("UPDATE_ACTION_INDEX={action_index}");
-    println!("UPDATE_PREDECESSOR_VALUE={predecessor_value}");
-    println!("UPDATE_ACTION_COUNT={}", extracted.action_count);
-    println!("UPDATE_REAL_SPENDS={}", extracted.real_spend_count);
-    println!("UPDATE_CARRIER_OUTPUTS={}", extracted.carrier_output_count);
-    println!("UPDATE_CHANGE_OUTPUTS={}", extracted.change_output_count);
-    println!("UPDATE_VALUE_BALANCE={}", extracted.ironwood_value_balance);
-    println!("UPDATE_ANCHOR_HEIGHT={anchor_height}");
-    println!("UPDATE_ANCHOR={}", hex::encode(anchor.to_bytes()));
-    println!("UPDATE_PREDECESSOR_NF={}", hex::encode(predecessor_nf));
-    println!("UPDATE_SUCCESSOR_CMX={}", hex::encode(successor_commitment));
+    println!("CNV2_{label}_BYTES={}", encoded_update.len());
+    println!("CPV1_{label}_FRAMES={}", frames.len());
+    println!("{label}_TXID={}", hex::encode(final_txid));
+    println!("{label}_ACTION_INDEX={action_index}");
+    println!("{label}_PREDECESSOR_VALUE={predecessor_value}");
+    println!("{label}_ACTION_COUNT={}", extracted.action_count);
+    println!("{label}_REAL_SPENDS={}", extracted.real_spend_count);
+    println!("{label}_CARRIER_OUTPUTS={}", extracted.carrier_output_count);
+    println!("{label}_CHANGE_OUTPUTS={}", extracted.change_output_count);
+    println!("{label}_VALUE_BALANCE={}", extracted.ironwood_value_balance);
+    println!("{label}_ANCHOR_HEIGHT={anchor_height}");
+    println!("{label}_ANCHOR={}", hex::encode(anchor.to_bytes()));
+    println!("{label}_PREDECESSOR_NF={}", hex::encode(predecessor_nf));
     println!(
-        "UPDATE_SUCCESSOR_FUTURE_NF={}",
+        "{label}_SUCCESSOR_CMX={}",
+        hex::encode(successor_commitment)
+    );
+    println!(
+        "{label}_SUCCESSOR_FUTURE_NF={}",
         hex::encode(successor_future_nf)
     );
     println!(
-        "CONSENSUS_PROOF_BYTES={}",
+        "{label}_CONSENSUS_PROOF_BYTES={}",
         extracted.ironwood_proof_byte_len
     );
     println!(
-        "CONSENSUS_PROOF_ELAPSED_MS={}",
+        "{label}_CONSENSUS_PROOF_ELAPSED_MS={}",
         consensus_proof_elapsed.as_millis()
     );
-    println!("UPDATE_TX_BYTES={}", raw.len());
+    println!("{label}_TX_BYTES={}", raw.len());
+    if let Some(raw_path) = args.raw_path {
+        println!("{label}_RAW_PATH={}", raw_path.display());
+    }
     println!("NAMES_APPLICATION_ID={}", hex::encode(app_id));
     println!(
         "RENDEZVOUS_RECEIVER={}",
         hex::encode(REGTEST.rendezvous.orchard_receiver)
     );
+    Ok(())
+}
+
+/// Builds one ordinary Ironwood spend of the accepted Names state note.  It
+/// deliberately publishes no Names carrier: the resulting canonical action
+/// is the live out-of-band-spend/abandonment fixture.
+fn abandon(args: AbandonArgs) -> Result<()> {
+    let params = local_consensus();
+    let reveal_txid = parse_txid_hex(&args.reveal_txid)?;
+    let update_txid = parse_txid_hex(&args.update_txid)?;
+    let mut source = source_for(&args.common.rpc_url)?;
+    let rendezvous = CoreRendezvous::try_new(
+        &REGTEST.rendezvous.orchard_ivk,
+        &REGTEST.rendezvous.orchard_receiver,
+    )
+    .map_err(|error| anyhow::anyhow!("construct Names rendezvous decoder: {error:?}"))?;
+    let app_id = names_application_id().to_bytes();
+    let (_, transition_verifier, _, genesis_verifier) =
+        orchard::circuit::state_note_binding::keygen();
+    let names_verifier = OrchardV2ProofVerifier::from_parts(transition_verifier, genesis_verifier);
+    let lineage = replay_names_lineage(
+        &mut source,
+        &params,
+        &rendezvous,
+        app_id,
+        reveal_txid,
+        Some(update_txid),
+        None,
+        None,
+        &names_verifier,
+    )?;
+    ensure!(
+        lineage.full_status == ResolutionStatus::Active
+            && lineage.fresh_status == ResolutionStatus::Active
+            && lineage.full_head == lineage.fresh_head,
+        "accepted Names state is not independently active before abandonment"
+    );
+    let predecessor = lineage.full_head;
+    ensure!(
+        predecessor.data.status == StateStatus::Active
+            && predecessor.data.terminal_height == 0
+            && lineage.tip_height < predecessor.data.lease_expiry,
+        "out-of-band spend predecessor is not currently payable"
+    );
+    let usk = wallet_usk(&params)?;
+    let names_fvk = FullViewingKey::from(usk.orchard());
+    let names_ask = SpendAuthorizingKey::from(usk.orchard());
+    let mut db = open_wallet(&args.common.wallet_dir, params)?;
+    let account_id = *db
+        .get_account_ids()?
+        .first()
+        .context("live wallet has no spending account")?;
+    let notes = selected_notes(&db, lineage.tip_height, account_id)?;
+    let predecessor_matches = notes
+        .iter()
+        .enumerate()
+        .filter(|(_, (note, _, _, _))| {
+            ExtractedNoteCommitment::from(note.commitment()).to_bytes() == predecessor.commitment
+        })
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    ensure!(
+        predecessor_matches.len() == 1,
+        "wallet must contain exactly one unspent accepted state note (found {})",
+        predecessor_matches.len()
+    );
+    let predecessor_index = predecessor_matches[0];
+    let (predecessor_note, predecessor_scope, predecessor_position, predecessor_value) = notes
+        .iter()
+        .enumerate()
+        .find_map(|(index, note)| (index == predecessor_index).then_some(*note))
+        .context("wallet predecessor note disappeared during selection")?;
+    let predecessor_nf = predecessor_note.nullifier(&names_fvk).to_bytes();
+    ensure!(
+        predecessor_nf == predecessor.state_ref.nullifier,
+        "wallet predecessor nullifier differs from accepted state reference"
+    );
+
+    let mut funding_notes = notes;
+    funding_notes.swap_remove(predecessor_index);
+    let funding_index = funding_notes
+        .iter()
+        .enumerate()
+        .max_by_key(|(_, (_, _, _, value))| *value)
+        .map(|(index, _)| index)
+        .context("live wallet has no separate Ironwood funding note")?;
+    let (funding_note, _funding_scope, funding_position, funding_value) =
+        funding_notes.swap_remove(funding_index);
+    let funding_nf = funding_note.nullifier(&names_fvk).to_bytes();
+    ensure!(
+        funding_nf != predecessor_nf && funding_position != predecessor_position,
+        "out-of-band funding note must be distinct from the state note"
+    );
+
+    let predecessor_rho = Option::<Rho>::from(Rho::from_bytes(&predecessor_nf))
+        .context("accepted predecessor nullifier is not a valid successor rho")?;
+    let successor_rseed =
+        Option::<RandomSeed>::from(RandomSeed::from_bytes([10; 32], &predecessor_rho))
+            .context("construct deterministic out-of-band successor seed")?;
+    let successor_note = Option::<Note>::from(Note::from_parts(
+        names_fvk.address_at(0u32, predecessor_scope),
+        predecessor_note.value(),
+        predecessor_rho,
+        successor_rseed,
+        NoteVersion::V3,
+    ))
+    .context("construct out-of-band successor note")?;
+    ensure!(
+        successor_note.value() == predecessor_note.value()
+            && successor_note.value().inner() == predecessor_value,
+        "out-of-band successor changed the state bond value"
+    );
+    let successor_commitment =
+        ExtractedNoteCommitment::from(successor_note.commitment()).to_bytes();
+    let successor_future_nf = successor_note.nullifier(&names_fvk).to_bytes();
+    let carrier_outputs = Vec::new();
+    let planned_shape = names_v2_ironwood_shape_from_counts(2, 0, 1, 0)?;
+    let required_fee = required_zip317_fee_for_names_v2(
+        &params,
+        BlockHeight::from_u32(
+            lineage
+                .tip_height
+                .checked_add(1)
+                .context("out-of-band spend height overflow")?,
+        ),
+        planned_shape,
+    )?;
+    let required_fee_value = required_fee.into_u64();
+    let change_value = funding_value
+        .checked_sub(required_fee_value)
+        .context("funding note cannot cover the out-of-band spend fee")?;
+    let plan = NamesV2IronwoodPlan {
+        designated_fvk: names_fvk.clone(),
+        designated_spend: predecessor_note,
+        successor_note,
+        successor_ovk: None,
+        successor_memo: [0; 512],
+        carrier_outputs,
+        funding_spends: vec![FundingSpend {
+            fvk: names_fvk.clone(),
+            note: funding_note,
+        }],
+        change_outputs: vec![ChangeOutput {
+            fvk: names_fvk.clone(),
+            ovk: None,
+            recipient: names_fvk.address_at(0u32, Scope::Internal),
+            value: orchard::value::NoteValue::from_raw(change_value),
+            memo: [0; 512],
+        }],
+        designated_action_index: 0,
+    };
+    ensure!(
+        names_v2_ironwood_shape(&plan)? == planned_shape,
+        "out-of-band plan shape changed after fee planning"
+    );
+    let built = build_names_v2_bundle(plan, OsRng)?;
+    ensure!(
+        built.action_count == planned_shape.action_count
+            && built.ironwood_value_balance
+                == i64::try_from(required_fee_value)
+                    .context("out-of-band ZIP-317 fee does not fit balance")?,
+        "out-of-band bundle shape or fee differs from planning"
+    );
+    verify_designated_action(
+        &built.bundle,
+        built.designated_action_index,
+        predecessor_nf,
+        successor_commitment,
+    )?;
+    let construction_height = lineage
+        .tip_height
+        .checked_add(1)
+        .context("out-of-band construction height overflow")?;
+    let anchor_height = db
+        .get_target_and_anchor_heights(NonZeroU32::MIN)?
+        .context("wallet has no synchronized target/anchor heights")?
+        .1;
+    let (anchor, paths) = wallet_witnesses(
+        &mut db,
+        anchor_height,
+        [predecessor_position, funding_position],
+    )?;
+    let complete = build_names_v2_pczt(NamesV2PcztPlan {
+        ironwood: built,
+        params,
+        consensus_branch_id: BranchId::Nu6_3,
+        expiry_height: BlockHeight::from_u32(construction_height),
+        fallback_lock_time: 0,
+    })?;
+    let finalized = finalize_names_v2_pczt_io(complete)?;
+    let witnessed = install_names_v2_ironwood_witnesses(
+        finalized,
+        NamesV2WitnessPlan {
+            anchor,
+            spends: vec![
+                NamesV2IronwoodWitness {
+                    nullifier: predecessor_nf,
+                    merkle_path: paths[0].clone(),
+                },
+                NamesV2IronwoodWitness {
+                    nullifier: funding_nf,
+                    merkle_path: paths[1].clone(),
+                },
+            ],
+        },
+    )?;
+    let consensus_proving_key = orchard::circuit::ProvingKey::build(
+        orchard::bundle::BundleVersion::ironwood_v3().circuit_version(),
+    );
+    let proof_started = Instant::now();
+    let proved = prove_names_v2_ironwood_pczt(witnessed, &consensus_proving_key)?;
+    let proof_elapsed = proof_started.elapsed();
+    let signed = sign_names_v2_ironwood_pczt(
+        proved,
+        NamesV2SigningPlan {
+            spends: vec![
+                zcash_devtool::names_v2_builder::NamesV2IronwoodSigningKey {
+                    nullifier: predecessor_nf,
+                    ask: names_ask,
+                },
+                zcash_devtool::names_v2_builder::NamesV2IronwoodSigningKey {
+                    nullifier: funding_nf,
+                    ask: SpendAuthorizingKey::from(usk.orchard()),
+                },
+            ],
+        },
+    )?;
+    let extracted = extract_names_v2_transaction(signed)?;
+    let mut raw = Vec::new();
+    extracted.transaction.write(&mut raw)?;
+    let txid = submit_raw(&args.common.rpc_url, &raw)?;
+    let final_txid: [u8; 32] = extracted.txid.into();
+    ensure!(txid == final_txid, "node returned a different ABANDON txid");
+    println!("ABANDON_TXID={}", hex::encode(final_txid));
+    println!("ABANDON_CONSTRUCTION_HEIGHT={construction_height}");
+    println!("ABANDON_PREDECESSOR_VALUE={predecessor_value}");
+    println!("ABANDON_PREDECESSOR_NF={}", hex::encode(predecessor_nf));
+    println!(
+        "ABANDON_SUCCESSOR_CMX={}",
+        hex::encode(successor_commitment)
+    );
+    println!(
+        "ABANDON_SUCCESSOR_FUTURE_NF={}",
+        hex::encode(successor_future_nf)
+    );
+    println!("ABANDON_ANCHOR_HEIGHT={anchor_height}");
+    println!("ABANDON_ANCHOR={}", hex::encode(anchor.to_bytes()));
+    println!("ABANDON_ACTION_COUNT={}", extracted.action_count);
+    println!("ABANDON_VALUE_BALANCE={}", extracted.ironwood_value_balance);
+    println!(
+        "ABANDON_CONSENSUS_PROOF_BYTES={}",
+        extracted.ironwood_proof_byte_len
+    );
+    println!(
+        "ABANDON_CONSENSUS_PROOF_ELAPSED_MS={}",
+        proof_elapsed.as_millis()
+    );
+    println!("ABANDON_TX_BYTES={}", raw.len());
     Ok(())
 }
 
@@ -3949,7 +4304,10 @@ fn verify_release_boundary(args: VerifyReleaseBoundaryArgs) -> Result<()> {
 fn verify_update(args: VerifyUpdateArgs) -> Result<()> {
     let params = local_consensus();
     let reveal_txid = parse_txid_hex(&args.reveal_txid)?;
+    let renew_txid = args.renew_txid.as_deref().map(parse_txid_hex).transpose()?;
     let update_txid = parse_txid_hex(&args.update_txid)?;
+    let expected_record = args.record_byte.map_or(UPDATE_RECORD, |byte| [byte; 64]);
+    let expected_sequence = if renew_txid.is_some() { 2 } else { 1 };
     let rendezvous = CoreRendezvous::try_new(
         &REGTEST.rendezvous.orchard_ivk,
         &REGTEST.rendezvous.orchard_receiver,
@@ -3967,7 +4325,7 @@ fn verify_update(args: VerifyUpdateArgs) -> Result<()> {
         app_id,
         reveal_txid,
         Some(update_txid),
-        None,
+        renew_txid,
         None,
         &names_verifier,
     )?;
@@ -4046,12 +4404,11 @@ fn verify_update(args: VerifyUpdateArgs) -> Result<()> {
     ensure!(
         accepted.data.name_id == lineage.name_id
             && accepted.data.owner_pk == state.owner_pk
-            && accepted.data.sequence == 1
-            && accepted.data.record.as_slice() == UPDATE_RECORD.as_slice()
-            && accepted.data.lease_expiry == 55
+            && accepted.data.sequence == expected_sequence
+            && accepted.data.record.as_slice() == expected_record.as_slice()
             && accepted.data.status == StateStatus::Active
             && accepted.data.terminal_height == 0,
-        "accepted UPDATE state values are not the expected sequence-one successor"
+        "accepted UPDATE state values are not the expected successor"
     );
     println!("ACTIVATION_HEIGHT={}", lineage.activation_height);
     println!(
@@ -4070,6 +4427,218 @@ fn verify_update(args: VerifyUpdateArgs) -> Result<()> {
     println!("UPDATE_ACTION_INDEX={action_index}");
     println!("ACCEPTED_NAME_ID={}", hex::encode(accepted.data.name_id));
     println!("ACCEPTED_OWNER_PK={}", hex::encode(accepted.data.owner_pk));
+    println!("ACCEPTED_SEQUENCE={}", accepted.data.sequence);
+    println!("ACCEPTED_RECORD_BYTES={}", accepted.data.record.len());
+    println!("ACCEPTED_LEASE_EXPIRY={}", accepted.data.lease_expiry);
+    println!(
+        "ACCEPTED_STATE_COMMITMENT={}",
+        hex::encode(accepted.commitment)
+    );
+    println!(
+        "ACCEPTED_STATE_FUTURE_NF={}",
+        hex::encode(accepted.state_ref.nullifier)
+    );
+    Ok(())
+}
+
+fn verify_abandon(args: VerifyAbandonArgs) -> Result<()> {
+    let params = local_consensus();
+    let v2 = v2_parameters();
+    let reveal_txid = parse_txid_hex(&args.reveal_txid)?;
+    let update_txid = parse_txid_hex(&args.update_txid)?;
+    let abandon_txid = parse_txid_hex(&args.abandon_txid)?;
+    let rendezvous = CoreRendezvous::try_new(
+        &REGTEST.rendezvous.orchard_ivk,
+        &REGTEST.rendezvous.orchard_receiver,
+    )
+    .map_err(|error| anyhow::anyhow!("construct Names rendezvous decoder: {error:?}"))?;
+    let app_id = names_application_id().to_bytes();
+    let mut source = source_for(&args.rpc_url)?;
+    let (_, transition_verifier, _, genesis_verifier) =
+        orchard::circuit::state_note_binding::keygen();
+    let names_verifier = OrchardV2ProofVerifier::from_parts(transition_verifier, genesis_verifier);
+    let lineage = replay_names_lineage(
+        &mut source,
+        &params,
+        &rendezvous,
+        app_id,
+        reveal_txid,
+        Some(update_txid),
+        None,
+        None,
+        &names_verifier,
+    )?;
+    let expected_status = match args.expected_status {
+        AbandonResolution::Abandoned => ResolutionStatus::Abandoned,
+        AbandonResolution::Expired => ResolutionStatus::Expired,
+    };
+    ensure!(
+        lineage.full_status == expected_status && lineage.fresh_status == expected_status,
+        "out-of-band spend resolution mismatch: full={:?}, fresh={:?}, expected={expected_status:?}",
+        lineage.full_status,
+        lineage.fresh_status
+    );
+    ensure!(
+        lineage.full_head == lineage.fresh_head,
+        "full replay and FreshResolver disagree after out-of-band spend"
+    );
+    ensure!(
+        lineage
+            .machine
+            .resolution_at(lineage.name_id, lineage.tip_height)
+            == expected_status,
+        "full replay machine status does not match its recorded abandonment status"
+    );
+    let abandon = lineage
+        .blocks
+        .values()
+        .flat_map(|block| block.transactions.iter())
+        .find(|transaction| transaction.txid == abandon_txid)
+        .context("canonical out-of-band spend disappeared during verification")?;
+    ensure!(
+        abandon.operations.is_empty(),
+        "out-of-band abandonment transaction unexpectedly carries a Names operation"
+    );
+    let matching_actions = abandon
+        .actions
+        .iter()
+        .filter(|action| action.nullifier == lineage.full_head.state_ref.nullifier)
+        .count();
+    ensure!(
+        matching_actions == 1,
+        "out-of-band spend must expose the accepted future nullifier exactly once"
+    );
+    let abandon_block = lineage
+        .blocks
+        .values()
+        .find(|block| block.transactions.iter().any(|tx| tx.txid == abandon_txid))
+        .context("canonical out-of-band spend block missing")?;
+    let abandoned_height = lineage
+        .full_head
+        .abandoned_height
+        .context("full replay did not record the out-of-band spend height")?;
+    ensure!(
+        abandoned_height == abandon_block.height,
+        "abandonment height does not match the canonical spend block"
+    );
+    let update = lineage
+        .blocks
+        .values()
+        .flat_map(|block| block.transactions.iter())
+        .find(|transaction| transaction.txid == update_txid)
+        .context("canonical UPDATE disappeared during abandonment verification")?;
+    let update_block = lineage
+        .blocks
+        .values()
+        .find(|block| block.transactions.iter().any(|tx| tx.txid == update_txid))
+        .context("canonical UPDATE block missing during abandonment verification")?;
+    let update_operation_index = update
+        .operations
+        .iter()
+        .position(|operation| matches!(operation, V2Operation::Update { .. }))
+        .context("canonical UPDATE operation index missing during abandonment verification")?;
+    let V2Operation::Update {
+        state,
+        state_commitment,
+        state_nullifier,
+        action_index,
+        ..
+    } = &update.operations[update_operation_index]
+    else {
+        bail!("canonical UPDATE operation kind mismatch during abandonment verification");
+    };
+    let expected_update_ref = StateRef::new(
+        ProducerPosition::new(update_block.height, update.tx_index, update.txid),
+        *action_index,
+        u32::try_from(update_operation_index).context("UPDATE operation index exceeds u32")?,
+        *state_commitment,
+        *state_nullifier,
+    );
+    let accepted = &lineage.full_head;
+    ensure!(
+        accepted.state_ref == expected_update_ref
+            && accepted.data.name_id == lineage.name_id
+            && accepted.data.owner_pk == state.owner_pk
+            && accepted.data.sequence == 1
+            && accepted.data.record.as_slice() == [args.record_byte; 64].as_slice()
+            && accepted.data.status == StateStatus::Active
+            && accepted.data.terminal_height == 0,
+        "accepted state changed unexpectedly when its note was spent"
+    );
+    let claimable_height = v2
+        .head_claimable_from(&accepted.data, Some(abandoned_height))
+        .context("abandonment claimability height overflow")?;
+    match args.expected_status {
+        AbandonResolution::Abandoned => ensure!(
+            lineage.tip_height < claimable_height,
+            "Abandoned verification must run before claimability"
+        ),
+        AbandonResolution::Expired => ensure!(
+            lineage.tip_height == claimable_height,
+            "Expired verification must run at the exact abandonment claimability height"
+        ),
+    }
+    let reveal = lineage
+        .blocks
+        .values()
+        .flat_map(|block| block.transactions.iter())
+        .find(|transaction| transaction.txid == reveal_txid)
+        .context("canonical REVEAL missing during abandonment verification")?;
+    let reveal_block = lineage
+        .blocks
+        .values()
+        .find(|block| block.transactions.iter().any(|tx| tx.txid == reveal_txid))
+        .context("canonical REVEAL block missing during abandonment verification")?;
+    let V2Operation::Reveal {
+        state_commitment,
+        state_nullifier,
+        action_index,
+        ..
+    } = &reveal.operations[0]
+    else {
+        bail!("canonical REVEAL operation mismatch during abandonment verification");
+    };
+    let reveal_ref = StateRef::new(
+        ProducerPosition::new(reveal_block.height, reveal.tx_index, reveal.txid),
+        *action_index,
+        0,
+        *state_commitment,
+        *state_nullifier,
+    );
+    ensure!(
+        lineage.fresh_anchor == Some(reveal_ref),
+        "FreshResolver discovery anchor changed after an out-of-band spend"
+    );
+
+    println!("NAMES_FULL_COMMIT_ACCEPTED=yes");
+    println!("NAMES_FULL_REVEAL_ACCEPTED=yes");
+    println!("NAMES_FULL_UPDATE_ACCEPTED=yes");
+    println!("NAMES_FULL_REPLAY_STATUS={:?}", lineage.full_status);
+    println!("NAMES_FRESH_RESOLVER_STATUS={:?}", lineage.fresh_status);
+    println!("NAMES_FULL_FRESH_MATCH=yes");
+    println!("ABANDON_TXID={}", hex::encode(abandon_txid));
+    println!("ABANDON_CANONICAL_HEIGHT={}", abandon_block.height);
+    println!("ABANDON_CLAIMABLE_HEIGHT={claimable_height}");
+    println!("ABANDONED_HEIGHT={abandoned_height}");
+    println!("ABANDON_STATE_UNCHANGED=yes");
+    println!("ABANDON_FRESH_ANCHOR_UNCHANGED=yes");
+    println!("ABANDON_FRESH_ANCHOR_HEIGHT={}", reveal_ref.producer_height);
+    println!(
+        "ABANDON_FRESH_ANCHOR_TX_INDEX={}",
+        reveal_ref.producer_tx_index
+    );
+    println!(
+        "ABANDON_FRESH_ANCHOR_TXID={}",
+        hex::encode(reveal_ref.producer_txid)
+    );
+    println!(
+        "ABANDON_FRESH_ANCHOR_ACTION_INDEX={}",
+        reveal_ref.producer_action_index
+    );
+    println!(
+        "ABANDON_FRESH_ANCHOR_OPERATION_INDEX={}",
+        reveal_ref.producer_operation_index
+    );
     println!("ACCEPTED_SEQUENCE={}", accepted.data.sequence);
     println!("ACCEPTED_RECORD_BYTES={}", accepted.data.record.len());
     println!("ACCEPTED_LEASE_EXPIRY={}", accepted.data.lease_expiry);
@@ -4315,6 +4884,7 @@ fn verify(args: VerifyArgs) -> Result<()> {
     let V2Operation::Reveal {
         intent,
         commit: commit_ref,
+        replacement_predecessor,
         state,
         state_commitment,
         state_nullifier,
@@ -4343,6 +4913,10 @@ fn verify(args: VerifyArgs) -> Result<()> {
     ensure!(
         commit_ref.position.height == commit_block.height,
         "REVEAL CommitRef height mismatch"
+    );
+    ensure!(
+        replacement_predecessor.is_none(),
+        "canonical reset REVEAL unexpectedly carries a replacement predecessor"
     );
     ensure!(
         commit_ref.position.tx_index == commit.tx_index,
@@ -4584,6 +5158,7 @@ fn verify(args: VerifyArgs) -> Result<()> {
     println!("REVEAL_CANONICAL_HEIGHT={}", reveal_block.height);
     println!("REVEAL_CANONICAL_TX_INDEX={}", reveal.tx_index);
     println!("REVEAL_ACTION_INDEX={action_index}");
+    println!("NO_PREDECESSOR_RESET=yes");
     println!("ACCEPTED_NAME_ID={}", hex::encode(accepted.data.name_id));
     println!("ACCEPTED_OWNER_PK={}", hex::encode(accepted.data.owner_pk));
     println!("ACCEPTED_SEQUENCE={}", accepted.data.sequence);
@@ -4608,6 +5183,8 @@ fn main() -> Result<()> {
         Command::Verify(args) => verify(args),
         Command::Update(args) => update(args),
         Command::VerifyUpdate(args) => verify_update(args),
+        Command::Abandon(args) => abandon(args),
+        Command::VerifyAbandon(args) => verify_abandon(args),
         Command::Renew(args) => renew(args),
         Command::VerifyRenew(args) => verify_renew(args),
         Command::Release(args) => release(args),
@@ -4615,6 +5192,14 @@ fn main() -> Result<()> {
         Command::VerifyReleaseBoundary(args) => verify_release_boundary(args),
         Command::ReclaimCommit(args) => build_reclaim_commit(args),
         Command::ReclaimReveal(args) => reclaim_reveal(args),
+        Command::ReclaimResetReveal(args) => reveal_with_replacement(
+            args,
+            RECLAIM_RECORD,
+            RECLAIM_SECRET,
+            RECLAIM_SUCCESSOR_SEED,
+            None,
+            "RESET_REVEAL",
+        ),
         Command::ReclaimCheck(args) => reclaim_check(args),
         Command::VerifyReclaim(args) => verify_reclaim(args),
         Command::VerifyReclaimRenew(args) => verify_reclaim_renew(args),
