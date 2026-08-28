@@ -1553,7 +1553,7 @@ mod tests {
         v2::{
             CommitRef, GenesisStatement, IronwoodActionRef, NameState, OrchardV2ProofProver,
             ProducerPosition, RegistrationIntent, StateData, StateRef, StateStatus, V2Operation,
-            decode_operation, encode_operation, operation_footprint,
+            V2Parameters, decode_operation, encode_operation, operation_footprint,
         },
     };
     use incrementalmerkletree::{Marking, Position, Retention};
@@ -2482,6 +2482,9 @@ mod tests {
         };
         let name_id = intent.name_id().unwrap();
         let intent_commitment = intent.commitment().unwrap();
+        let v2 = V2Parameters::testing();
+        let operation_height = coppice_names::v2::schedule::next_anchor_height(name_id, 901, v2)
+            .expect("synthetic REVEAL needs a scheduled height");
 
         // This CommitRef is deliberately synthetic. It gives the offline
         // envelope a canonical predecessor shape, but establishes no chain
@@ -2493,12 +2496,12 @@ mod tests {
             owner_pk,
             sequence: 0,
             record: intent.record.clone(),
-            lease_expiry: 1_000,
+            lease_expiry: v2.lease_expiry(operation_height).unwrap(),
             status: StateStatus::Active,
             terminal_height: 0,
         };
         let state_ref = StateRef::new(
-            ProducerPosition::new(901, 0, [4; 32]),
+            ProducerPosition::new(operation_height, 0, [4; 32]),
             ACTION_INDEX,
             0,
             successor_commitment,
@@ -2510,7 +2513,8 @@ mod tests {
             nullifier: registration_nullifier,
             commitment: successor_commitment,
         };
-        let statement = GenesisStatement::from_state(&state, action, MINIMUM_BOND).unwrap();
+        let statement =
+            GenesisStatement::from_reveal(&intent, &state, action, operation_height, v2).unwrap();
 
         assert_eq!(statement.name_id, name_id);
         assert_eq!(statement.owner_pk, owner_pk);
@@ -2524,7 +2528,6 @@ mod tests {
             successor_note,
             &names_fvk,
             Scope::External,
-            &names_ask,
             MINIMUM_BOND,
         )
         .expect("the funded registration/successor notes form a genesis witness");

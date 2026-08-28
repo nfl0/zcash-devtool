@@ -271,14 +271,19 @@ pub fn prepare_reveal(inputs: RevealInputs, params: V2Parameters) -> Result<Reve
         nullifier: registration_nullifier,
         commitment: successor_commitment,
     };
-    let statement = GenesisStatement::from_state(&state, action, params.minimum_bond_zatoshis)
-        .map_err(|error| anyhow::anyhow!("construct Names v2 genesis statement: {error:?}"))?;
+    let statement = GenesisStatement::from_reveal(
+        &intent,
+        &state,
+        action,
+        operation_height,
+        params,
+    )
+    .map_err(|error| anyhow::anyhow!("construct Names v2 genesis statement: {error:?}"))?;
     let witness = GenesisWitness::new(
         registration_note.clone(),
         successor_note.clone(),
         &fvk,
         scope,
-        &ask,
         params.minimum_bond_zatoshis,
     )
     .context("registration bond does not satisfy the genesis minimum")?;
@@ -394,14 +399,18 @@ pub struct TransitionPreparation {
 /// predecessor owner, lease, Active status, and zero terminal height, with
 /// sequence increased by one. The record must differ from the predecessor
 /// record, as the state machine requires.
-pub fn prepare_update(inputs: TransitionInputs, record: Vec<u8>) -> Result<TransitionPreparation> {
+pub fn prepare_update(
+    inputs: TransitionInputs,
+    record: Vec<u8>,
+    params: V2Parameters,
+) -> Result<TransitionPreparation> {
     ensure!(
         record != inputs.predecessor.data.record,
         "UPDATE must change the canonical record"
     );
     let mut successor_data = active_successor_data(&inputs.predecessor.data)?;
     successor_data.record = record;
-    prepare_transition(inputs, successor_data, OperationKind::Update)
+    prepare_transition(inputs, successor_data, OperationKind::Update, params)
 }
 
 /// Prepares a canonical RENEW from typed inputs.
@@ -429,7 +438,7 @@ pub fn prepare_renew(
     );
     let mut successor_data = active_successor_data(&inputs.predecessor.data)?;
     successor_data.lease_expiry = lease_expiry;
-    prepare_transition(inputs, successor_data, OperationKind::Renew)
+    prepare_transition(inputs, successor_data, OperationKind::Renew, params)
 }
 
 /// Prepares a canonical RELEASE from typed inputs.
@@ -437,11 +446,14 @@ pub fn prepare_renew(
 /// The successor preserves the predecessor record, owner, and lease, carries
 /// `Released` status, and terminates at `inputs.operation_height`, with
 /// sequence increased by one.
-pub fn prepare_release(inputs: TransitionInputs) -> Result<TransitionPreparation> {
+pub fn prepare_release(
+    inputs: TransitionInputs,
+    params: V2Parameters,
+) -> Result<TransitionPreparation> {
     let mut successor_data = active_successor_data(&inputs.predecessor.data)?;
     successor_data.status = StateStatus::Released;
     successor_data.terminal_height = inputs.operation_height;
-    prepare_transition(inputs, successor_data, OperationKind::Release)
+    prepare_transition(inputs, successor_data, OperationKind::Release, params)
 }
 
 impl TransitionPreparation {
@@ -828,6 +840,7 @@ fn prepare_transition(
     inputs: TransitionInputs,
     successor_data: StateData,
     kind: OperationKind,
+    params: V2Parameters,
 ) -> Result<TransitionPreparation> {
     let TransitionInputs {
         predecessor,
@@ -893,17 +906,20 @@ fn prepare_transition(
         nullifier: predecessor_nullifier,
         commitment: successor_commitment,
     };
-    let statement =
-        TransitionStatement::from_states(&predecessor, &successor, action, kind, operation_height)
-            .map_err(|error| {
-                anyhow::anyhow!("construct Names v2 transition statement: {error:?}")
-            })?;
+    let statement = TransitionStatement::from_states(
+        &predecessor,
+        &successor,
+        action,
+        kind,
+        operation_height,
+        params,
+    )
+    .map_err(|error| anyhow::anyhow!("construct Names v2 transition statement: {error:?}"))?;
     let witness = TransitionWitness::new(
         predecessor_note.clone(),
+        successor_note.clone(),
         &fvk,
         scope,
-        &ask,
-        successor_note.clone(),
     );
     Ok(TransitionPreparation {
         statement,
@@ -1391,6 +1407,7 @@ mod tests {
                 successor_seed: [10; 32],
             },
             update_record.clone(),
+            params,
         )
         .unwrap();
 
@@ -1482,6 +1499,7 @@ mod tests {
                     successor_seed: [10; 32],
                 },
                 predecessor.data.record.clone(),
+                params,
             )
             .is_err()
         );
@@ -1627,16 +1645,19 @@ mod tests {
         let predecessor = accepted_head(reveal_finalized.operation(), reveal_height, [7; 32]);
 
         let release_height = reveal_height + 1;
-        let release_preparation = prepare_release(TransitionInputs {
-            predecessor: predecessor.clone(),
-            predecessor_note: predecessor_note.clone(),
-            scope: Scope::External,
-            fvk: fvk.clone(),
-            ask: ask.clone(),
-            operation_height: release_height,
-            designated_action_index: 0,
-            successor_seed: [11; 32],
-        })
+        let release_preparation = prepare_release(
+            TransitionInputs {
+                predecessor: predecessor.clone(),
+                predecessor_note: predecessor_note.clone(),
+                scope: Scope::External,
+                fvk: fvk.clone(),
+                ask: ask.clone(),
+                operation_height: release_height,
+                designated_action_index: 0,
+                successor_seed: [11; 32],
+            },
+            params,
+        )
         .unwrap();
 
         let statement = release_preparation.statement();
@@ -1694,16 +1715,19 @@ mod tests {
         // A transition at or beyond the predecessor lease is invalid.
         let lease = predecessor.data.lease_expiry;
         assert!(
-            prepare_release(TransitionInputs {
-                predecessor,
-                predecessor_note,
-                scope: Scope::External,
-                fvk: fvk.clone(),
-                ask: ask.clone(),
-                operation_height: lease,
-                designated_action_index: 0,
-                successor_seed: [11; 32],
-            })
+            prepare_release(
+                TransitionInputs {
+                    predecessor,
+                    predecessor_note,
+                    scope: Scope::External,
+                    fvk: fvk.clone(),
+                    ask: ask.clone(),
+                    operation_height: lease,
+                    designated_action_index: 0,
+                    successor_seed: [11; 32],
+                },
+                params,
+            )
             .is_err()
         );
     }
@@ -1750,6 +1774,7 @@ mod tests {
                 successor_seed: [10; 32],
             },
             vec![6; 40],
+            params,
         )
         .unwrap();
         let finalized = update_preparation.finalize(vec![0xA5; 1_920]).unwrap();

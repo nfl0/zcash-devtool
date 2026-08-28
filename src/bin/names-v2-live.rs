@@ -2004,6 +2004,7 @@ fn update(args: UpdateArgs) -> Result<()> {
         "full replay and FreshResolver disagree before UPDATE construction"
     );
     let predecessor = lineage.full_head;
+    let v2 = v2_parameters();
     if renew_txid.is_none() {
         ensure!(
             predecessor.data.sequence == 0,
@@ -2013,7 +2014,6 @@ fn update(args: UpdateArgs) -> Result<()> {
             predecessor.data.record.as_slice() == RECORD.as_slice(),
             "qualified UPDATE fixture has an unexpected predecessor record"
         );
-        let v2 = v2_parameters();
         ensure!(
             predecessor.data.lease_expiry
                 == v2
@@ -2106,6 +2106,7 @@ fn update(args: UpdateArgs) -> Result<()> {
             successor_seed: [successor_seed; 32],
         },
         update_record.to_vec(),
+        v2,
     )?;
     let successor_commitment = preparation.statement().successor_commitment;
     let successor_future_nf = preparation.statement().successor_nullifier;
@@ -2913,8 +2914,8 @@ fn release(args: ReleaseArgs) -> Result<()> {
         "full replay and FreshResolver disagree before RELEASE construction"
     );
     let predecessor = lineage.full_head;
+    let v2 = v2_parameters();
     {
-        let v2 = v2_parameters();
         ensure!(
             predecessor.data.sequence == 2
                 && predecessor.data.record.as_slice() == UPDATE_RECORD.as_slice()
@@ -3030,16 +3031,19 @@ fn release(args: ReleaseArgs) -> Result<()> {
         "RELEASE funding position must differ from the predecessor position"
     );
 
-    let preparation = prepare_release(TransitionInputs {
-        predecessor: predecessor.clone(),
-        predecessor_note,
-        scope: predecessor_scope,
-        fvk: names_fvk.clone(),
-        ask: names_ask.clone(),
-        operation_height: construction_height,
-        designated_action_index: RELEASE_ACTION_INDEX,
-        successor_seed: [RELEASE_SUCCESSOR_SEED; 32],
-    })?;
+    let preparation = prepare_release(
+        TransitionInputs {
+            predecessor: predecessor.clone(),
+            predecessor_note,
+            scope: predecessor_scope,
+            fvk: names_fvk.clone(),
+            ask: names_ask.clone(),
+            operation_height: construction_height,
+            designated_action_index: RELEASE_ACTION_INDEX,
+            successor_seed: [RELEASE_SUCCESSOR_SEED; 32],
+        },
+        v2,
+    )?;
     let successor_commitment = preparation.statement().successor_commitment;
     let successor_future_nf = preparation.statement().successor_nullifier;
     let names_proof_started = Instant::now();
