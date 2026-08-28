@@ -16,10 +16,7 @@ use std::{
 use anyhow::{Context, Result, bail, ensure};
 use bip0039::{English, Mnemonic};
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use coppice::{
-    carrier::CoreRendezvous,
-    transport::{encode_frames, reconstruct_frames},
-};
+use coppice::{carrier::CoreRendezvous, transport::reconstruct_frames};
 use coppice_librustzcash::{CanonicalBlockSource, FullTransactionSource};
 use coppice_names::{
     carrier::bulletin_address,
@@ -27,14 +24,13 @@ use coppice_names::{
     names_application::names_application_id,
     v2::{
         AppliedOperationKind, AppliedOperationResult, CanonicalBlock, CanonicalTransaction,
-        CommitRef, FreshResolver, GenesisStatement, IronwoodActionRef, NameState, OperationKind,
-        OrchardV2ProofProver, OrchardV2ProofVerifier, ProducerPosition, RegistrationIntent,
-        ResolutionStatus, StateData, StateRef, StateStatus, TransitionStatement, V2Operation,
-        V2Parameters, V2StateMachine, decode_operation, encode_operation, operation_footprint,
+        CommitRef, FreshResolver, IronwoodActionRef, NameState, OrchardV2ProofProver,
+        OrchardV2ProofVerifier, ProducerPosition, RegistrationIntent, ResolutionStatus, StateRef,
+        StateStatus, V2Operation, V2Parameters, V2StateMachine, decode_operation,
     },
 };
 use orchard::{
-    circuit::state_note_binding::{GenesisWitness, TransitionWitness, spend_auth_owner_key_bytes},
+    circuit::state_note_binding::spend_auth_owner_key_bytes,
     keys::{FullViewingKey, Scope, SpendAuthorizingKey},
     note::{ExtractedNoteCommitment, Note, NoteVersion, RandomSeed, Rho},
 };
@@ -63,12 +59,15 @@ use zcash_protocol::{
 use zip321::{Payment, TransactionRequest};
 
 use zcash_devtool::names_v2_builder::{
-    CarrierOutput, ChangeOutput, FundingSpend, NamesV2IronwoodPlan, NamesV2IronwoodWitness,
-    NamesV2PcztPlan, NamesV2SigningPlan, NamesV2WitnessPlan, build_names_v2_bundle,
-    build_names_v2_pczt, extract_names_v2_transaction, finalize_names_v2_pczt_io,
-    install_names_v2_ironwood_witnesses, names_v2_ironwood_shape,
-    names_v2_ironwood_shape_from_counts, prove_names_v2_ironwood_pczt,
+    ChangeOutput, FundingSpend, NamesV2IronwoodPlan, NamesV2IronwoodWitness, NamesV2PcztPlan,
+    NamesV2SigningPlan, NamesV2WitnessPlan, build_names_v2_bundle, build_names_v2_pczt,
+    extract_names_v2_transaction, finalize_names_v2_pczt_io, install_names_v2_ironwood_witnesses,
+    names_v2_ironwood_shape, names_v2_ironwood_shape_from_counts, prove_names_v2_ironwood_pczt,
     required_zip317_fee_for_names_v2, sign_names_v2_ironwood_pczt, verify_designated_action,
+};
+use zcash_devtool::names_v2_operation::{
+    RevealInputs, SingleFunding, TransitionInputs, plan_state_operation, prepare_commit,
+    prepare_release, prepare_renew, prepare_reveal, prepare_update,
 };
 
 const NAME: &str = "footprint";
@@ -538,29 +537,23 @@ fn build_commit_for(
     let usk = wallet_usk(&params)?;
     let ask = SpendAuthorizingKey::from(usk.orchard());
     let intent = registration_intent(&ask, record, secret)?;
-    let commitment = intent
-        .commitment()
-        .map_err(|error| anyhow::anyhow!("derive COMMIT commitment: {error:?}"))?;
-    let operation = V2Operation::Commit { commitment };
-    let encoded = encode_operation(&operation)
-        .map_err(|error| anyhow::anyhow!("encode COMMIT operation: {error:?}"))?;
-    let decoded = decode_operation(&encoded)
-        .map_err(|error| anyhow::anyhow!("decode COMMIT operation: {error:?}"))?;
-    ensure!(decoded == operation, "COMMIT wire round-trip mismatch");
-    let app_id = names_application_id().to_bytes();
-    let frames = encode_frames(app_id, &encoded)
-        .map_err(|error| anyhow::anyhow!("frame COMMIT operation: {error:?}"))?;
-    ensure!(
-        frames.len() == 1,
-        "deterministic COMMIT must fit one CPV1 frame"
-    );
-    let raw = build_wallet_carrier_transaction(&args.wallet_dir, build_carrier_request(&frames)?)?;
+    let prepared = prepare_commit(&intent)?;
+    let commitment = prepared.commitment();
+    let operation_bytes = prepared.encoded().len();
+    let frame_count = prepared.frames().len();
+    let raw = build_wallet_carrier_transaction(
+        &args.wallet_dir,
+        build_carrier_request(prepared.frames())?,
+    )?;
     let txid = submit_raw(&args.rpc_url, &raw)?;
     println!("{label}_TXID={}", hex::encode(txid));
     println!("{label}_COMMITMENT={}", hex::encode(commitment));
-    println!("{label}_OPERATION_BYTES={}", encoded.len());
-    println!("{label}_CPV1_FRAMES={}", frames.len());
-    println!("NAMES_APPLICATION_ID={}", hex::encode(app_id));
+    println!("{label}_OPERATION_BYTES={operation_bytes}");
+    println!("{label}_CPV1_FRAMES={frame_count}");
+    println!(
+        "NAMES_APPLICATION_ID={}",
+        hex::encode(names_application_id().to_bytes())
+    );
     println!(
         "RENDEZVOUS_RECEIVER={}",
         hex::encode(REGTEST.rendezvous.orchard_receiver)
@@ -1409,9 +1402,6 @@ fn reveal_with_replacement(
         construction_height - commit_height <= v2.commit_ttl_blocks,
         "canonical COMMIT is outside its v2 lifetime"
     );
-    let lease_expiry = v2
-        .lease_expiry(construction_height)
-        .context("Names v2 lease expiry overflow")?;
 
     let mut db = open_wallet(&args.common.wallet_dir, params)?;
     let account_id = *db
@@ -1435,187 +1425,64 @@ fn reveal_with_replacement(
     let registration_note = registration.0;
     let funding_note = funding.0;
     let registration_nf = registration_note.nullifier(&names_fvk).to_bytes();
-    let successor_note = {
-        let rho = Option::<Rho>::from(Rho::from_bytes(&registration_nf))
-            .context("registration nullifier is not a valid successor rho")?;
-        let rseed = Option::<RandomSeed>::from(RandomSeed::from_bytes([successor_seed; 32], &rho))
-            .context("construct deterministic successor note seed")?;
-        Option::<Note>::from(Note::from_parts(
-            names_fvk.address_at(0u32, registration.1),
-            registration_note.value(),
-            rho,
-            rseed,
-            NoteVersion::V3,
-        ))
-        .context("construct exact successor state note")?
-    };
-    let successor_commitment =
-        ExtractedNoteCommitment::from(successor_note.commitment()).to_bytes();
-    let successor_future_nf = successor_note.nullifier(&names_fvk).to_bytes();
-    let state_data = StateData {
-        name_id,
-        owner_pk: intent.owner_pk,
-        sequence: 0,
-        record: intent.record.clone(),
-        lease_expiry,
-        status: StateStatus::Active,
-        terminal_height: 0,
-    };
-    // The final producer position is only known after this transaction is
-    // mined. GenesisStatement authenticates the state fields and action; the
-    // canonical replay path reconstructs the real StateRef from the mined tx.
-    let state_ref = StateRef::new(
-        ProducerPosition::new(construction_height, 0, [0; 32]),
-        ACTION_INDEX,
-        0,
-        successor_commitment,
-        successor_future_nf,
-    );
-    let state = NameState::new(state_data.clone(), successor_commitment, state_ref)
-        .map_err(|error| anyhow::anyhow!("construct Names state: {error:?}"))?;
-    let action = IronwoodActionRef {
-        action_index: ACTION_INDEX,
-        nullifier: registration_nf,
-        commitment: successor_commitment,
-    };
-    let statement = GenesisStatement::from_state(&state, action, v2.minimum_bond_zatoshis)
-        .map_err(|error| anyhow::anyhow!("construct Names genesis statement: {error:?}"))?;
-    let witness = GenesisWitness::new(
-        registration_note,
-        successor_note,
-        &names_fvk,
-        registration.1,
-        &names_ask,
-        v2.minimum_bond_zatoshis,
-    )
-    .context("construct real Names genesis witness")?;
+    let preparation = prepare_reveal(
+        RevealInputs {
+            intent,
+            commit,
+            replacement_predecessor,
+            registration_note,
+            scope: registration.1,
+            fvk: names_fvk.clone(),
+            ask: names_ask.clone(),
+            designated_action_index: ACTION_INDEX,
+            operation_height: construction_height,
+            successor_seed: [successor_seed; 32],
+        },
+        v2,
+    )?;
+    let successor_commitment = preparation.statement().commitment;
+    let successor_future_nf = preparation.statement().state_nullifier;
+    let lease_expiry = preparation.statement().lease_expiry;
     let names_prover = OrchardV2ProofProver::new();
     let proof_started = Instant::now();
     let genesis_proof = names_prover
-        .prove_genesis(&statement, witness, OsRng)
+        .prove_genesis(
+            preparation.statement(),
+            preparation.witness().clone(),
+            OsRng,
+        )
         .map_err(|error| anyhow::anyhow!("create Names genesis proof: {error:?}"))?;
     let proof_elapsed = proof_started.elapsed();
-    ensure!(!genesis_proof.is_empty(), "Names genesis proof is empty");
-
-    let reveal = V2Operation::Reveal {
-        intent: Box::new(intent),
-        commit,
-        replacement_predecessor,
-        state: state_data,
-        state_commitment: successor_commitment,
-        state_nullifier: successor_future_nf,
-        action_index: ACTION_INDEX,
-        proof: genesis_proof.clone(),
-    };
-    let encoded_reveal = encode_operation(&reveal)
-        .map_err(|error| anyhow::anyhow!("encode REVEAL operation: {error:?}"))?;
-    let decoded_reveal = decode_operation(&encoded_reveal)
-        .map_err(|error| anyhow::anyhow!("decode REVEAL operation: {error:?}"))?;
-    ensure!(decoded_reveal == reveal, "REVEAL wire round-trip mismatch");
-    let footprint = operation_footprint(&reveal)
-        .map_err(|error| anyhow::anyhow!("measure REVEAL operation: {error:?}"))?;
-    let frames = encode_frames(app_id, &encoded_reveal)
-        .map_err(|error| anyhow::anyhow!("frame REVEAL operation: {error:?}"))?;
-    let reconstructed = reconstruct_frames(&frames, app_id)
-        .map_err(|error| anyhow::anyhow!("reconstruct REVEAL frames: {error:?}"))?;
-    ensure!(
-        reconstructed == encoded_reveal,
-        "CPV1 reconstruction changed REVEAL bytes"
-    );
-    let reconstructed_reveal = decode_operation(&reconstructed)
-        .map_err(|error| anyhow::anyhow!("decode reconstructed REVEAL: {error:?}"))?;
-    ensure!(
-        reconstructed_reveal == reveal,
-        "CPV1 decode changed REVEAL operation"
-    );
-    ensure!(
-        frames.len() == footprint.cpv1_frames,
-        "CPV1 footprint disagrees with measured operation"
-    );
+    let finalized_operation = preparation.finalize(genesis_proof.clone())?;
 
     let carrier_recipient = names_recipient()?;
-    let carriers = frames
-        .iter()
-        .copied()
-        .map(|memo| CarrierOutput {
-            recipient: carrier_recipient,
-            value: orchard::value::NoteValue::from_raw(1),
-            memo,
-        })
-        .collect::<Vec<_>>();
-    let funding_spend_count = 1usize;
-    let change_output_count = 1usize;
-    let real_spend_count = 1usize
-        .checked_add(funding_spend_count)
-        .context("Names v2 real-spend count overflow")?;
-    let designated_action_index =
-        usize::try_from(ACTION_INDEX).context("designated action index does not fit usize")?;
-    let planned_shape = names_v2_ironwood_shape_from_counts(
-        real_spend_count,
-        carriers.len(),
-        change_output_count,
-        designated_action_index,
-    )?;
-    let required_fee = required_zip317_fee_for_names_v2(
-        &params,
-        BlockHeight::from_u32(construction_height),
-        planned_shape,
-    )?;
-    let required_fee_value = required_fee.into_u64();
-    let required_fee_balance =
-        i64::try_from(required_fee_value).context("ZIP-317 fee does not fit signed balance")?;
-
+    let funding_nf = funding_note.nullifier(&names_fvk).to_bytes();
     let anchor_height = db
         .get_target_and_anchor_heights(NonZeroU32::MIN)?
         .context("wallet has no synchronized target/anchor heights")?
         .1;
     let (anchor, paths) = wallet_witnesses(&mut db, anchor_height, [registration.2, funding.2])?;
-    let funding_value = funding.3;
-    let carrier_value = u64::try_from(carriers.len()).context("carrier count does not fit u64")?;
-    let change_value = funding_value
-        .checked_sub(carrier_value)
-        .and_then(|value| value.checked_sub(required_fee_value))
-        .context("funding note cannot cover carrier outputs and the requested value balance")?;
-    let plan = NamesV2IronwoodPlan {
-        designated_fvk: names_fvk.clone(),
-        designated_spend: registration_note,
-        successor_note,
-        successor_ovk: None,
-        successor_memo: [0; 512],
-        carrier_outputs: carriers,
-        funding_spends: vec![FundingSpend {
+    let planned = plan_state_operation(
+        &params,
+        BlockHeight::from_u32(construction_height),
+        &finalized_operation,
+        carrier_recipient,
+        &SingleFunding {
             fvk: names_fvk.clone(),
-            note: funding_note,
-        }],
-        change_outputs: vec![ChangeOutput {
-            fvk: names_fvk.clone(),
-            ovk: None,
-            recipient: names_fvk.address_at(0u32, Scope::Internal),
-            value: orchard::value::NoteValue::from_raw(change_value),
-            memo: [0; 512],
-        }],
-        designated_action_index,
-    };
+            note: funding_note.clone(),
+        },
+        names_fvk.address_at(0u32, Scope::Internal),
+    )?;
+    let built = build_names_v2_bundle(planned.plan, OsRng)?;
     ensure!(
-        names_v2_ironwood_shape(&plan)? == planned_shape,
-        "Names v2 plan shape changed after fee planning"
-    );
-    let built = build_names_v2_bundle(plan, OsRng)?;
-    ensure!(
-        built.action_count == planned_shape.action_count,
+        built.action_count == planned.planned_shape.action_count,
         "built Names v2 action count differs from fee-planned shape"
     );
     ensure!(
-        built.ironwood_value_balance == required_fee_balance,
+        built.ironwood_value_balance
+            == i64::try_from(planned.required_fee.into_u64())
+                .context("ZIP-317 fee does not fit signed balance")?,
         "built Names v2 value balance differs from required ZIP-317 fee"
-    );
-    ensure!(
-        built.designated_nullifier == statement.registration_nullifier,
-        "wallet designated NF differs from Names genesis statement"
-    );
-    ensure!(
-        built.designated_commitment == statement.commitment,
-        "wallet designated CMX differs from Names genesis statement"
     );
     let complete = build_names_v2_pczt(NamesV2PcztPlan {
         ironwood: built,
@@ -1635,7 +1502,7 @@ fn reveal_with_replacement(
                     merkle_path: paths[0].clone(),
                 },
                 NamesV2IronwoodWitness {
-                    nullifier: funding_note.nullifier(&names_fvk).to_bytes(),
+                    nullifier: funding_nf,
                     merkle_path: paths[1].clone(),
                 },
             ],
@@ -1656,7 +1523,7 @@ fn reveal_with_replacement(
                     ask: names_ask,
                 },
                 zcash_devtool::names_v2_builder::NamesV2IronwoodSigningKey {
-                    nullifier: funding_note.nullifier(&names_fvk).to_bytes(),
+                    nullifier: funding_nf,
                     ask: SpendAuthorizingKey::from(usk.orchard()),
                 },
             ],
@@ -1690,8 +1557,8 @@ fn reveal_with_replacement(
     println!("LEASE_EXPIRY={lease_expiry}");
     println!("NAMES_PROOF_BYTES={}", genesis_proof.len());
     println!("NAMES_PROOF_ELAPSED_MS={}", proof_elapsed.as_millis());
-    println!("CNV2_REVEAL_BYTES={}", encoded_reveal.len());
-    println!("CPV1_FRAMES={}", frames.len());
+    println!("CNV2_REVEAL_BYTES={}", finalized_operation.encoded().len());
+    println!("CPV1_FRAMES={}", finalized_operation.frames().len());
     println!("REVEAL_TXID={}", hex::encode(final_txid));
     println!("REVEAL_ACTION_INDEX={ACTION_INDEX}");
     println!("REVEAL_ACTION_COUNT={}", extracted.action_count);
@@ -2160,8 +2027,7 @@ fn update(args: UpdateArgs) -> Result<()> {
         .max_by_key(|(_, (_, _, _, value))| *value)
         .map(|(index, _)| index)
         .context("live wallet has no separate Ironwood funding note")?;
-    let (funding_note, _funding_scope, funding_position, funding_value) =
-        notes.swap_remove(funding_index);
+    let (funding_note, _funding_scope, funding_position, _) = notes.swap_remove(funding_index);
     let funding_nf = funding_note.nullifier(&names_fvk).to_bytes();
     ensure!(
         funding_nf != predecessor_nf,
@@ -2172,227 +2038,33 @@ fn update(args: UpdateArgs) -> Result<()> {
         "UPDATE funding position must differ from the predecessor position"
     );
 
-    let predecessor_rho = Option::<Rho>::from(Rho::from_bytes(&predecessor_nf))
-        .context("accepted predecessor nullifier is not a valid successor rho")?;
-    let successor_rseed = Option::<RandomSeed>::from(RandomSeed::from_bytes(
-        [successor_seed; 32],
-        &predecessor_rho,
-    ))
-    .context("construct deterministic UPDATE successor seed")?;
-    let successor_note = Option::<Note>::from(Note::from_parts(
-        names_fvk.address_at(0u32, predecessor_scope),
-        predecessor_note.value(),
-        predecessor_rho,
-        successor_rseed,
-        NoteVersion::V3,
-    ))
-    .context("construct exact UPDATE successor note")?;
-    ensure!(
-        successor_note.value() == predecessor_note.value(),
-        "UPDATE successor note changed the predecessor bond value"
-    );
-    ensure!(
-        successor_note.value().inner() == predecessor_value,
-        "UPDATE successor note value differs from the wallet predecessor value"
-    );
-    let successor_commitment =
-        ExtractedNoteCommitment::from(successor_note.commitment()).to_bytes();
-    let successor_future_nf = successor_note.nullifier(&names_fvk).to_bytes();
-    let successor_data = StateData {
-        name_id: predecessor.data.name_id,
-        owner_pk: predecessor.data.owner_pk,
-        sequence: predecessor
-            .data
-            .sequence
-            .checked_add(1)
-            .context("UPDATE sequence overflow")?,
-        record: update_record.to_vec(),
-        lease_expiry: predecessor.data.lease_expiry,
-        status: StateStatus::Active,
-        terminal_height: 0,
-    };
-    ensure!(
-        successor_data.record != predecessor.data.record,
-        "UPDATE successor record must change"
-    );
-    ensure!(
-        successor_data.lease_expiry == predecessor.data.lease_expiry,
-        "UPDATE successor lease must remain unchanged"
-    );
-    let action_index = UPDATE_ACTION_INDEX;
-    let successor_state_ref = StateRef::new(
-        ProducerPosition::new(construction_height, 0, [0; 32]),
-        action_index,
-        0,
-        successor_commitment,
-        successor_future_nf,
-    );
-    let successor = NameState::new(
-        successor_data.clone(),
-        successor_commitment,
-        successor_state_ref,
-    )
-    .map_err(|error| anyhow::anyhow!("construct UPDATE successor state: {error:?}"))?;
-    let action = IronwoodActionRef {
-        action_index,
-        nullifier: predecessor_nf,
-        commitment: successor_commitment,
-    };
-    let statement = TransitionStatement::from_states(
-        &predecessor,
-        &successor,
-        action,
-        OperationKind::Update,
-        construction_height,
-    )
-    .map_err(|error| anyhow::anyhow!("construct Names UPDATE statement: {error:?}"))?;
-    ensure!(
-        statement.predecessor_commitment == predecessor.commitment
-            && statement.predecessor_nullifier == predecessor_nf
-            && statement.successor_commitment == successor_commitment
-            && statement.successor_nullifier == successor_future_nf
-            && statement.predecessor_ref_digest == predecessor.state_ref.digest(),
-        "Names UPDATE statement does not reflect the exact predecessor/successor"
-    );
-    ensure!(
-        statement.predecessor_sequence == predecessor.data.sequence
-            && statement.successor_sequence
-                == predecessor
-                    .data
-                    .sequence
-                    .checked_add(1)
-                    .context("UPDATE statement sequence overflow")?
-            && statement.predecessor_lease_expiry == predecessor.data.lease_expiry
-            && statement.successor_lease_expiry == predecessor.data.lease_expiry
-            && statement.operation_height == construction_height,
-        "Names UPDATE statement has unexpected lifecycle fields"
-    );
-    let transition_witness = TransitionWitness::new(
-        predecessor_note,
-        &names_fvk,
-        predecessor_scope,
-        &names_ask,
-        successor_note,
-    );
+    let preparation = prepare_update(
+        TransitionInputs {
+            predecessor: predecessor.clone(),
+            predecessor_note,
+            scope: predecessor_scope,
+            fvk: names_fvk.clone(),
+            ask: names_ask.clone(),
+            operation_height: construction_height,
+            designated_action_index: UPDATE_ACTION_INDEX,
+            successor_seed: [successor_seed; 32],
+        },
+        update_record.to_vec(),
+    )?;
+    let successor_commitment = preparation.statement().successor_commitment;
+    let successor_future_nf = preparation.statement().successor_nullifier;
     let names_proof_started = Instant::now();
     let transition_proof = names_prover
-        .prove_transition(&statement, transition_witness, OsRng)
+        .prove_transition(
+            preparation.statement(),
+            preparation.witness().clone(),
+            OsRng,
+        )
         .map_err(|error| anyhow::anyhow!("create Names UPDATE proof: {error:?}"))?;
     let names_proof_elapsed = names_proof_started.elapsed();
-    ensure!(!transition_proof.is_empty(), "Names UPDATE proof is empty");
-
-    let update_operation = V2Operation::Update {
-        predecessor: predecessor.state_ref,
-        state: successor_data,
-        state_commitment: successor_commitment,
-        state_nullifier: successor_future_nf,
-        action_index,
-        proof: transition_proof.clone(),
-    };
-    let encoded_update = encode_operation(&update_operation)
-        .map_err(|error| anyhow::anyhow!("encode UPDATE operation: {error:?}"))?;
-    let decoded_update = decode_operation(&encoded_update)
-        .map_err(|error| anyhow::anyhow!("decode UPDATE operation: {error:?}"))?;
-    ensure!(
-        decoded_update == update_operation,
-        "UPDATE wire round-trip mismatch"
-    );
-    let footprint = operation_footprint(&update_operation)
-        .map_err(|error| anyhow::anyhow!("measure UPDATE operation: {error:?}"))?;
-    let frames = encode_frames(app_id, &encoded_update)
-        .map_err(|error| anyhow::anyhow!("frame UPDATE operation: {error:?}"))?;
-    let reconstructed = reconstruct_frames(&frames, app_id)
-        .map_err(|error| anyhow::anyhow!("reconstruct UPDATE frames: {error:?}"))?;
-    ensure!(
-        reconstructed == encoded_update,
-        "CPV1 reconstruction changed UPDATE bytes"
-    );
-    let reconstructed_update = decode_operation(&reconstructed)
-        .map_err(|error| anyhow::anyhow!("decode reconstructed UPDATE: {error:?}"))?;
-    ensure!(
-        reconstructed_update == update_operation,
-        "CPV1 decode changed UPDATE operation"
-    );
-    ensure!(
-        frames.len() == footprint.cpv1_frames,
-        "CPV1 footprint disagrees with measured UPDATE operation"
-    );
+    let finalized_operation = preparation.finalize(transition_proof.clone())?;
 
     let carrier_recipient = names_recipient()?;
-    let carriers = frames
-        .iter()
-        .copied()
-        .map(|memo| CarrierOutput {
-            recipient: carrier_recipient,
-            value: orchard::value::NoteValue::from_raw(1),
-            memo,
-        })
-        .collect::<Vec<_>>();
-    let planned_shape = names_v2_ironwood_shape_from_counts(
-        2,
-        carriers.len(),
-        1,
-        usize::try_from(action_index).context("UPDATE action index does not fit usize")?,
-    )?;
-    let required_fee = required_zip317_fee_for_names_v2(
-        &params,
-        BlockHeight::from_u32(construction_height),
-        planned_shape,
-    )?;
-    let required_fee_value = required_fee.into_u64();
-    let required_fee_balance =
-        i64::try_from(required_fee_value).context("UPDATE ZIP-317 fee does not fit balance")?;
-    let carrier_value = u64::try_from(carriers.len()).context("UPDATE carrier count overflow")?;
-    let change_value = funding_value
-        .checked_sub(carrier_value)
-        .and_then(|value| value.checked_sub(required_fee_value))
-        .context("funding note cannot cover UPDATE carriers and ZIP-317 fee")?;
-    let plan = NamesV2IronwoodPlan {
-        designated_fvk: names_fvk.clone(),
-        designated_spend: predecessor_note,
-        successor_note,
-        successor_ovk: None,
-        successor_memo: [0; 512],
-        carrier_outputs: carriers,
-        funding_spends: vec![FundingSpend {
-            fvk: names_fvk.clone(),
-            note: funding_note,
-        }],
-        change_outputs: vec![ChangeOutput {
-            fvk: names_fvk.clone(),
-            ovk: None,
-            recipient: names_fvk.address_at(0u32, Scope::Internal),
-            value: orchard::value::NoteValue::from_raw(change_value),
-            memo: [0; 512],
-        }],
-        designated_action_index: usize::try_from(action_index)
-            .context("UPDATE action index does not fit usize")?,
-    };
-    ensure!(
-        names_v2_ironwood_shape(&plan)? == planned_shape,
-        "UPDATE plan shape changed after fee planning"
-    );
-    let built = build_names_v2_bundle(plan, OsRng)?;
-    ensure!(
-        built.action_count == planned_shape.action_count,
-        "UPDATE built action count differs from fee-planned shape"
-    );
-    ensure!(
-        built.ironwood_value_balance == required_fee_balance,
-        "UPDATE built value balance differs from ZIP-317 fee"
-    );
-    ensure!(
-        built.designated_nullifier == statement.predecessor_nullifier
-            && built.designated_commitment == statement.successor_commitment,
-        "UPDATE designated action differs from the Names transition statement"
-    );
-    verify_designated_action(
-        &built.bundle,
-        built.designated_action_index,
-        predecessor_nf,
-        successor_commitment,
-    )?;
-
     let anchor_height = db
         .get_target_and_anchor_heights(NonZeroU32::MIN)?
         .context("wallet has no synchronized target/anchor heights")?
@@ -2402,6 +2074,28 @@ fn update(args: UpdateArgs) -> Result<()> {
         anchor_height,
         [predecessor_position, funding_position],
     )?;
+    let planned = plan_state_operation(
+        &params,
+        BlockHeight::from_u32(construction_height),
+        &finalized_operation,
+        carrier_recipient,
+        &SingleFunding {
+            fvk: names_fvk.clone(),
+            note: funding_note.clone(),
+        },
+        names_fvk.address_at(0u32, Scope::Internal),
+    )?;
+    let built = build_names_v2_bundle(planned.plan, OsRng)?;
+    ensure!(
+        built.action_count == planned.planned_shape.action_count,
+        "UPDATE built action count differs from fee-planned shape"
+    );
+    ensure!(
+        built.ironwood_value_balance
+            == i64::try_from(planned.required_fee.into_u64())
+                .context("UPDATE ZIP-317 fee does not fit balance")?,
+        "UPDATE built value balance differs from ZIP-317 fee"
+    );
     let complete = build_names_v2_pczt(NamesV2PcztPlan {
         ironwood: built,
         params,
@@ -2449,8 +2143,10 @@ fn update(args: UpdateArgs) -> Result<()> {
     )?;
     let extracted = extract_names_v2_transaction(signed)?;
     ensure!(
-        extracted.action_count == planned_shape.action_count
-            && extracted.ironwood_value_balance == required_fee_balance,
+        extracted.action_count == planned.planned_shape.action_count
+            && extracted.ironwood_value_balance
+                == i64::try_from(planned.required_fee.into_u64())
+                    .context("UPDATE ZIP-317 fee does not fit balance")?,
         "extracted UPDATE metadata differs from the planned shape or fee"
     );
     let mut raw = Vec::new();
@@ -2481,10 +2177,10 @@ fn update(args: UpdateArgs) -> Result<()> {
         "{label}_NAMES_PROOF_ELAPSED_MS={}",
         names_proof_elapsed.as_millis()
     );
-    println!("CNV2_{label}_BYTES={}", encoded_update.len());
-    println!("CPV1_{label}_FRAMES={}", frames.len());
+    println!("CNV2_{label}_BYTES={}", finalized_operation.encoded().len());
+    println!("CPV1_{label}_FRAMES={}", finalized_operation.frames().len());
     println!("{label}_TXID={}", hex::encode(final_txid));
-    println!("{label}_ACTION_INDEX={action_index}");
+    println!("{label}_ACTION_INDEX={UPDATE_ACTION_INDEX}");
     println!("{label}_PREDECESSOR_VALUE={predecessor_value}");
     println!("{label}_ACTION_COUNT={}", extracted.action_count);
     println!("{label}_REAL_SPENDS={}", extracted.real_spend_count);
@@ -2897,13 +2593,6 @@ fn renew(args: RenewArgs) -> Result<()> {
         renew_height < predecessor.data.lease_expiry,
         "next scheduled RENEW height is at or beyond the predecessor lease expiry"
     );
-    let successor_lease_expiry = v2
-        .lease_expiry(renew_height)
-        .context("Names v2 RENEW lease expiry overflow")?;
-    ensure!(
-        successor_lease_expiry > predecessor.data.lease_expiry,
-        "RENEW lease must strictly extend the predecessor lease"
-    );
 
     let usk = wallet_usk(&params)?;
     let names_fvk = FullViewingKey::from(usk.orchard());
@@ -2952,8 +2641,7 @@ fn renew(args: RenewArgs) -> Result<()> {
         .max_by_key(|(_, (_, _, _, value))| *value)
         .map(|(index, _)| index)
         .context("live wallet has no separate Ironwood funding note")?;
-    let (funding_note, _funding_scope, funding_position, funding_value) =
-        notes.swap_remove(funding_index);
+    let (funding_note, _funding_scope, funding_position, _) = notes.swap_remove(funding_index);
     let funding_nf = funding_note.nullifier(&names_fvk).to_bytes();
     ensure!(
         funding_nf != predecessor_nf,
@@ -2964,231 +2652,38 @@ fn renew(args: RenewArgs) -> Result<()> {
         "RENEW funding position must differ from the predecessor position"
     );
 
-    let predecessor_rho = Option::<Rho>::from(Rho::from_bytes(&predecessor_nf))
-        .context("accepted predecessor nullifier is not a valid successor rho")?;
-    let successor_rseed = Option::<RandomSeed>::from(RandomSeed::from_bytes(
-        [if update_txid.is_some() {
-            RENEW_SUCCESSOR_SEED
-        } else {
-            RENEW_SUCCESSOR_SEED + 3
-        }; 32],
-        &predecessor_rho,
-    ))
-    .context("construct deterministic RENEW successor seed")?;
-    let successor_note = Option::<Note>::from(Note::from_parts(
-        names_fvk.address_at(0u32, predecessor_scope),
-        predecessor_note.value(),
-        predecessor_rho,
-        successor_rseed,
-        NoteVersion::V3,
-    ))
-    .context("construct exact RENEW successor note")?;
-    ensure!(
-        successor_note.value() == predecessor_note.value()
-            && successor_note.value().inner() == predecessor_value,
-        "RENEW successor note changed the predecessor bond value"
-    );
-    let successor_commitment =
-        ExtractedNoteCommitment::from(successor_note.commitment()).to_bytes();
-    let successor_future_nf = successor_note.nullifier(&names_fvk).to_bytes();
-    let successor_data = StateData {
-        name_id: predecessor.data.name_id,
-        owner_pk: predecessor.data.owner_pk,
-        sequence: predecessor
-            .data
-            .sequence
-            .checked_add(1)
-            .context("RENEW sequence overflow")?,
-        record: predecessor.data.record.clone(),
-        lease_expiry: successor_lease_expiry,
-        status: StateStatus::Active,
-        terminal_height: 0,
-    };
-    ensure!(
-        successor_data.record == predecessor.data.record,
-        "RENEW must preserve the predecessor record"
-    );
-    ensure!(
-        successor_data.lease_expiry > predecessor.data.lease_expiry,
-        "RENEW successor lease did not extend the predecessor"
-    );
-
-    let action_index = RENEW_ACTION_INDEX;
-    let successor_state_ref = StateRef::new(
-        ProducerPosition::new(construction_height, 0, [0; 32]),
-        action_index,
-        0,
-        successor_commitment,
-        successor_future_nf,
-    );
-    let successor = NameState::new(
-        successor_data.clone(),
-        successor_commitment,
-        successor_state_ref,
-    )
-    .map_err(|error| anyhow::anyhow!("construct RENEW successor state: {error:?}"))?;
-    let action = IronwoodActionRef {
-        action_index,
-        nullifier: predecessor_nf,
-        commitment: successor_commitment,
-    };
-    let statement = TransitionStatement::from_states(
-        &predecessor,
-        &successor,
-        action,
-        OperationKind::Renew,
-        construction_height,
-    )
-    .map_err(|error| anyhow::anyhow!("construct Names RENEW statement: {error:?}"))?;
-    ensure!(
-        statement.operation == OperationKind::Renew
-            && statement.predecessor_commitment == predecessor.commitment
-            && statement.predecessor_nullifier == predecessor_nf
-            && statement.successor_commitment == successor_commitment
-            && statement.successor_nullifier == successor_future_nf
-            && statement.predecessor_ref_digest == predecessor.state_ref.digest(),
-        "Names RENEW statement does not reflect the exact predecessor/successor"
-    );
-    ensure!(
-        statement.predecessor_sequence == predecessor.data.sequence
-            && statement.successor_sequence == predecessor.data.sequence + 1
-            && statement.predecessor_record_digest == statement.successor_record_digest
-            && statement.predecessor_lease_expiry == predecessor.data.lease_expiry
-            && statement.successor_lease_expiry == successor_lease_expiry
-            && statement.predecessor_status == StateStatus::Active.code()
-            && statement.successor_status == StateStatus::Active.code()
-            && statement.predecessor_terminal_height == 0
-            && statement.successor_terminal_height == 0
-            && statement.operation_height == renew_height,
-        "Names RENEW statement has unexpected lifecycle fields"
-    );
-
-    let transition_witness = TransitionWitness::new(
-        predecessor_note,
-        &names_fvk,
-        predecessor_scope,
-        &names_ask,
-        successor_note,
-    );
+    let preparation = prepare_renew(
+        TransitionInputs {
+            predecessor: predecessor.clone(),
+            predecessor_note,
+            scope: predecessor_scope,
+            fvk: names_fvk.clone(),
+            ask: names_ask.clone(),
+            operation_height: construction_height,
+            designated_action_index: RENEW_ACTION_INDEX,
+            successor_seed: [if update_txid.is_some() {
+                RENEW_SUCCESSOR_SEED
+            } else {
+                RENEW_SUCCESSOR_SEED + 3
+            }; 32],
+        },
+        v2,
+    )?;
+    let successor_commitment = preparation.statement().successor_commitment;
+    let successor_future_nf = preparation.statement().successor_nullifier;
+    let successor_lease_expiry = preparation.statement().successor_lease_expiry;
     let names_proof_started = Instant::now();
     let transition_proof = names_prover
-        .prove_transition(&statement, transition_witness, OsRng)
+        .prove_transition(
+            preparation.statement(),
+            preparation.witness().clone(),
+            OsRng,
+        )
         .map_err(|error| anyhow::anyhow!("create Names RENEW proof: {error:?}"))?;
     let names_proof_elapsed = names_proof_started.elapsed();
-    ensure!(!transition_proof.is_empty(), "Names RENEW proof is empty");
-
-    let renew_operation = V2Operation::Renew {
-        predecessor: predecessor.state_ref,
-        state: successor_data,
-        state_commitment: successor_commitment,
-        state_nullifier: successor_future_nf,
-        action_index,
-        proof: transition_proof.clone(),
-    };
-    let encoded_renew = encode_operation(&renew_operation)
-        .map_err(|error| anyhow::anyhow!("encode RENEW operation: {error:?}"))?;
-    let decoded_renew = decode_operation(&encoded_renew)
-        .map_err(|error| anyhow::anyhow!("decode RENEW operation: {error:?}"))?;
-    ensure!(
-        decoded_renew == renew_operation,
-        "RENEW wire round-trip mismatch"
-    );
-    let footprint = operation_footprint(&renew_operation)
-        .map_err(|error| anyhow::anyhow!("measure RENEW operation: {error:?}"))?;
-    let frames = encode_frames(app_id, &encoded_renew)
-        .map_err(|error| anyhow::anyhow!("frame RENEW operation: {error:?}"))?;
-    let reconstructed = reconstruct_frames(&frames, app_id)
-        .map_err(|error| anyhow::anyhow!("reconstruct RENEW frames: {error:?}"))?;
-    ensure!(
-        reconstructed == encoded_renew,
-        "CPV1 reconstruction changed RENEW bytes"
-    );
-    let reconstructed_renew = decode_operation(&reconstructed)
-        .map_err(|error| anyhow::anyhow!("decode reconstructed RENEW: {error:?}"))?;
-    ensure!(
-        reconstructed_renew == renew_operation,
-        "CPV1 decode changed RENEW operation"
-    );
-    ensure!(
-        frames.len() == footprint.cpv1_frames,
-        "CPV1 footprint disagrees with measured RENEW operation"
-    );
+    let finalized_operation = preparation.finalize(transition_proof.clone())?;
 
     let carrier_recipient = names_recipient()?;
-    let carriers = frames
-        .iter()
-        .copied()
-        .map(|memo| CarrierOutput {
-            recipient: carrier_recipient,
-            value: orchard::value::NoteValue::from_raw(1),
-            memo,
-        })
-        .collect::<Vec<_>>();
-    let planned_shape = names_v2_ironwood_shape_from_counts(
-        2,
-        carriers.len(),
-        1,
-        usize::try_from(action_index).context("RENEW action index does not fit usize")?,
-    )?;
-    let required_fee = required_zip317_fee_for_names_v2(
-        &params,
-        BlockHeight::from_u32(construction_height),
-        planned_shape,
-    )?;
-    let required_fee_value = required_fee.into_u64();
-    let required_fee_balance =
-        i64::try_from(required_fee_value).context("RENEW ZIP-317 fee does not fit balance")?;
-    let carrier_value = u64::try_from(carriers.len()).context("RENEW carrier count overflow")?;
-    let change_value = funding_value
-        .checked_sub(carrier_value)
-        .and_then(|value| value.checked_sub(required_fee_value))
-        .context("funding note cannot cover RENEW carriers and ZIP-317 fee")?;
-    let plan = NamesV2IronwoodPlan {
-        designated_fvk: names_fvk.clone(),
-        designated_spend: predecessor_note,
-        successor_note,
-        successor_ovk: None,
-        successor_memo: [0; 512],
-        carrier_outputs: carriers,
-        funding_spends: vec![FundingSpend {
-            fvk: names_fvk.clone(),
-            note: funding_note,
-        }],
-        change_outputs: vec![ChangeOutput {
-            fvk: names_fvk.clone(),
-            ovk: None,
-            recipient: names_fvk.address_at(0u32, Scope::Internal),
-            value: orchard::value::NoteValue::from_raw(change_value),
-            memo: [0; 512],
-        }],
-        designated_action_index: usize::try_from(action_index)
-            .context("RENEW action index does not fit usize")?,
-    };
-    ensure!(
-        names_v2_ironwood_shape(&plan)? == planned_shape,
-        "RENEW plan shape changed after fee planning"
-    );
-    let built = build_names_v2_bundle(plan, OsRng)?;
-    ensure!(
-        built.action_count == planned_shape.action_count,
-        "RENEW built action count differs from fee-planned shape"
-    );
-    ensure!(
-        built.ironwood_value_balance == required_fee_balance,
-        "RENEW built value balance differs from ZIP-317 fee"
-    );
-    ensure!(
-        built.designated_nullifier == statement.predecessor_nullifier
-            && built.designated_commitment == statement.successor_commitment,
-        "RENEW designated action differs from the Names transition statement"
-    );
-    verify_designated_action(
-        &built.bundle,
-        built.designated_action_index,
-        predecessor_nf,
-        successor_commitment,
-    )?;
-
     let anchor_height = db
         .get_target_and_anchor_heights(NonZeroU32::MIN)?
         .context("wallet has no synchronized target/anchor heights")?
@@ -3198,6 +2693,28 @@ fn renew(args: RenewArgs) -> Result<()> {
         anchor_height,
         [predecessor_position, funding_position],
     )?;
+    let planned = plan_state_operation(
+        &params,
+        BlockHeight::from_u32(construction_height),
+        &finalized_operation,
+        carrier_recipient,
+        &SingleFunding {
+            fvk: names_fvk.clone(),
+            note: funding_note.clone(),
+        },
+        names_fvk.address_at(0u32, Scope::Internal),
+    )?;
+    let built = build_names_v2_bundle(planned.plan, OsRng)?;
+    ensure!(
+        built.action_count == planned.planned_shape.action_count,
+        "RENEW built action count differs from fee-planned shape"
+    );
+    ensure!(
+        built.ironwood_value_balance
+            == i64::try_from(planned.required_fee.into_u64())
+                .context("RENEW ZIP-317 fee does not fit balance")?,
+        "RENEW built value balance differs from ZIP-317 fee"
+    );
     let complete = build_names_v2_pczt(NamesV2PcztPlan {
         ironwood: built,
         params,
@@ -3245,8 +2762,10 @@ fn renew(args: RenewArgs) -> Result<()> {
     )?;
     let extracted = extract_names_v2_transaction(signed)?;
     ensure!(
-        extracted.action_count == planned_shape.action_count
-            && extracted.ironwood_value_balance == required_fee_balance,
+        extracted.action_count == planned.planned_shape.action_count
+            && extracted.ironwood_value_balance
+                == i64::try_from(planned.required_fee.into_u64())
+                    .context("RENEW ZIP-317 fee does not fit balance")?,
         "extracted RENEW metadata differs from the planned shape or fee"
     );
     let mut raw = Vec::new();
@@ -3267,10 +2786,10 @@ fn renew(args: RenewArgs) -> Result<()> {
         "RENEW_NAMES_PROOF_ELAPSED_MS={}",
         names_proof_elapsed.as_millis()
     );
-    println!("CNV2_RENEW_BYTES={}", encoded_renew.len());
-    println!("CPV1_RENEW_FRAMES={}", frames.len());
+    println!("CNV2_RENEW_BYTES={}", finalized_operation.encoded().len());
+    println!("CPV1_RENEW_FRAMES={}", finalized_operation.frames().len());
     println!("RENEW_TXID={}", hex::encode(final_txid));
-    println!("RENEW_ACTION_INDEX={action_index}");
+    println!("RENEW_ACTION_INDEX={RENEW_ACTION_INDEX}");
     println!("RENEW_PREDECESSOR_VALUE={predecessor_value}");
     println!("RENEW_SUCCESSOR_LEASE_EXPIRY={successor_lease_expiry}");
     println!("RENEW_ACTION_COUNT={}", extracted.action_count);
@@ -3445,8 +2964,7 @@ fn release(args: ReleaseArgs) -> Result<()> {
         .max_by_key(|(_, (_, _, _, value))| *value)
         .map(|(index, _)| index)
         .context("live wallet has no separate Ironwood funding note")?;
-    let (funding_note, _funding_scope, funding_position, funding_value) =
-        notes.swap_remove(funding_index);
+    let (funding_note, _funding_scope, funding_position, _) = notes.swap_remove(funding_index);
     let funding_nf = funding_note.nullifier(&names_fvk).to_bytes();
     ensure!(
         funding_nf != predecessor_nf,
@@ -3457,233 +2975,30 @@ fn release(args: ReleaseArgs) -> Result<()> {
         "RELEASE funding position must differ from the predecessor position"
     );
 
-    let predecessor_rho = Option::<Rho>::from(Rho::from_bytes(&predecessor_nf))
-        .context("accepted predecessor nullifier is not a valid successor rho")?;
-    let successor_rseed = Option::<RandomSeed>::from(RandomSeed::from_bytes(
-        [RELEASE_SUCCESSOR_SEED; 32],
-        &predecessor_rho,
-    ))
-    .context("construct deterministic RELEASE successor seed")?;
-    let successor_note = Option::<Note>::from(Note::from_parts(
-        names_fvk.address_at(0u32, predecessor_scope),
-        predecessor_note.value(),
-        predecessor_rho,
-        successor_rseed,
-        NoteVersion::V3,
-    ))
-    .context("construct exact RELEASE successor note")?;
-    ensure!(
-        successor_note.value() == predecessor_note.value()
-            && successor_note.value().inner() == predecessor_value,
-        "RELEASE successor note changed the predecessor bond value"
-    );
-    let successor_commitment =
-        ExtractedNoteCommitment::from(successor_note.commitment()).to_bytes();
-    let successor_future_nf = successor_note.nullifier(&names_fvk).to_bytes();
-    let successor_data = StateData {
-        name_id: predecessor.data.name_id,
-        owner_pk: predecessor.data.owner_pk,
-        sequence: predecessor
-            .data
-            .sequence
-            .checked_add(1)
-            .context("RELEASE sequence overflow")?,
-        record: predecessor.data.record.clone(),
-        lease_expiry: predecessor.data.lease_expiry,
-        status: StateStatus::Released,
-        terminal_height: release_height,
-    };
-    ensure!(
-        successor_data.record == predecessor.data.record
-            && successor_data.record.as_slice() == UPDATE_RECORD.as_slice(),
-        "RELEASE must preserve the predecessor record"
-    );
-    ensure!(
-        successor_data.lease_expiry == predecessor.data.lease_expiry,
-        "RELEASE must preserve the predecessor lease expiry"
-    );
-    ensure!(
-        successor_data.status == StateStatus::Released
-            && successor_data.terminal_height == release_height,
-        "RELEASE successor must be terminal at its construction height"
-    );
-
-    let action_index = RELEASE_ACTION_INDEX;
-    let successor_state_ref = StateRef::new(
-        ProducerPosition::new(construction_height, 0, [0; 32]),
-        action_index,
-        0,
-        successor_commitment,
-        successor_future_nf,
-    );
-    let successor = NameState::new(
-        successor_data.clone(),
-        successor_commitment,
-        successor_state_ref,
-    )
-    .map_err(|error| anyhow::anyhow!("construct RELEASE successor state: {error:?}"))?;
-    let action = IronwoodActionRef {
-        action_index,
-        nullifier: predecessor_nf,
-        commitment: successor_commitment,
-    };
-    let statement = TransitionStatement::from_states(
-        &predecessor,
-        &successor,
-        action,
-        OperationKind::Release,
-        construction_height,
-    )
-    .map_err(|error| anyhow::anyhow!("construct Names RELEASE statement: {error:?}"))?;
-    ensure!(
-        statement.operation == OperationKind::Release
-            && statement.predecessor_commitment == predecessor.commitment
-            && statement.predecessor_nullifier == predecessor_nf
-            && statement.successor_commitment == successor_commitment
-            && statement.successor_nullifier == successor_future_nf
-            && statement.predecessor_ref_digest == predecessor.state_ref.digest(),
-        "Names RELEASE statement does not reflect the exact predecessor/successor"
-    );
-    ensure!(
-        statement.predecessor_sequence == 2
-            && statement.successor_sequence == 3
-            && statement.predecessor_record_digest == statement.successor_record_digest
-            && statement.predecessor_lease_expiry == 59
-            && statement.successor_lease_expiry == 59
-            && statement.predecessor_status == StateStatus::Active.code()
-            && statement.successor_status == StateStatus::Released.code()
-            && statement.predecessor_terminal_height == 0
-            && statement.successor_terminal_height == release_height
-            && statement.operation_height == release_height,
-        "Names RELEASE statement has unexpected lifecycle fields"
-    );
-
-    let transition_witness = TransitionWitness::new(
+    let preparation = prepare_release(TransitionInputs {
+        predecessor: predecessor.clone(),
         predecessor_note,
-        &names_fvk,
-        predecessor_scope,
-        &names_ask,
-        successor_note,
-    );
+        scope: predecessor_scope,
+        fvk: names_fvk.clone(),
+        ask: names_ask.clone(),
+        operation_height: construction_height,
+        designated_action_index: RELEASE_ACTION_INDEX,
+        successor_seed: [RELEASE_SUCCESSOR_SEED; 32],
+    })?;
+    let successor_commitment = preparation.statement().successor_commitment;
+    let successor_future_nf = preparation.statement().successor_nullifier;
     let names_proof_started = Instant::now();
     let transition_proof = names_prover
-        .prove_transition(&statement, transition_witness, OsRng)
+        .prove_transition(
+            preparation.statement(),
+            preparation.witness().clone(),
+            OsRng,
+        )
         .map_err(|error| anyhow::anyhow!("create Names RELEASE proof: {error:?}"))?;
     let names_proof_elapsed = names_proof_started.elapsed();
-    ensure!(!transition_proof.is_empty(), "Names RELEASE proof is empty");
-
-    let release_operation = V2Operation::Release {
-        predecessor: predecessor.state_ref,
-        state: successor_data,
-        state_commitment: successor_commitment,
-        state_nullifier: successor_future_nf,
-        action_index,
-        proof: transition_proof.clone(),
-    };
-    let encoded_release = encode_operation(&release_operation)
-        .map_err(|error| anyhow::anyhow!("encode RELEASE operation: {error:?}"))?;
-    let decoded_release = decode_operation(&encoded_release)
-        .map_err(|error| anyhow::anyhow!("decode RELEASE operation: {error:?}"))?;
-    ensure!(
-        decoded_release == release_operation,
-        "RELEASE wire round-trip mismatch"
-    );
-    let footprint = operation_footprint(&release_operation)
-        .map_err(|error| anyhow::anyhow!("measure RELEASE operation: {error:?}"))?;
-    let frames = encode_frames(app_id, &encoded_release)
-        .map_err(|error| anyhow::anyhow!("frame RELEASE operation: {error:?}"))?;
-    let reconstructed = reconstruct_frames(&frames, app_id)
-        .map_err(|error| anyhow::anyhow!("reconstruct RELEASE frames: {error:?}"))?;
-    ensure!(
-        reconstructed == encoded_release,
-        "CPV1 reconstruction changed RELEASE bytes"
-    );
-    let reconstructed_release = decode_operation(&reconstructed)
-        .map_err(|error| anyhow::anyhow!("decode reconstructed RELEASE: {error:?}"))?;
-    ensure!(
-        reconstructed_release == release_operation,
-        "CPV1 decode changed RELEASE operation"
-    );
-    ensure!(
-        frames.len() == footprint.cpv1_frames,
-        "CPV1 footprint disagrees with measured RELEASE operation"
-    );
+    let finalized_operation = preparation.finalize(transition_proof.clone())?;
 
     let carrier_recipient = names_recipient()?;
-    let carriers = frames
-        .iter()
-        .copied()
-        .map(|memo| CarrierOutput {
-            recipient: carrier_recipient,
-            value: orchard::value::NoteValue::from_raw(1),
-            memo,
-        })
-        .collect::<Vec<_>>();
-    let planned_shape = names_v2_ironwood_shape_from_counts(
-        2,
-        carriers.len(),
-        1,
-        usize::try_from(action_index).context("RELEASE action index does not fit usize")?,
-    )?;
-    let required_fee = required_zip317_fee_for_names_v2(
-        &params,
-        BlockHeight::from_u32(construction_height),
-        planned_shape,
-    )?;
-    let required_fee_value = required_fee.into_u64();
-    let required_fee_balance =
-        i64::try_from(required_fee_value).context("RELEASE ZIP-317 fee does not fit balance")?;
-    let carrier_value = u64::try_from(carriers.len()).context("RELEASE carrier count overflow")?;
-    let change_value = funding_value
-        .checked_sub(carrier_value)
-        .and_then(|value| value.checked_sub(required_fee_value))
-        .context("funding note cannot cover RELEASE carriers and ZIP-317 fee")?;
-    let plan = NamesV2IronwoodPlan {
-        designated_fvk: names_fvk.clone(),
-        designated_spend: predecessor_note,
-        successor_note,
-        successor_ovk: None,
-        successor_memo: [0; 512],
-        carrier_outputs: carriers,
-        funding_spends: vec![FundingSpend {
-            fvk: names_fvk.clone(),
-            note: funding_note,
-        }],
-        change_outputs: vec![ChangeOutput {
-            fvk: names_fvk.clone(),
-            ovk: None,
-            recipient: names_fvk.address_at(0u32, Scope::Internal),
-            value: orchard::value::NoteValue::from_raw(change_value),
-            memo: [0; 512],
-        }],
-        designated_action_index: usize::try_from(action_index)
-            .context("RELEASE action index does not fit usize")?,
-    };
-    ensure!(
-        names_v2_ironwood_shape(&plan)? == planned_shape,
-        "RELEASE plan shape changed after fee planning"
-    );
-    let built = build_names_v2_bundle(plan, OsRng)?;
-    ensure!(
-        built.action_count == planned_shape.action_count,
-        "RELEASE built action count differs from fee-planned shape"
-    );
-    ensure!(
-        built.ironwood_value_balance == required_fee_balance,
-        "RELEASE built value balance differs from ZIP-317 fee"
-    );
-    ensure!(
-        built.designated_nullifier == statement.predecessor_nullifier
-            && built.designated_commitment == statement.successor_commitment,
-        "RELEASE designated action differs from the Names transition statement"
-    );
-    verify_designated_action(
-        &built.bundle,
-        built.designated_action_index,
-        predecessor_nf,
-        successor_commitment,
-    )?;
-
     let anchor_height = db
         .get_target_and_anchor_heights(NonZeroU32::MIN)?
         .context("wallet has no synchronized target/anchor heights")?
@@ -3693,6 +3008,28 @@ fn release(args: ReleaseArgs) -> Result<()> {
         anchor_height,
         [predecessor_position, funding_position],
     )?;
+    let planned = plan_state_operation(
+        &params,
+        BlockHeight::from_u32(construction_height),
+        &finalized_operation,
+        carrier_recipient,
+        &SingleFunding {
+            fvk: names_fvk.clone(),
+            note: funding_note.clone(),
+        },
+        names_fvk.address_at(0u32, Scope::Internal),
+    )?;
+    let built = build_names_v2_bundle(planned.plan, OsRng)?;
+    ensure!(
+        built.action_count == planned.planned_shape.action_count,
+        "RELEASE built action count differs from fee-planned shape"
+    );
+    ensure!(
+        built.ironwood_value_balance
+            == i64::try_from(planned.required_fee.into_u64())
+                .context("RELEASE ZIP-317 fee does not fit balance")?,
+        "RELEASE built value balance differs from ZIP-317 fee"
+    );
     let complete = build_names_v2_pczt(NamesV2PcztPlan {
         ironwood: built,
         params,
@@ -3740,8 +3077,10 @@ fn release(args: ReleaseArgs) -> Result<()> {
     )?;
     let extracted = extract_names_v2_transaction(signed)?;
     ensure!(
-        extracted.action_count == planned_shape.action_count
-            && extracted.ironwood_value_balance == required_fee_balance,
+        extracted.action_count == planned.planned_shape.action_count
+            && extracted.ironwood_value_balance
+                == i64::try_from(planned.required_fee.into_u64())
+                    .context("RELEASE ZIP-317 fee does not fit balance")?,
         "extracted RELEASE metadata differs from the planned shape or fee"
     );
     let mut raw = Vec::new();
@@ -3761,10 +3100,10 @@ fn release(args: ReleaseArgs) -> Result<()> {
         "RELEASE_NAMES_PROOF_ELAPSED_MS={}",
         names_proof_elapsed.as_millis()
     );
-    println!("CNV2_RELEASE_BYTES={}", encoded_release.len());
-    println!("CPV1_RELEASE_FRAMES={}", frames.len());
+    println!("CNV2_RELEASE_BYTES={}", finalized_operation.encoded().len());
+    println!("CPV1_RELEASE_FRAMES={}", finalized_operation.frames().len());
     println!("RELEASE_TXID={}", hex::encode(final_txid));
-    println!("RELEASE_ACTION_INDEX={action_index}");
+    println!("RELEASE_ACTION_INDEX={RELEASE_ACTION_INDEX}");
     println!("RELEASE_PREDECESSOR_VALUE={predecessor_value}");
     println!("RELEASE_SUCCESSOR_SEQUENCE=3");
     println!("RELEASE_SUCCESSOR_LEASE_EXPIRY=59");
