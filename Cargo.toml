@@ -164,8 +164,9 @@ tui = [
 # orchard is patched here too, to the dedicated non-consensus Coppice Names
 # extension. A git dependency's own nested patches do not propagate to ours,
 # so this workspace needs its own matching entry or the graph disagrees on
-# which orchard it is building against.
-orchard = { git = "https://github.com/nfl0/orchard-coppice.git", rev = "14c3fd9633297787c3a34a13c0c93fb89e35908c" }
+# which orchard it is building against. The release freeze pins the audited
+# fork head, which carries the hardened designated Ironwood action pairing.
+orchard = { git = "https://github.com/nfl0/orchard-coppice.git", rev = "deea5a3b499c9f4e9e30ff4d9ffca4e0f51234ca" }
 equihash = { git = "https://github.com/zcash/librustzcash.git", rev = "6c07e5f3297febf469e5cc8d0b91321e0767cdd7" }
 f4jumble = { git = "https://github.com/zcash/librustzcash.git", rev = "6c07e5f3297febf469e5cc8d0b91321e0767cdd7" }
 zcash_address = { git = "https://github.com/zcash/librustzcash.git", rev = "6c07e5f3297febf469e5cc8d0b91321e0767cdd7" }

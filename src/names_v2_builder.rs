@@ -2630,6 +2630,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "generates a real Ironwood consensus proof; run via `cargo test -- --ignored` or the scripted release qualification"]
     fn funded_reveal_proves_signs_and_extracts_one_consensus_transaction() {
         let fixture = funded_reveal_fixture();
         let witness_plan = deterministic_funded_reveal_witness_plan(&fixture);
