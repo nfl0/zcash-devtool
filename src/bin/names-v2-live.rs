@@ -5158,7 +5158,7 @@ fn verify(args: VerifyArgs) -> Result<()> {
     println!("REVEAL_CANONICAL_HEIGHT={}", reveal_block.height);
     println!("REVEAL_CANONICAL_TX_INDEX={}", reveal.tx_index);
     println!("REVEAL_ACTION_INDEX={action_index}");
-    println!("NO_PREDECESSOR_RESET=yes");
+    println!("REPLACEMENT_PREDECESSOR=none");
     println!("ACCEPTED_NAME_ID={}", hex::encode(accepted.data.name_id));
     println!("ACCEPTED_OWNER_PK={}", hex::encode(accepted.data.owner_pk));
     println!("ACCEPTED_SEQUENCE={}", accepted.data.sequence);
