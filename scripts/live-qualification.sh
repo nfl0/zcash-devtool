@@ -23,13 +23,15 @@ Usage: live-qualification.sh [--phase N] [--keep-state]
 Options:
   --phase N       Run a fresh stack through phase N (1-5), run deterministic
                   Phase 6, run all live phases including deep-reorg Phase 7,
-                  or run the one live v2 COMMIT -> REVEAL flow (Phase 8).
+                  run the one live v2 COMMIT -> REVEAL flow (Phase 8), or run
+                  the full v2 release lifecycle COMMIT -> REVEAL -> UPDATE ->
+                  RENEW -> RELEASE -> claimability boundary (Phase 9).
                   The default is 5.
   --resume DIR   Reuse a Phase 4 checkpoint and run only Phase 5. The directory
                   must have been produced with --phase 4 --keep-state.
   --keep-state   Preserve the disposable run directory after success. This is
                   required when creating a checkpoint for --resume.
-  -h, --help     Show this help.
+  -h|--help     Show this help.
 
 Examples:
   ./scripts/live-qualification.sh --phase 1
@@ -38,6 +40,7 @@ Examples:
   ./scripts/live-qualification.sh --phase 6
   ./scripts/live-qualification.sh --phase 7
   ./scripts/live-qualification.sh --phase 8 --keep-state
+  ./scripts/live-qualification.sh --phase 9 --keep-state
 EOF
 }
 
@@ -74,8 +77,8 @@ while (($# > 0)); do
     esac
 done
 
-[[ "$TARGET_PHASE" =~ ^[1-8]$ ]] || {
-    printf '[FAIL] --phase must be an integer from 1 through 8\n' >&2
+[[ "$TARGET_PHASE" =~ ^[1-9]$ ]] || {
+    printf '[FAIL] --phase must be an integer from 1 through 9\n' >&2
     exit 2
 }
 if [[ -n "$RESUME_DIR" ]]; then
@@ -1127,8 +1130,8 @@ done
 require_executable "$ZAKURA_BIN"
 require_executable "$ZAINO_BIN"
 require_executable "$DEVTOOL_BIN"
-if (( TARGET_PHASE == 8 )); then
-    status "Build the narrow live Names v2 COMMIT -> REVEAL entry point"
+if (( TARGET_PHASE == 8 || TARGET_PHASE == 9 )); then
+    status "Build the narrow live Names v2 lifecycle entry point"
     if ! (cd "$ROOT_DIR/zcash-devtool" && cargo build --offline --bin names-v2-live) \
         >"$LOG_DIR/names-v2-live-build.log" 2>&1; then
         tail -100 "$LOG_DIR/names-v2-live-build.log" >&2 || true
@@ -1137,7 +1140,7 @@ if (( TARGET_PHASE == 8 )); then
     require_executable "$NAMES_V2_LIVE_BIN"
 fi
 printf '[INFO] binaries: %s, %s, %s\n' "$ZAKURA_BIN" "$ZAINO_BIN" "$DEVTOOL_BIN"
-if (( TARGET_PHASE == 8 )); then
+if (( TARGET_PHASE == 8 || TARGET_PHASE == 9 )); then
     printf '[INFO] live Names v2 binary: %s\n' "$NAMES_V2_LIVE_BIN"
 fi
 printf '[INFO] disposable run directory: %s\n' "$WORK_DIR"
@@ -1328,7 +1331,7 @@ printf '[PASS] Ironwood subtree-root serving: yes (explicit gRPC GetSubtreeRoots
 printf '[PASS] ordinary Ironwood wallet receive/spend: yes (mined tx %s)\n' "$TXID"
     printf '[PASS] Phase 1 completed before Phase 2 Coppice lifecycle qualification\n'
 
-if (( TARGET_PHASE == 8 )); then
+if (( TARGET_PHASE == 8 || TARGET_PHASE == 9 )); then
     status "Phase 8: submit the real v2 COMMIT carrier transaction"
     # The live helper reads the mnemonic only from its environment. Keeping it
     # out of the command line also keeps it out of the run log.
@@ -1403,6 +1406,127 @@ if (( TARGET_PHASE == 8 )); then
         "$REVEAL_TXID" "$REVEAL_HEIGHT_EXPECTED"
     printf '[PASS] v2 COMMIT maturity distance=%s blocks; target/reveal height=%s; logs=%s\n' \
         "$MATURITY_DISTANCE" "$TARGET_REVEAL_HEIGHT" "$LOG_DIR"
+
+    if (( TARGET_PHASE == 8 )); then
+        exit 0
+    fi
+
+    status "Phase 9: canonical UPDATE on the active registration"
+    wallet_sync_logged names-v2-update-sync
+    UPDATE_HEIGHT_EXPECTED=$(($(zakura_tip_height) + 1))
+    run_logged names-v2-update timeout 1800 "$NAMES_V2_LIVE_BIN" update \
+        --wallet-dir "$WALLET_DIR" --rpc-url "$ZAKURA_RPC_URL" \
+        --reveal-txid "$REVEAL_TXID"
+    UPDATE_TXID="$(rg -a -o '^UPDATE_TXID=[0-9a-f]{64}$' \
+        "$LOG_DIR/names-v2-update.log" | tail -1 | cut -d= -f2)"
+    [[ -n "$UPDATE_TXID" ]] || die "live v2 UPDATE did not emit a transaction id"
+    rpc_generate 1
+    wait_for_zaino_tip "$UPDATE_HEIGHT_EXPECTED"
+    wallet_sync_logged names-v2-post-update-sync
+    run_logged names-v2-verify-update timeout 1200 "$NAMES_V2_LIVE_BIN" verify-update \
+        --rpc-url "$ZAKURA_RPC_URL" --reveal-txid "$REVEAL_TXID" \
+        --update-txid "$UPDATE_TXID"
+    rg -a -q '^NAMES_FULL_FRESH_MATCH=yes$' "$LOG_DIR/names-v2-verify-update.log" \
+        || die "canonical Names v2 verification disagreed after the live UPDATE"
+    printf '[PASS] live v2 UPDATE %s mined at h=%s and canonically accepted\n' \
+        "$UPDATE_TXID" "$UPDATE_HEIGHT_EXPECTED"
+
+    status "Phase 9: mine to the next scheduled RENEW anchor"
+    wallet_sync_logged names-v2-renew-pre-sync
+    RENEW_TARGET_HEIGHT="$(timeout 120 "$NAMES_V2_LIVE_BIN" target \
+        --from-height "$(($(zakura_tip_height) + 1))" \
+        | sed -n 's/^TARGET_REVEAL_HEIGHT=//p' | tail -1)"
+    [[ "$RENEW_TARGET_HEIGHT" =~ ^[0-9]+$ ]] \
+        || die "live v2 RENEW target derivation did not emit a height"
+    RENEW_BLOCKS=$((RENEW_TARGET_HEIGHT - 1 - $(zakura_tip_height)))
+    (( RENEW_BLOCKS >= 0 )) \
+        || die "live v2 RENEW anchor $RENEW_TARGET_HEIGHT is not ahead of the current tip"
+    if (( RENEW_BLOCKS > 0 )); then
+        rpc_generate "$RENEW_BLOCKS"
+        wait_for_zaino_tip "$((RENEW_TARGET_HEIGHT - 1))"
+        wallet_sync_logged names-v2-renew-sync
+    fi
+
+    status "Phase 9: canonical RENEW at the scheduled anchor"
+    RENEW_HEIGHT_EXPECTED="$RENEW_TARGET_HEIGHT"
+    run_logged names-v2-renew timeout 1800 "$NAMES_V2_LIVE_BIN" renew \
+        --wallet-dir "$WALLET_DIR" --rpc-url "$ZAKURA_RPC_URL" \
+        --reveal-txid "$REVEAL_TXID" --update-txid "$UPDATE_TXID"
+    RENEW_TXID="$(rg -a -o '^RENEW_TXID=[0-9a-f]{64}$' \
+        "$LOG_DIR/names-v2-renew.log" | tail -1 | cut -d= -f2)"
+    [[ -n "$RENEW_TXID" ]] || die "live v2 RENEW did not emit a transaction id"
+    rpc_generate 1
+    wait_for_zaino_tip "$RENEW_HEIGHT_EXPECTED"
+    wallet_sync_logged names-v2-post-renew-sync
+    run_logged names-v2-verify-renew timeout 1200 "$NAMES_V2_LIVE_BIN" verify-renew \
+        --rpc-url "$ZAKURA_RPC_URL" --reveal-txid "$REVEAL_TXID" \
+        --update-txid "$UPDATE_TXID" --renew-txid "$RENEW_TXID"
+    rg -a -q '^NAMES_FULL_FRESH_MATCH=yes$' "$LOG_DIR/names-v2-verify-renew.log" \
+        || die "canonical Names v2 verification disagreed after the live RENEW"
+    printf '[PASS] live v2 RENEW %s mined at scheduled h=%s and canonically accepted\n' \
+        "$RENEW_TXID" "$RENEW_HEIGHT_EXPECTED"
+
+    status "Phase 9: canonical RELEASE of the renewed registration"
+    RELEASE_HEIGHT_EXPECTED=$((RENEW_HEIGHT_EXPECTED + 1))
+    run_logged names-v2-release timeout 1800 "$NAMES_V2_LIVE_BIN" release \
+        --wallet-dir "$WALLET_DIR" --rpc-url "$ZAKURA_RPC_URL" \
+        --reveal-txid "$REVEAL_TXID" --update-txid "$UPDATE_TXID" \
+        --renew-txid "$RENEW_TXID"
+    RELEASE_TXID="$(rg -a -o '^RELEASE_TXID=[0-9a-f]{64}$' \
+        "$LOG_DIR/names-v2-release.log" | tail -1 | cut -d= -f2)"
+    [[ -n "$RELEASE_TXID" ]] || die "live v2 RELEASE did not emit a transaction id"
+    rpc_generate 1
+    wait_for_zaino_tip "$RELEASE_HEIGHT_EXPECTED"
+    wallet_sync_logged names-v2-post-release-sync
+    run_logged names-v2-verify-release timeout 1200 "$NAMES_V2_LIVE_BIN" verify-release \
+        --rpc-url "$ZAKURA_RPC_URL" --reveal-txid "$REVEAL_TXID" \
+        --update-txid "$UPDATE_TXID" --renew-txid "$RENEW_TXID" \
+        --release-txid "$RELEASE_TXID"
+    rg -a -q '^NAMES_FULL_FRESH_MATCH=yes$' "$LOG_DIR/names-v2-verify-release.log" \
+        || die "canonical Names v2 verification disagreed after the live RELEASE"
+    printf '[PASS] live v2 RELEASE %s mined at h=%s and canonically accepted\n' \
+        "$RELEASE_TXID" "$RELEASE_HEIGHT_EXPECTED"
+
+    status "Phase 9: verify the exact Released -> Expired claimability boundary"
+    wallet_sync_logged names-v2-boundary-pre-sync
+    CLAIMABLE_HEIGHT="$(rg -a -o '^CLAIMABLE_HEIGHT=[0-9]+$' \
+        "$LOG_DIR/names-v2-verify-release.log" | tail -1 | cut -d= -f2)"
+    [[ "$CLAIMABLE_HEIGHT" =~ ^[0-9]+$ ]] \
+        || die "live v2 RELEASE verification did not emit the claimability height"
+    LAST_BLOCKED_HEIGHT=$((CLAIMABLE_HEIGHT - 1))
+    BOUNDARY_BLOCKS=$((LAST_BLOCKED_HEIGHT - $(zakura_tip_height)))
+    (( BOUNDARY_BLOCKS >= 0 )) \
+        || die "live v2 claimability boundary $CLAIMABLE_HEIGHT is behind the current tip"
+    if (( BOUNDARY_BLOCKS > 0 )); then
+        rpc_generate "$BOUNDARY_BLOCKS"
+        wait_for_zaino_tip "$LAST_BLOCKED_HEIGHT"
+        wallet_sync_logged names-v2-boundary-released-sync
+    fi
+    run_logged names-v2-verify-boundary-released timeout 1200 "$NAMES_V2_LIVE_BIN" \
+        verify-release-boundary --rpc-url "$ZAKURA_RPC_URL" \
+        --reveal-txid "$REVEAL_TXID" --update-txid "$UPDATE_TXID" \
+        --renew-txid "$RENEW_TXID" --release-txid "$RELEASE_TXID" \
+        --expected-status released
+    rg -a -q '^NAMES_FULL_REPLAY_STATUS=Released$' \
+        "$LOG_DIR/names-v2-verify-boundary-released.log" \
+        || die "the last blocked height did not resolve as Released"
+    rpc_generate 1
+    wait_for_zaino_tip "$CLAIMABLE_HEIGHT"
+    wallet_sync_logged names-v2-boundary-expired-sync
+    run_logged names-v2-verify-boundary-expired timeout 1200 "$NAMES_V2_LIVE_BIN" \
+        verify-release-boundary --rpc-url "$ZAKURA_RPC_URL" \
+        --reveal-txid "$REVEAL_TXID" --update-txid "$UPDATE_TXID" \
+        --renew-txid "$RENEW_TXID" --release-txid "$RELEASE_TXID" \
+        --expected-status expired
+    rg -a -q '^NAMES_FULL_REPLAY_STATUS=Expired$' \
+        "$LOG_DIR/names-v2-verify-boundary-expired.log" \
+        || die "the claimability height did not resolve as Expired"
+    printf '[PASS] v2 lifecycle claimability boundary: Released at h=%s, Expired at h=%s\n' \
+        "$LAST_BLOCKED_HEIGHT" "$CLAIMABLE_HEIGHT"
+
+    printf '\n[PASS] full v2 release lifecycle qualification complete\n'
+    printf '[PASS] COMMIT=%s REVEAL=%s UPDATE=%s RENEW=%s RELEASE=%s\n' \
+        "$COMMIT_TXID" "$REVEAL_TXID" "$UPDATE_TXID" "$RENEW_TXID" "$RELEASE_TXID"
     exit 0
 fi
 
