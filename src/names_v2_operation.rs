@@ -42,7 +42,7 @@ use coppice_names::v2::{
 use orchard::circuit::state_note_binding::{
     GenesisWitness, TransitionWitness, spend_auth_owner_key_bytes,
 };
-use orchard::keys::{FullViewingKey, Scope, SpendAuthorizingKey};
+use orchard::keys::{FullViewingKey, OutgoingViewingKey, Scope, SpendAuthorizingKey};
 use orchard::note::{ExtractedNoteCommitment, Note, NoteVersion, RandomSeed, Rho};
 use orchard::value::NoteValue;
 use zcash_protocol::consensus::{BlockHeight, Parameters};
@@ -477,17 +477,79 @@ impl TransitionPreparation {
     }
 }
 
-/// One wallet funding note spent alongside the designated state-note spend.
-pub struct SingleFunding {
-    /// Full viewing key owning `note`.
-    pub fvk: FullViewingKey,
-    /// The funding note itself.
-    pub note: Note,
+/// Carrier-output policy for one finalized state operation's CPV1 frames.
+///
+/// Every CPV1 frame becomes one distinct Ironwood rendezvous output with this
+/// recipient and value; the frame memo is the output memo. The value is a
+/// wallet funding decision, bounded below by the protocol dust threshold.
+pub struct CarrierPlan {
+    /// Recipient of every carrier output.
+    pub recipient: orchard::Address,
+    /// Value of every carrier output.
+    pub value: NoteValue,
+}
+
+/// Transport policy for the successor state-note output.
+///
+/// The note opening itself is already fixed by the finalized operation; this
+/// selects only how the output is transmitted. A wallet that must later spend
+/// the state note from a restored wallet database should supply its own
+/// outgoing viewing key so the opening stays recoverable from the chain;
+/// `None` omits the outgoing ciphertext entirely. The empty memo is the
+/// canonical Orchard default and carries no Names semantics.
+pub struct SuccessorTransport {
+    /// Outgoing viewing key under which the successor output is recoverable.
+    pub ovk: Option<OutgoingViewingKey>,
+    /// Orchard memo carried by the successor output.
+    pub memo: [u8; 512],
+}
+
+/// Ordinary wallet funding for one designated-pair state operation bundle.
+///
+/// Zero or more additional funding spends and zero or more wallet change
+/// outputs are allowed; a wallet funds the fee from the designated bond note,
+/// from separate funding notes, or both. The designated spend and the exact
+/// successor always occupy the encoded designated action; funding and change
+/// occupy other actions.
+pub struct OperationFunding {
+    /// Additional real Ironwood spends used for funding.
+    pub funding_spends: Vec<FundingSpend>,
+    /// Wallet-controlled Ironwood change outputs.
+    pub change_outputs: Vec<ChangeOutput>,
+}
+
+/// Physical shape and ZIP-317 fee preview taken before funding is sized.
+///
+/// Returns the shape implied by the finalized operation plus
+/// `funding_spend_count` additional real spends and `change_output_count`
+/// change outputs, and the ZIP-317 fee that shape requires at
+/// `target_height`. A wallet uses the fee and its own carrier value policy to
+/// size funding and change before calling [`plan_state_operation`].
+pub fn planned_state_operation_shape_and_fee<P: Parameters>(
+    params: &P,
+    target_height: BlockHeight,
+    finalized: &FinalizedOperation,
+    funding_spend_count: usize,
+    change_output_count: usize,
+) -> Result<(NamesV2IronwoodShape, Zatoshis)> {
+    let carrier_count = finalized.frames().len();
+    let designated_action_index = usize::try_from(finalized.designated_action_index())
+        .context("designated Names action index does not fit usize")?;
+    let real_spend_count = 1usize
+        .checked_add(funding_spend_count)
+        .context("Names v2 real-spend count overflowed usize")?;
+    let shape = names_v2_ironwood_shape_from_counts(
+        real_spend_count,
+        carrier_count,
+        change_output_count,
+        designated_action_index,
+    )?;
+    let fee = required_zip317_fee_for_names_v2(params, target_height, shape)?;
+    Ok((shape, fee))
 }
 
 /// The designated-pair Ironwood plan for one finalized state operation,
-/// together with the ZIP-317 fee and change material implied by the frozen
-/// funding shape.
+/// together with the ZIP-317 fee the planned shape requires.
 pub struct StateOperationPlan {
     /// Plan for [`crate::names_v2_builder::build_names_v2_bundle`]. The
     /// designated spend and the exact successor occupy the same action,
@@ -498,68 +560,101 @@ pub struct StateOperationPlan {
     /// ZIP-317 fee required for `planned_shape` at the target height. The
     /// built bundle's value balance must equal this fee.
     pub required_fee: Zatoshis,
-    /// Value returned to the change recipient after the single funding note
-    /// pays the one-zatoshi carrier outputs and `required_fee`.
-    pub change_value: NoteValue,
+    /// Total value paid out by the carrier outputs.
+    pub carrier_value_total: u64,
 }
 
 /// Assembles the designated-pair Ironwood plan for a finalized state operation.
 ///
-/// The carrier outputs are derived from the operation's CPV1 frames (one
-/// zatoshi each, addressed to `carrier_recipient`); exactly one funding note
-/// and one change output fund the fee, matching the qualified funding shape.
-/// The designated action index is taken from the encoded operation, so a
-/// later stage cannot move or reassign the designated pair.
+/// The carrier outputs are derived from the operation's CPV1 frames under
+/// `carriers`; the successor output is transmitted under `successor`; funding
+/// and change are supplied exactly as the wallet sized them. The plan fails
+/// closed unless the supplied inputs contribute exactly `required_fee` after
+/// paying the carrier and change outputs, so underfunded or overfunding
+/// shapes are rejected before any proving or signing. The designated action
+/// index is taken from the encoded operation, so a later stage cannot move or
+/// reassign the designated pair.
 pub fn plan_state_operation<P: Parameters>(
     params: &P,
     target_height: BlockHeight,
     finalized: &FinalizedOperation,
-    carrier_recipient: orchard::Address,
-    funding: &SingleFunding,
-    change_recipient: orchard::Address,
+    carriers: CarrierPlan,
+    successor: SuccessorTransport,
+    funding: OperationFunding,
 ) -> Result<StateOperationPlan> {
-    let carriers = finalized
+    let carrier_outputs = finalized
         .frames()
         .iter()
         .copied()
         .map(|memo| CarrierOutput {
-            recipient: carrier_recipient,
-            value: NoteValue::from_raw(1),
+            recipient: carriers.recipient,
+            value: carriers.value,
             memo,
         })
         .collect::<Vec<_>>();
     let designated_action_index = usize::try_from(finalized.designated_action_index())
         .context("designated Names action index does not fit usize")?;
-    let planned_shape =
-        names_v2_ironwood_shape_from_counts(2, carriers.len(), 1, designated_action_index)?;
+    let real_spend_count = 1usize
+        .checked_add(funding.funding_spends.len())
+        .context("Names v2 real-spend count overflowed usize")?;
+    let planned_shape = names_v2_ironwood_shape_from_counts(
+        real_spend_count,
+        carrier_outputs.len(),
+        funding.change_outputs.len(),
+        designated_action_index,
+    )?;
     let required_fee = required_zip317_fee_for_names_v2(params, target_height, planned_shape)?;
-    let required_fee_value = required_fee.into_u64();
-    let carrier_value = u64::try_from(carriers.len()).context("carrier count does not fit u64")?;
-    let change_value = funding
-        .note
+    let carrier_value_total = carriers
+        .value
+        .inner()
+        .checked_mul(
+            u64::try_from(carrier_outputs.len()).context("carrier count does not fit u64")?,
+        )
+        .context("carrier output value overflowed u64")?;
+
+    // The designated bond value returns to the successor output (the
+    // construction preserves value exactly), so the fee is funded by the
+    // additional funding spends net of carrier and change outputs.
+    let funding_value_total = funding
+        .funding_spends
+        .iter()
+        .try_fold(0u64, |total, spend| {
+            total
+                .checked_add(spend.note.value().inner())
+                .context("funding spend value overflowed u64")
+        })?;
+    let change_value_total = funding
+        .change_outputs
+        .iter()
+        .try_fold(0u64, |total, output| {
+            total
+                .checked_add(output.value.inner())
+                .context("change output value overflowed u64")
+        })?;
+    let contributed_fee = finalized
+        .designated_note
         .value()
         .inner()
-        .checked_sub(carrier_value)
-        .and_then(|value| value.checked_sub(required_fee_value))
-        .context("funding note cannot cover the carrier outputs and the ZIP-317 fee")?;
+        .checked_add(funding_value_total)
+        .and_then(|value| value.checked_sub(finalized.successor_note.value().inner()))
+        .and_then(|value| value.checked_sub(carrier_value_total))
+        .and_then(|value| value.checked_sub(change_value_total))
+        .context("funding does not cover the carrier outputs and change outputs")?;
+    ensure!(
+        contributed_fee == required_fee.into_u64(),
+        "Names v2 funding does not balance: supplied inputs contribute {contributed_fee} zatoshis toward a required ZIP-317 fee of {}",
+        required_fee.into_u64()
+    );
+
     let plan = NamesV2IronwoodPlan {
         designated_fvk: finalized.owner_fvk.clone(),
         designated_spend: finalized.designated_note.clone(),
         successor_note: finalized.successor_note.clone(),
-        successor_ovk: None,
-        successor_memo: [0; 512],
-        carrier_outputs: carriers,
-        funding_spends: vec![FundingSpend {
-            fvk: funding.fvk.clone(),
-            note: funding.note.clone(),
-        }],
-        change_outputs: vec![ChangeOutput {
-            fvk: funding.fvk.clone(),
-            ovk: None,
-            recipient: change_recipient,
-            value: NoteValue::from_raw(change_value),
-            memo: [0; 512],
-        }],
+        successor_ovk: successor.ovk,
+        successor_memo: successor.memo,
+        carrier_outputs,
+        funding_spends: funding.funding_spends,
+        change_outputs: funding.change_outputs,
         designated_action_index,
     };
     ensure!(
@@ -570,7 +665,7 @@ pub fn plan_state_operation<P: Parameters>(
         plan,
         planned_shape,
         required_fee,
-        change_value: NoteValue::from_raw(change_value),
+        carrier_value_total,
     })
 }
 
@@ -1600,18 +1695,51 @@ mod tests {
 
         let funding_note = bond_note(&fvk, 60_000, 6, 7);
         let carrier_recipient = key_material(30).0.address_at(0u32, Scope::External);
+        let (shape, fee) = planned_state_operation_shape_and_fee(
+            &consensus_params,
+            BlockHeight::from_u32(update_height),
+            &finalized,
+            1,
+            1,
+        )
+        .unwrap();
+        let carrier_value_total = u64::try_from(finalized.frames().len()).unwrap();
+        let change_value = funding_note
+            .value()
+            .inner()
+            .checked_sub(carrier_value_total)
+            .and_then(|value| value.checked_sub(fee.into_u64()))
+            .unwrap();
         let planned = plan_state_operation(
             &consensus_params,
             BlockHeight::from_u32(update_height),
             &finalized,
-            carrier_recipient,
-            &SingleFunding {
-                fvk: fvk.clone(),
-                note: funding_note.clone(),
+            CarrierPlan {
+                recipient: carrier_recipient,
+                value: NoteValue::from_raw(1),
             },
-            fvk.address_at(0u32, Scope::Internal),
+            SuccessorTransport {
+                ovk: None,
+                memo: [0; 512],
+            },
+            OperationFunding {
+                funding_spends: vec![FundingSpend {
+                    fvk: fvk.clone(),
+                    note: funding_note.clone(),
+                }],
+                change_outputs: vec![ChangeOutput {
+                    fvk: fvk.clone(),
+                    ovk: None,
+                    recipient: fvk.address_at(0u32, Scope::Internal),
+                    value: NoteValue::from_raw(change_value),
+                    memo: [0; 512],
+                }],
+            },
         )
         .unwrap();
+        assert_eq!(planned.planned_shape, shape);
+        assert_eq!(planned.required_fee, fee);
+        assert_eq!(planned.carrier_value_total, carrier_value_total);
 
         assert_eq!(
             planned.plan.designated_action_index as u32,
@@ -1651,6 +1779,165 @@ mod tests {
         assert_eq!(
             built.designated_commitment,
             ExtractedNoteCommitment::from(finalized.successor_note().commitment()).to_bytes()
+        );
+    }
+
+    #[test]
+    fn state_operation_plan_supports_zero_and_multi_note_funding() {
+        let params = V2Parameters::testing();
+        let consensus_params = local_v6_params();
+        let (fvk, ask) = key_material(18);
+        let carrier_recipient = key_material(31).0.address_at(0u32, Scope::External);
+
+        // Zero additional funding spends cannot fund a fee: the designated
+        // bond value returns intact to the successor output, so carrier
+        // outputs and the fee must come from separate funding.
+        let small_intent = RegistrationIntent {
+            record: vec![5; 8],
+            ..test_intent(&ask, 5, 7)
+        };
+        let designated_note = bond_note(&fvk, 40_000, 8, 9);
+        let reveal_intent_commitment = small_intent.commitment().unwrap();
+        let reveal_preparation = prepare_reveal(
+            RevealInputs {
+                intent: small_intent,
+                commit: CommitRef::new(
+                    ProducerPosition::new(900, 1, [3; 32]),
+                    0,
+                    reveal_intent_commitment,
+                ),
+                replacement_predecessor: None,
+                registration_note: designated_note,
+                scope: Scope::External,
+                fvk: fvk.clone(),
+                ask: ask.clone(),
+                designated_action_index: 2,
+                operation_height: 40,
+                successor_seed: [9; 32],
+            },
+            params,
+        )
+        .unwrap();
+        let finalized = reveal_preparation.finalize(vec![0x5A; 320]).unwrap();
+        assert!(finalized.frames().len() >= 1);
+        let zero_funding = plan_state_operation(
+            &consensus_params,
+            BlockHeight::from_u32(41),
+            &finalized,
+            CarrierPlan {
+                recipient: carrier_recipient,
+                value: NoteValue::from_raw(1),
+            },
+            SuccessorTransport {
+                ovk: None,
+                memo: [0; 512],
+            },
+            OperationFunding {
+                funding_spends: vec![],
+                change_outputs: vec![],
+            },
+        );
+        assert!(
+            zero_funding.is_err(),
+            "zero funding cannot pay the carriers and fee; must fail closed"
+        );
+
+        // Two funding notes with the change split across both owners balance
+        // exactly like the single-note shape.
+        let funding_one = bond_note(&fvk, 30_000, 10, 11);
+        let funding_two = bond_note(&fvk, 40_000, 11, 12);
+        let (shape, fee) = planned_state_operation_shape_and_fee(
+            &consensus_params,
+            BlockHeight::from_u32(41),
+            &finalized,
+            2,
+            2,
+        )
+        .unwrap();
+        let carrier_total = u64::try_from(finalized.frames().len()).unwrap();
+        let change_one = 20_000u64;
+        let change_two = funding_one
+            .value()
+            .inner()
+            .checked_add(funding_two.value().inner())
+            .and_then(|value| value.checked_sub(carrier_total))
+            .and_then(|value| value.checked_sub(fee.into_u64()))
+            .and_then(|value| value.checked_sub(change_one))
+            .unwrap();
+        let multi_funding = plan_state_operation(
+            &consensus_params,
+            BlockHeight::from_u32(41),
+            &finalized,
+            CarrierPlan {
+                recipient: carrier_recipient,
+                value: NoteValue::from_raw(1),
+            },
+            SuccessorTransport {
+                ovk: None,
+                memo: [0; 512],
+            },
+            OperationFunding {
+                funding_spends: vec![
+                    FundingSpend {
+                        fvk: fvk.clone(),
+                        note: funding_one.clone(),
+                    },
+                    FundingSpend {
+                        fvk: fvk.clone(),
+                        note: funding_two.clone(),
+                    },
+                ],
+                change_outputs: vec![
+                    ChangeOutput {
+                        fvk: fvk.clone(),
+                        ovk: None,
+                        recipient: fvk.address_at(0u32, Scope::Internal),
+                        value: NoteValue::from_raw(change_one),
+                        memo: [0; 512],
+                    },
+                    ChangeOutput {
+                        fvk: fvk.clone(),
+                        ovk: None,
+                        recipient: fvk.address_at(0u32, Scope::External),
+                        value: NoteValue::from_raw(change_two),
+                        memo: [0; 512],
+                    },
+                ],
+            },
+        )
+        .unwrap();
+        assert_eq!(multi_funding.planned_shape, shape);
+        let built = build_names_v2_bundle(multi_funding.plan, StdRng::from_seed([79; 32])).unwrap();
+        assert_eq!(
+            built.ironwood_value_balance,
+            i64::try_from(multi_funding.required_fee.into_u64()).unwrap()
+        );
+        assert_eq!(built.real_spend_count, 3);
+
+        // Unbalanced funding fails closed before any proving.
+        let underfunded = plan_state_operation(
+            &consensus_params,
+            BlockHeight::from_u32(41),
+            &finalized,
+            CarrierPlan {
+                recipient: carrier_recipient,
+                value: NoteValue::from_raw(1),
+            },
+            SuccessorTransport {
+                ovk: None,
+                memo: [0; 512],
+            },
+            OperationFunding {
+                funding_spends: vec![FundingSpend {
+                    fvk: fvk.clone(),
+                    note: funding_one.clone(),
+                }],
+                change_outputs: vec![],
+            },
+        );
+        assert!(
+            underfunded.is_err(),
+            "unbalanced funding must fail at planning time"
         );
     }
 }

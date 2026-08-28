@@ -33,6 +33,7 @@ use orchard::{
     circuit::state_note_binding::spend_auth_owner_key_bytes,
     keys::{FullViewingKey, Scope, SpendAuthorizingKey},
     note::{ExtractedNoteCommitment, Note, NoteVersion, RandomSeed, Rho},
+    value::NoteValue,
 };
 use rand::rngs::OsRng;
 use zcash_client_backend::{
@@ -66,8 +67,10 @@ use zcash_devtool::names_v2_builder::{
     required_zip317_fee_for_names_v2, sign_names_v2_ironwood_pczt, verify_designated_action,
 };
 use zcash_devtool::names_v2_operation::{
-    RevealInputs, SingleFunding, TransitionInputs, plan_state_operation, prepare_commit,
-    prepare_release, prepare_renew, prepare_reveal, prepare_update,
+    CarrierPlan, FinalizedOperation, OperationFunding, RevealInputs, StateOperationPlan,
+    SuccessorTransport, TransitionInputs, plan_state_operation,
+    planned_state_operation_shape_and_fee, prepare_commit, prepare_release, prepare_renew,
+    prepare_reveal, prepare_update,
 };
 
 const NAME: &str = "footprint";
@@ -517,6 +520,61 @@ fn submit_raw(rpc_url: &str, bytes: &[u8]) -> Result<[u8; 32]> {
     client
         .submit_raw_transaction(bytes)
         .map_err(|error| anyhow::anyhow!("sendrawtransaction: {error:?}"))
+}
+
+/// The qualified live funding policy: one funding note, one internal change
+/// output, one-zatoshi carriers, and no outgoing ciphertexts. Production
+/// wallets make their own funding and outgoing-recovery decisions directly
+/// through the reusable library API; only this disposable harness fixes them.
+fn plan_qualified_funding(
+    params: &LocalNetwork,
+    target_height: BlockHeight,
+    finalized_operation: &FinalizedOperation,
+    carrier_recipient: orchard::Address,
+    names_fvk: &FullViewingKey,
+    funding_note: &Note,
+) -> Result<StateOperationPlan> {
+    let (planned_shape, required_fee) =
+        planned_state_operation_shape_and_fee(params, target_height, finalized_operation, 1, 1)?;
+    let carrier_value_total = u64::try_from(finalized_operation.frames().len())
+        .context("carrier count does not fit u64")?;
+    let change_value = funding_note
+        .value()
+        .inner()
+        .checked_sub(carrier_value_total)
+        .and_then(|value| value.checked_sub(required_fee.into_u64()))
+        .context("funding note cannot cover the carrier outputs and the ZIP-317 fee")?;
+    let planned = plan_state_operation(
+        params,
+        target_height,
+        finalized_operation,
+        CarrierPlan {
+            recipient: carrier_recipient,
+            value: NoteValue::from_raw(1),
+        },
+        SuccessorTransport {
+            ovk: None,
+            memo: [0; 512],
+        },
+        OperationFunding {
+            funding_spends: vec![FundingSpend {
+                fvk: names_fvk.clone(),
+                note: funding_note.clone(),
+            }],
+            change_outputs: vec![ChangeOutput {
+                fvk: names_fvk.clone(),
+                ovk: None,
+                recipient: names_fvk.address_at(0u32, Scope::Internal),
+                value: NoteValue::from_raw(change_value),
+                memo: [0; 512],
+            }],
+        },
+    )?;
+    ensure!(
+        planned.planned_shape == planned_shape,
+        "Names v2 plan shape changed after fee planning"
+    );
+    Ok(planned)
 }
 
 fn build_commit(args: CommonArgs) -> Result<()> {
@@ -1462,16 +1520,13 @@ fn reveal_with_replacement(
         .context("wallet has no synchronized target/anchor heights")?
         .1;
     let (anchor, paths) = wallet_witnesses(&mut db, anchor_height, [registration.2, funding.2])?;
-    let planned = plan_state_operation(
+    let planned = plan_qualified_funding(
         &params,
         BlockHeight::from_u32(construction_height),
         &finalized_operation,
         carrier_recipient,
-        &SingleFunding {
-            fvk: names_fvk.clone(),
-            note: funding_note.clone(),
-        },
-        names_fvk.address_at(0u32, Scope::Internal),
+        &names_fvk,
+        &funding_note,
     )?;
     let built = build_names_v2_bundle(planned.plan, OsRng)?;
     ensure!(
@@ -2074,16 +2129,13 @@ fn update(args: UpdateArgs) -> Result<()> {
         anchor_height,
         [predecessor_position, funding_position],
     )?;
-    let planned = plan_state_operation(
+    let planned = plan_qualified_funding(
         &params,
         BlockHeight::from_u32(construction_height),
         &finalized_operation,
         carrier_recipient,
-        &SingleFunding {
-            fvk: names_fvk.clone(),
-            note: funding_note.clone(),
-        },
-        names_fvk.address_at(0u32, Scope::Internal),
+        &names_fvk,
+        &funding_note,
     )?;
     let built = build_names_v2_bundle(planned.plan, OsRng)?;
     ensure!(
@@ -2693,16 +2745,13 @@ fn renew(args: RenewArgs) -> Result<()> {
         anchor_height,
         [predecessor_position, funding_position],
     )?;
-    let planned = plan_state_operation(
+    let planned = plan_qualified_funding(
         &params,
         BlockHeight::from_u32(construction_height),
         &finalized_operation,
         carrier_recipient,
-        &SingleFunding {
-            fvk: names_fvk.clone(),
-            note: funding_note.clone(),
-        },
-        names_fvk.address_at(0u32, Scope::Internal),
+        &names_fvk,
+        &funding_note,
     )?;
     let built = build_names_v2_bundle(planned.plan, OsRng)?;
     ensure!(
@@ -3008,16 +3057,13 @@ fn release(args: ReleaseArgs) -> Result<()> {
         anchor_height,
         [predecessor_position, funding_position],
     )?;
-    let planned = plan_state_operation(
+    let planned = plan_qualified_funding(
         &params,
         BlockHeight::from_u32(construction_height),
         &finalized_operation,
         carrier_recipient,
-        &SingleFunding {
-            fvk: names_fvk.clone(),
-            note: funding_note.clone(),
-        },
-        names_fvk.address_at(0u32, Scope::Internal),
+        &names_fvk,
+        &funding_note,
     )?;
     let built = build_names_v2_bundle(planned.plan, OsRng)?;
     ensure!(
