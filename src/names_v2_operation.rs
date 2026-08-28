@@ -165,6 +165,7 @@ pub struct RevealPreparation {
     registration_note: Note,
     successor_note: Note,
     designated_action_index: u32,
+    operation_height: u32,
     statement: GenesisStatement,
     witness: GenesisWitness,
 }
@@ -209,6 +210,27 @@ pub fn prepare_reveal(inputs: RevealInputs, params: V2Parameters) -> Result<Reve
     let name_id = intent
         .name_id()
         .map_err(|error| anyhow::anyhow!("derive REVEAL name id: {error:?}"))?;
+    // Local typed height bindings only: the intended REVEAL height must land
+    // inside this COMMIT's lifetime at the name's scheduled anchor. Canonical
+    // COMMIT authenticity, reorg state, name availability, replacement
+    // validity, and reset eligibility remain replay/state-machine checks.
+    ensure!(
+        operation_height > commit.position.height,
+        "intended REVEAL height must be strictly after the canonical COMMIT height"
+    );
+    ensure!(
+        operation_height
+            <= commit
+                .position
+                .height
+                .checked_add(params.commit_ttl_blocks)
+                .context("Names v2 COMMIT lifetime overflow")?,
+        "intended REVEAL height is beyond the canonical COMMIT lifetime"
+    );
+    ensure!(
+        is_anchor_height(name_id, operation_height, params),
+        "intended REVEAL height is not the name's scheduled anchor height"
+    );
     let registration_nullifier = registration_note.nullifier(&fvk).to_bytes();
     let successor_note = successor_state_note(
         &fvk,
@@ -269,6 +291,7 @@ pub fn prepare_reveal(inputs: RevealInputs, params: V2Parameters) -> Result<Reve
         registration_note,
         successor_note,
         designated_action_index,
+        operation_height,
         statement,
         witness,
     })
@@ -295,6 +318,11 @@ impl RevealPreparation {
         self.designated_action_index
     }
 
+    /// The exact intended canonical height of this operation.
+    pub const fn operation_height(&self) -> u32 {
+        self.operation_height
+    }
+
     /// Attaches the generated genesis proof and completes the canonical
     /// REVEAL operation, its CNV2 bytes, and its CPV1 frames.
     pub fn finalize(self, genesis_proof: Vec<u8>) -> Result<FinalizedOperation> {
@@ -314,6 +342,7 @@ impl RevealPreparation {
             self.fvk,
             self.registration_note,
             self.successor_note,
+            self.operation_height,
         )
     }
 }
@@ -356,6 +385,7 @@ pub struct TransitionPreparation {
     predecessor_note: Note,
     successor_note: Note,
     designated_action_index: u32,
+    operation_height: u32,
 }
 
 /// Prepares a canonical UPDATE from typed inputs.
@@ -435,6 +465,11 @@ impl TransitionPreparation {
         self.designated_action_index
     }
 
+    /// The exact intended canonical height of this operation.
+    pub const fn operation_height(&self) -> u32 {
+        self.operation_height
+    }
+
     /// Attaches the generated transition proof and completes the canonical
     /// operation, its CNV2 bytes, and its CPV1 frames.
     pub fn finalize(self, transition_proof: Vec<u8>) -> Result<FinalizedOperation> {
@@ -473,6 +508,7 @@ impl TransitionPreparation {
             self.fvk,
             self.predecessor_note,
             self.successor_note,
+            self.operation_height,
         )
     }
 }
@@ -494,9 +530,10 @@ pub struct CarrierPlan {
 /// The note opening itself is already fixed by the finalized operation; this
 /// selects only how the output is transmitted. A wallet that must later spend
 /// the state note from a restored wallet database should supply its own
-/// outgoing viewing key so the opening stays recoverable from the chain;
-/// `None` omits the outgoing ciphertext entirely. The empty memo is the
-/// canonical Orchard default and carries no Names semantics.
+/// outgoing viewing key; with `ovk: None` the constructor supplies no OVK and
+/// makes no recoverability guarantee through any outgoing ciphertext. The
+/// empty memo is the canonical Orchard default and carries no Names
+/// semantics.
 pub struct SuccessorTransport {
     /// Outgoing viewing key under which the successor output is recoverable.
     pub ovk: Option<OutgoingViewingKey>,
@@ -507,10 +544,12 @@ pub struct SuccessorTransport {
 /// Ordinary wallet funding for one designated-pair state operation bundle.
 ///
 /// Zero or more additional funding spends and zero or more wallet change
-/// outputs are allowed; a wallet funds the fee from the designated bond note,
-/// from separate funding notes, or both. The designated spend and the exact
-/// successor always occupy the encoded designated action; funding and change
-/// occupy other actions.
+/// outputs are allowed. The designated predecessor/bond value is preserved
+/// exactly into the successor state note, so it contributes nothing net to
+/// the fee: the additional funding spends pay the carrier outputs, the
+/// ZIP-317 fee, and any change. The designated spend and the exact successor
+/// always occupy the encoded designated action; funding and change occupy
+/// other actions.
 pub struct OperationFunding {
     /// Additional real Ironwood spends used for funding.
     pub funding_spends: Vec<FundingSpend>,
@@ -520,14 +559,15 @@ pub struct OperationFunding {
 
 /// Physical shape and ZIP-317 fee preview taken before funding is sized.
 ///
-/// Returns the shape implied by the finalized operation plus
-/// `funding_spend_count` additional real spends and `change_output_count`
-/// change outputs, and the ZIP-317 fee that shape requires at
-/// `target_height`. A wallet uses the fee and its own carrier value policy to
-/// size funding and change before calling [`plan_state_operation`].
+/// The fee is planned at exactly the finalized operation's intended height;
+/// there is no independent height argument to drift. Returns the shape
+/// implied by the finalized operation plus `funding_spend_count` additional
+/// real spends and `change_output_count` change outputs, and the ZIP-317 fee
+/// that shape requires at that height. A wallet uses the fee and its own
+/// carrier value policy to size funding and change before calling
+/// [`plan_state_operation`].
 pub fn planned_state_operation_shape_and_fee<P: Parameters>(
     params: &P,
-    target_height: BlockHeight,
     finalized: &FinalizedOperation,
     funding_spend_count: usize,
     change_output_count: usize,
@@ -544,7 +584,11 @@ pub fn planned_state_operation_shape_and_fee<P: Parameters>(
         change_output_count,
         designated_action_index,
     )?;
-    let fee = required_zip317_fee_for_names_v2(params, target_height, shape)?;
+    let fee = required_zip317_fee_for_names_v2(
+        params,
+        BlockHeight::from_u32(finalized.operation_height()),
+        shape,
+    )?;
     Ok((shape, fee))
 }
 
@@ -553,35 +597,40 @@ pub fn planned_state_operation_shape_and_fee<P: Parameters>(
 pub struct StateOperationPlan {
     /// Plan for [`crate::names_v2_builder::build_names_v2_bundle`]. The
     /// designated spend and the exact successor occupy the same action,
-    /// which is the action index already encoded in the operation.
+    /// which is the action index already encoded in the operation, and the
+    /// plan carries the operation's intended height for the later PCZT
+    /// expiry binding.
     pub plan: NamesV2IronwoodPlan,
     /// Physical shape `plan` must produce.
     pub planned_shape: NamesV2IronwoodShape,
-    /// ZIP-317 fee required for `planned_shape` at the target height. The
+    /// ZIP-317 fee required for `planned_shape` at the operation height. The
     /// built bundle's value balance must equal this fee.
     pub required_fee: Zatoshis,
     /// Total value paid out by the carrier outputs.
     pub carrier_value_total: u64,
+    /// The finalized operation's intended canonical height.
+    pub operation_height: u32,
 }
 
 /// Assembles the designated-pair Ironwood plan for a finalized state operation.
 ///
-/// The carrier outputs are derived from the operation's CPV1 frames under
-/// `carriers`; the successor output is transmitted under `successor`; funding
-/// and change are supplied exactly as the wallet sized them. The plan fails
-/// closed unless the supplied inputs contribute exactly `required_fee` after
-/// paying the carrier and change outputs, so underfunded or overfunding
-/// shapes are rejected before any proving or signing. The designated action
-/// index is taken from the encoded operation, so a later stage cannot move or
-/// reassign the designated pair.
+/// The fee and shape are planned at exactly the finalized operation's
+/// intended height; the carrier outputs are derived from the operation's
+/// CPV1 frames under `carriers`; the successor output is transmitted under
+/// `successor`; funding and change are supplied exactly as the wallet sized
+/// them. The plan fails closed unless the supplied inputs contribute exactly
+/// `required_fee` after paying the carrier and change outputs, so underfunded
+/// or overfunding shapes are rejected before any proving or signing. The
+/// designated action index is taken from the encoded operation, so a later
+/// stage cannot move or reassign the designated pair.
 pub fn plan_state_operation<P: Parameters>(
     params: &P,
-    target_height: BlockHeight,
     finalized: &FinalizedOperation,
     carriers: CarrierPlan,
     successor: SuccessorTransport,
     funding: OperationFunding,
 ) -> Result<StateOperationPlan> {
+    let operation_height = finalized.operation_height();
     let carrier_outputs = finalized
         .frames()
         .iter()
@@ -603,7 +652,11 @@ pub fn plan_state_operation<P: Parameters>(
         funding.change_outputs.len(),
         designated_action_index,
     )?;
-    let required_fee = required_zip317_fee_for_names_v2(params, target_height, planned_shape)?;
+    let required_fee = required_zip317_fee_for_names_v2(
+        params,
+        BlockHeight::from_u32(operation_height),
+        planned_shape,
+    )?;
     let carrier_value_total = carriers
         .value
         .inner()
@@ -656,6 +709,7 @@ pub fn plan_state_operation<P: Parameters>(
         funding_spends: funding.funding_spends,
         change_outputs: funding.change_outputs,
         designated_action_index,
+        operation_height,
     };
     ensure!(
         names_v2_ironwood_shape(&plan)? == planned_shape,
@@ -666,6 +720,7 @@ pub fn plan_state_operation<P: Parameters>(
         planned_shape,
         required_fee,
         carrier_value_total,
+        operation_height,
     })
 }
 
@@ -682,6 +737,7 @@ pub struct FinalizedOperation {
     owner_fvk: FullViewingKey,
     designated_note: Note,
     successor_note: Note,
+    operation_height: u32,
 }
 
 impl FinalizedOperation {
@@ -716,6 +772,12 @@ impl FinalizedOperation {
         self.operation
             .action_index()
             .expect("state operations carry an action index")
+    }
+
+    /// The exact intended canonical height of this operation. Fee planning
+    /// and the later PCZT expiry height are bound to this value.
+    pub const fn operation_height(&self) -> u32 {
+        self.operation_height
     }
 }
 
@@ -852,6 +914,7 @@ fn prepare_transition(
         predecessor_note,
         successor_note,
         designated_action_index,
+        operation_height,
     })
 }
 
@@ -862,6 +925,7 @@ fn finalize_operation(
     owner_fvk: FullViewingKey,
     designated_note: Note,
     successor_note: Note,
+    operation_height: u32,
 ) -> Result<FinalizedOperation> {
     let encoded = encode_operation(&operation)
         .map_err(|error| anyhow::anyhow!("encode Names v2 operation: {error:?}"))?;
@@ -897,16 +961,21 @@ fn finalize_operation(
         owner_fvk,
         designated_note,
         successor_note,
+        operation_height,
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::names_v2_builder::{build_names_v2_bundle, required_zip317_fee_for_names_v2};
+    use crate::names_v2_builder::{
+        NamesV2PcztPlan, build_names_v2_bundle, build_names_v2_pczt,
+        required_zip317_fee_for_names_v2,
+    };
     use coppice_names::v2::schedule::next_anchor_height;
     use orchard::keys::SpendingKey;
     use rand::{SeedableRng, rngs::StdRng};
+    use zcash_protocol::consensus::BranchId;
     use zcash_protocol::local_consensus::LocalNetwork;
 
     /// Deterministic local v6 consensus parameters (regtest-shaped).
@@ -964,6 +1033,27 @@ mod tests {
             record: vec![record_byte; 64],
             secret: [secret_byte; 32],
         }
+    }
+
+    /// A frozen canonical COMMIT reference at height 30 plus the first legal
+    /// REVEAL height for the intent's name: strictly after the COMMIT, inside
+    /// its TTL, and at the name's scheduled anchor.
+    fn reveal_commit_and_height(
+        intent: &RegistrationIntent,
+        params: V2Parameters,
+    ) -> (CommitRef, u32) {
+        let commit_height = 30;
+        let reveal_height =
+            next_anchor_height(intent.name_id().unwrap(), commit_height + 1, params)
+                .expect("every COMMIT admits a scheduled reveal inside its lifetime");
+        (
+            CommitRef::new(
+                ProducerPosition::new(commit_height, 1, [3; 32]),
+                0,
+                intent.commitment().unwrap(),
+            ),
+            reveal_height,
+        )
     }
 
     /// Builds the canonical predecessor head a machine would reconstruct from
@@ -1053,12 +1143,7 @@ mod tests {
         let registration_note = bond_note(&fvk, 50_000, 1, 2);
         let registration_nullifier = registration_note.nullifier(&fvk).to_bytes();
         let intent = test_intent(&ask, 4, 6);
-        let commit = CommitRef::new(
-            ProducerPosition::new(900, 1, [3; 32]),
-            0,
-            intent.commitment().unwrap(),
-        );
-        let height = 40;
+        let (commit, height) = reveal_commit_and_height(&intent, params);
         let action_index = 2;
 
         let preparation = prepare_reveal(
@@ -1176,11 +1261,7 @@ mod tests {
         let (fvk, ask) = key_material(12);
         let registration_note = bond_note(&fvk, 50_000, 2, 3);
         let intent = test_intent(&ask, 5, 7);
-        let commit = CommitRef::new(
-            ProducerPosition::new(900, 1, [3; 32]),
-            0,
-            intent.commitment().unwrap(),
-        );
+        let (commit, reveal_height) = reveal_commit_and_height(&intent, params);
         let prior_terminal = StateRef::new(
             ProducerPosition::new(30, 1, [8; 32]),
             4,
@@ -1198,7 +1279,7 @@ mod tests {
             fvk: fvk.clone(),
             ask: ask.clone(),
             designated_action_index: 2,
-            operation_height: 40,
+            operation_height: reveal_height,
             successor_seed: [9; 32],
         };
 
@@ -1239,7 +1320,7 @@ mod tests {
             intent_b.commitment().unwrap()
         );
         let commit_for_b = CommitRef::new(
-            ProducerPosition::new(900, 1, [3; 32]),
+            ProducerPosition::new(30, 1, [3; 32]),
             0,
             intent_b.commitment().unwrap(),
         );
@@ -1275,12 +1356,7 @@ mod tests {
         let (fvk, ask) = key_material(13);
         let registration_note = bond_note(&fvk, 40_000, 2, 3);
         let intent = test_intent(&ask, 5, 7);
-        let commit = CommitRef::new(
-            ProducerPosition::new(900, 1, [3; 32]),
-            0,
-            intent.commitment().unwrap(),
-        );
-        let reveal_height = 40;
+        let (commit, reveal_height) = reveal_commit_and_height(&intent, params);
         let reveal_preparation = prepare_reveal(
             RevealInputs {
                 intent,
@@ -1302,7 +1378,7 @@ mod tests {
         let predecessor = accepted_head(reveal_finalized.operation(), reveal_height, [7; 32]);
 
         let update_record = vec![6; 40];
-        let update_height = 41;
+        let update_height = reveal_height + 1;
         let update_preparation = prepare_update(
             TransitionInputs {
                 predecessor: predecessor.clone(),
@@ -1418,12 +1494,7 @@ mod tests {
         let registration_note = bond_note(&fvk, 40_000, 3, 4);
         let intent = test_intent(&ask, 5, 7);
         let name_id = intent.name_id().unwrap();
-        let commit = CommitRef::new(
-            ProducerPosition::new(900, 1, [3; 32]),
-            0,
-            intent.commitment().unwrap(),
-        );
-        let reveal_height = 40;
+        let (commit, reveal_height) = reveal_commit_and_height(&intent, params);
         let reveal_preparation = prepare_reveal(
             RevealInputs {
                 intent,
@@ -1534,12 +1605,7 @@ mod tests {
         let (fvk, ask) = key_material(15);
         let registration_note = bond_note(&fvk, 40_000, 4, 5);
         let intent = test_intent(&ask, 5, 7);
-        let commit = CommitRef::new(
-            ProducerPosition::new(900, 1, [3; 32]),
-            0,
-            intent.commitment().unwrap(),
-        );
-        let reveal_height = 40;
+        let (commit, reveal_height) = reveal_commit_and_height(&intent, params);
         let reveal_preparation = prepare_reveal(
             RevealInputs {
                 intent,
@@ -1649,12 +1715,7 @@ mod tests {
         let (fvk, ask) = key_material(16);
         let registration_note = bond_note(&fvk, 40_000, 5, 6);
         let intent = test_intent(&ask, 5, 7);
-        let commit = CommitRef::new(
-            ProducerPosition::new(900, 1, [3; 32]),
-            0,
-            intent.commitment().unwrap(),
-        );
-        let reveal_height = 40;
+        let (commit, reveal_height) = reveal_commit_and_height(&intent, params);
         let reveal_preparation = prepare_reveal(
             RevealInputs {
                 intent,
@@ -1676,7 +1737,7 @@ mod tests {
         let reveal_finalized = reveal_preparation.finalize(vec![0x5A; 1_920]).unwrap();
         let predecessor = accepted_head(reveal_finalized.operation(), reveal_height, [7; 32]);
 
-        let update_height = 41;
+        let update_height = reveal_height + 1;
         let update_preparation = prepare_update(
             TransitionInputs {
                 predecessor,
@@ -1695,14 +1756,8 @@ mod tests {
 
         let funding_note = bond_note(&fvk, 60_000, 6, 7);
         let carrier_recipient = key_material(30).0.address_at(0u32, Scope::External);
-        let (shape, fee) = planned_state_operation_shape_and_fee(
-            &consensus_params,
-            BlockHeight::from_u32(update_height),
-            &finalized,
-            1,
-            1,
-        )
-        .unwrap();
+        let (shape, fee) =
+            planned_state_operation_shape_and_fee(&consensus_params, &finalized, 1, 1).unwrap();
         let carrier_value_total = u64::try_from(finalized.frames().len()).unwrap();
         let change_value = funding_note
             .value()
@@ -1712,7 +1767,6 @@ mod tests {
             .unwrap();
         let planned = plan_state_operation(
             &consensus_params,
-            BlockHeight::from_u32(update_height),
             &finalized,
             CarrierPlan {
                 recipient: carrier_recipient,
@@ -1798,21 +1852,29 @@ mod tests {
         };
         let designated_note = bond_note(&fvk, 40_000, 8, 9);
         let reveal_intent_commitment = small_intent.commitment().unwrap();
-        let reveal_preparation = prepare_reveal(
-            RevealInputs {
-                intent: small_intent,
-                commit: CommitRef::new(
-                    ProducerPosition::new(900, 1, [3; 32]),
+        let (reveal_commit, reveal_height) = {
+            let commit_height = 30;
+            (
+                CommitRef::new(
+                    ProducerPosition::new(commit_height, 1, [3; 32]),
                     0,
                     reveal_intent_commitment,
                 ),
+                next_anchor_height(small_intent.name_id().unwrap(), commit_height + 1, params)
+                    .unwrap(),
+            )
+        };
+        let reveal_preparation = prepare_reveal(
+            RevealInputs {
+                intent: small_intent,
+                commit: reveal_commit,
                 replacement_predecessor: None,
                 registration_note: designated_note,
                 scope: Scope::External,
                 fvk: fvk.clone(),
                 ask: ask.clone(),
                 designated_action_index: 2,
-                operation_height: 40,
+                operation_height: reveal_height,
                 successor_seed: [9; 32],
             },
             params,
@@ -1822,7 +1884,6 @@ mod tests {
         assert!(finalized.frames().len() >= 1);
         let zero_funding = plan_state_operation(
             &consensus_params,
-            BlockHeight::from_u32(41),
             &finalized,
             CarrierPlan {
                 recipient: carrier_recipient,
@@ -1846,14 +1907,8 @@ mod tests {
         // exactly like the single-note shape.
         let funding_one = bond_note(&fvk, 30_000, 10, 11);
         let funding_two = bond_note(&fvk, 40_000, 11, 12);
-        let (shape, fee) = planned_state_operation_shape_and_fee(
-            &consensus_params,
-            BlockHeight::from_u32(41),
-            &finalized,
-            2,
-            2,
-        )
-        .unwrap();
+        let (shape, fee) =
+            planned_state_operation_shape_and_fee(&consensus_params, &finalized, 2, 2).unwrap();
         let carrier_total = u64::try_from(finalized.frames().len()).unwrap();
         let change_one = 20_000u64;
         let change_two = funding_one
@@ -1866,7 +1921,6 @@ mod tests {
             .unwrap();
         let multi_funding = plan_state_operation(
             &consensus_params,
-            BlockHeight::from_u32(41),
             &finalized,
             CarrierPlan {
                 recipient: carrier_recipient,
@@ -1917,7 +1971,6 @@ mod tests {
         // Unbalanced funding fails closed before any proving.
         let underfunded = plan_state_operation(
             &consensus_params,
-            BlockHeight::from_u32(41),
             &finalized,
             CarrierPlan {
                 recipient: carrier_recipient,
@@ -1939,5 +1992,211 @@ mod tests {
             underfunded.is_err(),
             "unbalanced funding must fail at planning time"
         );
+    }
+
+    #[test]
+    fn reveal_rejects_heights_outside_the_commit_lifetime_or_schedule() {
+        let params = V2Parameters::testing();
+        let (fvk, ask) = key_material(19);
+        let registration_note = bond_note(&fvk, 40_000, 12, 13);
+        let intent = test_intent(&ask, 5, 7);
+        let name_id = intent.name_id().unwrap();
+        let commit_height = 30;
+        let commit = CommitRef::new(
+            ProducerPosition::new(commit_height, 1, [3; 32]),
+            0,
+            intent.commitment().unwrap(),
+        );
+        let legal_height = next_anchor_height(name_id, commit_height + 1, params).unwrap();
+        assert!(legal_height > commit_height);
+        assert!(legal_height <= commit_height + params.commit_ttl_blocks);
+
+        let inputs = |operation_height| RevealInputs {
+            intent: intent.clone(),
+            commit,
+            replacement_predecessor: None,
+            registration_note: registration_note.clone(),
+            scope: Scope::External,
+            fvk: fvk.clone(),
+            ask: ask.clone(),
+            designated_action_index: 2,
+            operation_height,
+            successor_seed: [9; 32],
+        };
+
+        // Same height as the COMMIT: rejected before any proof work.
+        assert!(
+            prepare_reveal(inputs(commit_height), params)
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("strictly after the canonical COMMIT height")
+        );
+        // Beyond the COMMIT lifetime: rejected.
+        assert!(
+            prepare_reveal(inputs(commit_height + params.commit_ttl_blocks + 1), params)
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("beyond the canonical COMMIT lifetime")
+        );
+        // Inside the lifetime but off the name's scheduled anchor: rejected.
+        let non_anchor = (commit_height + 1..legal_height)
+            .find(|height| !coppice_names::v2::schedule::is_anchor_height(name_id, *height, params))
+            .expect("a scheduled anchor window contains non-anchor heights");
+        assert!(
+            prepare_reveal(inputs(non_anchor), params)
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("scheduled anchor height")
+        );
+        // The legal scheduled height prepares.
+        assert!(prepare_reveal(inputs(legal_height), params).is_ok());
+    }
+
+    #[test]
+    fn finalized_operation_binds_fee_planning_and_pczt_expiry_to_its_height() {
+        let params = V2Parameters::testing();
+        let consensus_params = local_v6_params();
+        let (fvk, ask) = key_material(20);
+        let registration_note = bond_note(&fvk, 60_000, 14, 15);
+        let intent = test_intent(&ask, 5, 7);
+        let (commit, reveal_height) = reveal_commit_and_height(&intent, params);
+        let preparation = prepare_reveal(
+            RevealInputs {
+                intent,
+                commit,
+                replacement_predecessor: None,
+                registration_note: registration_note.clone(),
+                scope: Scope::External,
+                fvk: fvk.clone(),
+                ask: ask.clone(),
+                designated_action_index: 2,
+                operation_height: reveal_height,
+                successor_seed: [9; 32],
+            },
+            params,
+        )
+        .unwrap();
+        assert_eq!(preparation.operation_height(), reveal_height);
+        let finalized = preparation.finalize(vec![0x5A; 1_920]).unwrap();
+        assert_eq!(finalized.operation_height(), reveal_height);
+
+        // Fee planning carries no height argument: it plans at exactly the
+        // finalized operation height.
+        let (shape, fee) =
+            planned_state_operation_shape_and_fee(&consensus_params, &finalized, 1, 1).unwrap();
+        assert_eq!(
+            fee,
+            required_zip317_fee_for_names_v2(
+                &consensus_params,
+                BlockHeight::from_u32(reveal_height),
+                shape,
+            )
+            .unwrap()
+        );
+        let carrier_recipient = key_material(32).0.address_at(0u32, Scope::External);
+        let carrier_value_total = finalized.frames().len() as u64;
+        let funding_note = bond_note(&fvk, 60_000, 16, 17);
+        let planned = plan_state_operation(
+            &consensus_params,
+            &finalized,
+            CarrierPlan {
+                recipient: carrier_recipient,
+                value: NoteValue::from_raw(1),
+            },
+            SuccessorTransport {
+                ovk: None,
+                memo: [0; 512],
+            },
+            OperationFunding {
+                funding_spends: vec![FundingSpend {
+                    fvk: fvk.clone(),
+                    note: funding_note.clone(),
+                }],
+                change_outputs: vec![ChangeOutput {
+                    fvk: fvk.clone(),
+                    ovk: None,
+                    recipient: fvk.address_at(0u32, Scope::Internal),
+                    value: NoteValue::from_raw(
+                        funding_note
+                            .value()
+                            .inner()
+                            .checked_sub(carrier_value_total)
+                            .and_then(|value| value.checked_sub(fee.into_u64()))
+                            .unwrap(),
+                    ),
+                    memo: [0; 512],
+                }],
+            },
+        )
+        .unwrap();
+        assert_eq!(planned.operation_height, reveal_height);
+        assert_eq!(planned.carrier_value_total, carrier_value_total);
+
+        let built = build_names_v2_bundle(planned.plan, StdRng::from_seed([80; 32])).unwrap();
+        assert_eq!(built.operation_height, reveal_height);
+
+        // A PCZT expiry height different from the Names operation height is
+        // rejected before any PCZT construction. Each rebuilt bundle pairs its
+        // own designated spend with a successor whose rho derives from it.
+        let rebuilt = |operation_height, rho_byte: u8, seed_byte: u8| {
+            let designated = bond_note(&fvk, 60_000, rho_byte, seed_byte);
+            let successor = successor_state_note(
+                &fvk,
+                Scope::External,
+                &designated,
+                designated.nullifier(&fvk).to_bytes(),
+                [9; 32],
+            )
+            .unwrap();
+            build_names_v2_bundle(
+                NamesV2IronwoodPlan {
+                    designated_fvk: fvk.clone(),
+                    designated_spend: designated,
+                    successor_note: successor,
+                    successor_ovk: None,
+                    successor_memo: [0; 512],
+                    carrier_outputs: Vec::new(),
+                    funding_spends: vec![FundingSpend {
+                        fvk: fvk.clone(),
+                        note: bond_note(&fvk, 60_000, rho_byte + 1, seed_byte + 1),
+                    }],
+                    change_outputs: vec![ChangeOutput {
+                        fvk: fvk.clone(),
+                        ovk: None,
+                        recipient: fvk.address_at(0u32, Scope::Internal),
+                        value: NoteValue::from_raw(45_000),
+                        memo: [0; 512],
+                    }],
+                    designated_action_index: 1,
+                    operation_height,
+                },
+                StdRng::from_seed([rho_byte; 32]),
+            )
+            .unwrap()
+        };
+        let mismatched = build_names_v2_pczt(NamesV2PcztPlan {
+            ironwood: rebuilt(reveal_height, 20, 21),
+            params: consensus_params.clone(),
+            consensus_branch_id: BranchId::Nu6_3,
+            expiry_height: BlockHeight::from_u32(reveal_height + 1),
+            fallback_lock_time: 0,
+        });
+        assert!(
+            mismatched.is_err(),
+            "PCZT expiry height must equal the Names operation height"
+        );
+
+        // The exact operation height builds the complete PCZT.
+        let aligned = build_names_v2_pczt(NamesV2PcztPlan {
+            ironwood: rebuilt(reveal_height, 22, 23),
+            params: consensus_params,
+            consensus_branch_id: BranchId::Nu6_3,
+            expiry_height: BlockHeight::from_u32(reveal_height),
+            fallback_lock_time: 0,
+        });
+        assert!(aligned.is_ok());
     }
 }

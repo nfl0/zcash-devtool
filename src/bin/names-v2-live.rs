@@ -528,14 +528,13 @@ fn submit_raw(rpc_url: &str, bytes: &[u8]) -> Result<[u8; 32]> {
 /// through the reusable library API; only this disposable harness fixes them.
 fn plan_qualified_funding(
     params: &LocalNetwork,
-    target_height: BlockHeight,
     finalized_operation: &FinalizedOperation,
     carrier_recipient: orchard::Address,
     names_fvk: &FullViewingKey,
     funding_note: &Note,
 ) -> Result<StateOperationPlan> {
     let (planned_shape, required_fee) =
-        planned_state_operation_shape_and_fee(params, target_height, finalized_operation, 1, 1)?;
+        planned_state_operation_shape_and_fee(params, finalized_operation, 1, 1)?;
     let carrier_value_total = u64::try_from(finalized_operation.frames().len())
         .context("carrier count does not fit u64")?;
     let change_value = funding_note
@@ -546,7 +545,6 @@ fn plan_qualified_funding(
         .context("funding note cannot cover the carrier outputs and the ZIP-317 fee")?;
     let planned = plan_state_operation(
         params,
-        target_height,
         finalized_operation,
         CarrierPlan {
             recipient: carrier_recipient,
@@ -1522,7 +1520,6 @@ fn reveal_with_replacement(
     let (anchor, paths) = wallet_witnesses(&mut db, anchor_height, [registration.2, funding.2])?;
     let planned = plan_qualified_funding(
         &params,
-        BlockHeight::from_u32(construction_height),
         &finalized_operation,
         carrier_recipient,
         &names_fvk,
@@ -2135,7 +2132,6 @@ fn update(args: UpdateArgs) -> Result<()> {
     )?;
     let planned = plan_qualified_funding(
         &params,
-        BlockHeight::from_u32(construction_height),
         &finalized_operation,
         carrier_recipient,
         &names_fvk,
@@ -2364,6 +2360,10 @@ fn abandon(args: AbandonArgs) -> Result<()> {
         funding_nf != predecessor_nf && funding_position != predecessor_position,
         "out-of-band funding note must be distinct from the state note"
     );
+    let construction_height = lineage
+        .tip_height
+        .checked_add(1)
+        .context("out-of-band construction height overflow")?;
 
     let predecessor_rho = Option::<Rho>::from(Rho::from_bytes(&predecessor_nf))
         .context("accepted predecessor nullifier is not a valid successor rho")?;
@@ -2421,6 +2421,7 @@ fn abandon(args: AbandonArgs) -> Result<()> {
             memo: [0; 512],
         }],
         designated_action_index: 0,
+        operation_height: construction_height,
     };
     ensure!(
         names_v2_ironwood_shape(&plan)? == planned_shape,
@@ -2440,10 +2441,6 @@ fn abandon(args: AbandonArgs) -> Result<()> {
         predecessor_nf,
         successor_commitment,
     )?;
-    let construction_height = lineage
-        .tip_height
-        .checked_add(1)
-        .context("out-of-band construction height overflow")?;
     let anchor_height = db
         .get_target_and_anchor_heights(NonZeroU32::MIN)?
         .context("wallet has no synchronized target/anchor heights")?
@@ -2751,7 +2748,6 @@ fn renew(args: RenewArgs) -> Result<()> {
     )?;
     let planned = plan_qualified_funding(
         &params,
-        BlockHeight::from_u32(construction_height),
         &finalized_operation,
         carrier_recipient,
         &names_fvk,
@@ -3069,7 +3065,6 @@ fn release(args: ReleaseArgs) -> Result<()> {
     )?;
     let planned = plan_qualified_funding(
         &params,
-        BlockHeight::from_u32(construction_height),
         &finalized_operation,
         carrier_recipient,
         &names_fvk,

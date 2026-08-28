@@ -58,6 +58,9 @@ pub struct NamesV2IronwoodPlan {
     pub change_outputs: Vec<ChangeOutput>,
     /// Canonical action index carried by the CNV2 operation.
     pub designated_action_index: usize,
+    /// Exact intended canonical height of the Names operation. The later
+    /// PCZT expiry height must equal this height.
+    pub operation_height: u32,
 }
 
 /// The public physical shape of a manually assembled Names v2 Ironwood bundle.
@@ -83,6 +86,9 @@ pub struct NamesV2BuiltBundle {
     pub change_output_count: usize,
     /// Positive value contributed by Ironwood toward the transaction fee or other pools.
     pub ironwood_value_balance: i64,
+    /// Exact intended canonical height of the Names operation. The later
+    /// PCZT expiry height must equal this height.
+    pub operation_height: u32,
 }
 
 /// Metadata needed to place an already-built Names v2 bundle into a V6 PCZT.
@@ -413,6 +419,7 @@ pub fn build_names_v2_bundle(
         carrier_output_count: shape.carrier_output_count,
         change_output_count: shape.change_output_count,
         ironwood_value_balance,
+        operation_height: plan.operation_height,
     })
 }
 
@@ -446,7 +453,12 @@ pub fn build_names_v2_pczt<P: Parameters>(plan: NamesV2PcztPlan<P>) -> Result<Na
         carrier_output_count,
         change_output_count,
         ironwood_value_balance,
+        operation_height,
     } = ironwood;
+    ensure!(
+        expiry_height == BlockHeight::from_u32(operation_height),
+        "Names v2 PCZT expiry height {expiry_height} does not equal the operation's intended height {operation_height}"
+    );
     let designated_action_index = u32::try_from(designated_action_index)
         .context("convert designated Names action index to CNV2 u32")?;
     let source_action_layout = action_pair_layout(&bundle);
@@ -1661,6 +1673,8 @@ mod tests {
                     memo: [0; 512],
                 }],
                 designated_action_index: 4,
+                // Matches the expiry height every PCZT-based test below uses.
+                operation_height: 100,
             },
             registration_nullifier,
             registration_commitment,
@@ -2915,6 +2929,7 @@ mod tests {
                 funding_spends: vec![],
                 change_outputs: vec![],
                 designated_action_index: 0,
+                operation_height: 0,
             },
             StdRng::from_seed([13; 32]),
         )
