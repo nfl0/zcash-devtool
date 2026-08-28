@@ -2016,9 +2016,13 @@ fn update(args: UpdateArgs) -> Result<()> {
             predecessor.data.record.as_slice() == RECORD.as_slice(),
             "qualified UPDATE fixture has an unexpected predecessor record"
         );
+        let v2 = v2_parameters();
         ensure!(
-            predecessor.data.lease_expiry == 55,
-            "qualified UPDATE fixture has an unexpected predecessor lease expiry"
+            predecessor.data.lease_expiry
+                == v2
+                    .lease_expiry(predecessor.state_ref.producer_height)
+                    .context("Names v2 predecessor lease expiry overflow")?,
+            "UPDATE predecessor lease does not match its reveal-height schedule"
         );
     }
     ensure!(
@@ -2913,14 +2917,20 @@ fn release(args: ReleaseArgs) -> Result<()> {
         "full replay and FreshResolver disagree before RELEASE construction"
     );
     let predecessor = lineage.full_head;
-    ensure!(
-        predecessor.data.sequence == 2
-            && predecessor.data.record.as_slice() == UPDATE_RECORD.as_slice()
-            && predecessor.data.lease_expiry == 59
-            && predecessor.data.status == StateStatus::Active
-            && predecessor.data.terminal_height == 0,
-        "qualified RELEASE fixture does not have the expected active sequence-two predecessor"
-    );
+    {
+        let v2 = v2_parameters();
+        ensure!(
+            predecessor.data.sequence == 2
+                && predecessor.data.record.as_slice() == UPDATE_RECORD.as_slice()
+                && predecessor.data.lease_expiry
+                    == v2
+                        .lease_expiry(predecessor.state_ref.producer_height)
+                        .context("Names v2 predecessor lease expiry overflow")?
+                && predecessor.data.status == StateStatus::Active
+                && predecessor.data.terminal_height == 0,
+            "qualified RELEASE fixture does not have the expected active sequence-two predecessor"
+        );
+    }
 
     let renew_transaction = lineage
         .blocks
@@ -3342,7 +3352,10 @@ fn verify_release(args: VerifyReleaseArgs) -> Result<()> {
             && accepted.data.owner_pk == state.owner_pk
             && accepted.data.sequence == 3
             && accepted.data.record.as_slice() == UPDATE_RECORD.as_slice()
-            && accepted.data.lease_expiry == 59
+            && accepted.data.lease_expiry
+                == v2
+                    .lease_expiry(renew_block.height)
+                    .context("canonical RENEW lease expiry overflow")?
             && accepted.data.status == StateStatus::Released
             && accepted.data.terminal_height == release_block.height,
         "accepted RELEASE state values are not the expected terminal successor"
@@ -3564,13 +3577,13 @@ fn verify_release_boundary(args: VerifyReleaseBoundaryArgs) -> Result<()> {
         *state_nullifier,
     );
     ensure!(
-        renew_block.height == 27
+        coppice_names::v2::schedule::is_anchor_height(lineage.name_id, renew_block.height, v2)
             && renew_state_ref.producer_action_index == 4
             && renew_state_ref.producer_operation_index == 0
-            && release_block.height == 28
+            && release_block.height == renew_block.height + 1
             && release_state_ref.producer_action_index == 4
             && release_state_ref.producer_operation_index == 0,
-        "canonical RELEASE lineage is not the qualified h27 -> h28 fixture"
+        "canonical RELEASE lineage is not a scheduled-RENEW -> next-block RELEASE chain"
     );
     ensure!(
         lineage.fresh_anchor == Some(renew_state_ref),
@@ -3591,9 +3604,12 @@ fn verify_release_boundary(args: VerifyReleaseBoundaryArgs) -> Result<()> {
             && accepted.data.owner_pk == state.owner_pk
             && accepted.data.sequence == 3
             && accepted.data.record.as_slice() == UPDATE_RECORD.as_slice()
-            && accepted.data.lease_expiry == 59
+            && accepted.data.lease_expiry
+                == v2
+                    .lease_expiry(renew_block.height)
+                    .context("canonical RENEW lease expiry overflow")?
             && accepted.data.status == StateStatus::Released
-            && accepted.data.terminal_height == 28
+            && accepted.data.terminal_height == release_block.height
             && accepted.commitment == *state_commitment
             && accepted.state_ref.nullifier == *state_nullifier,
         "terminal RELEASE NameState changed across the claimability boundary"
@@ -3608,9 +3624,15 @@ fn verify_release_boundary(args: VerifyReleaseBoundaryArgs) -> Result<()> {
     let last_blocked_height = claimable_height
         .checked_sub(1)
         .context("RELEASE claimable height has no preceding blocked height")?;
+    let expected_claimable_height = accepted
+        .data
+        .terminal_height
+        .checked_add(v2.reuse_delay_blocks)
+        .context("RELEASE claimability height overflow")?;
     ensure!(
-        claimable_height == 32,
-        "qualified RELEASE claimability boundary changed: expected 32, got {claimable_height}"
+        claimable_height == expected_claimable_height,
+        "RELEASE claimability boundary changed: terminal {} plus the reuse delay must be {expected_claimable_height}, got {claimable_height}",
+        accepted.data.terminal_height
     );
     match expected_status {
         ResolutionStatus::Released => ensure!(
