@@ -271,14 +271,9 @@ pub fn prepare_reveal(inputs: RevealInputs, params: V2Parameters) -> Result<Reve
         nullifier: registration_nullifier,
         commitment: successor_commitment,
     };
-    let statement = GenesisStatement::from_reveal(
-        &intent,
-        &state,
-        action,
-        operation_height,
-        params,
-    )
-    .map_err(|error| anyhow::anyhow!("construct Names v2 genesis statement: {error:?}"))?;
+    let statement =
+        GenesisStatement::from_reveal(&intent, &state, action, operation_height, params)
+            .map_err(|error| anyhow::anyhow!("construct Names v2 genesis statement: {error:?}"))?;
     let witness = GenesisWitness::new(
         registration_note.clone(),
         successor_note.clone(),
