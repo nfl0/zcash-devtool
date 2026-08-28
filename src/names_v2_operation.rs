@@ -116,9 +116,9 @@ impl PreparedCommit {
     }
 }
 
-/// Typed inputs for one canonical REVEAL, shared by first registrations
-/// (`replacement_predecessor == None`) and replacement registrations
-/// (reclaim or reset reveals carrying the exact prior terminal head).
+/// Typed inputs for one canonical REVEAL. One constructor serves first
+/// registrations and replacement registrations; they differ only in
+/// [`RevealInputs::replacement_predecessor`].
 pub struct RevealInputs {
     /// The disclosed registration intent; its commitment must match the
     /// referenced COMMIT.
@@ -126,8 +126,12 @@ pub struct RevealInputs {
     /// Exact canonical COMMIT reference. This only exists after the COMMIT
     /// transaction has a canonical producer position.
     pub commit: CommitRef,
-    /// Exact prior terminal state reference when replacing a claimable
-    /// lineage; `None` for a first registration.
+    /// `Some(exact prior terminal state reference)` selects the explicit
+    /// replacement path against that exact accepted head. `None` means
+    /// either a first registration for a name with no prior accepted head,
+    /// or a bounded-history no-predecessor reset. Whether a `None` reset is
+    /// canonically eligible is a state-machine/replay semantic check and is
+    /// deliberately not evaluated here.
     pub replacement_predecessor: Option<StateRef>,
     /// The bond input note spent by the designated REVEAL action. Its value
     /// is carried intact into the successor state note.
@@ -167,6 +171,12 @@ pub struct RevealPreparation {
 
 /// Prepares a canonical REVEAL from typed inputs.
 ///
+/// Locally enforces the typed binding between `inputs.intent` and
+/// `inputs.commit` via the authoritative [`RegistrationIntent::commitment`]:
+/// a reference to a different intent fails before any proof work. Canonical
+/// COMMIT authenticity, maturity, TTL, anchoring, and reset eligibility
+/// remain the caller's replay/state-machine responsibility.
+///
 /// Binds the intent, the exact COMMIT reference, the optional replacement
 /// predecessor, the initial lease from `params` at `inputs.operation_height`,
 /// the exact successor note and its commitment/future nullifier, the
@@ -185,6 +195,13 @@ pub fn prepare_reveal(inputs: RevealInputs, params: V2Parameters) -> Result<Reve
         operation_height,
         successor_seed,
     } = inputs;
+    let expected_commitment = intent
+        .commitment()
+        .map_err(|error| anyhow::anyhow!("derive REVEAL commitment: {error:?}"))?;
+    ensure!(
+        expected_commitment == commit.commitment,
+        "REVEAL intent commitment does not match the supplied COMMIT reference"
+    );
     ensure!(
         intent.owner_pk == spend_auth_owner_key_bytes(&ask),
         "REVEAL owner key does not match the supplied spend authorizing key"
@@ -1113,6 +1130,48 @@ mod tests {
         // The two operations are identical apart from the replacement
         // reference: one protocol operation, two typed inputs.
         assert_ne!(first.encoded(), replacement.encoded());
+    }
+
+    #[test]
+    fn reveal_rejects_commit_reference_for_a_different_intent() {
+        let params = V2Parameters::testing();
+        let (fvk, ask) = key_material(17);
+        let registration_note = bond_note(&fvk, 40_000, 7, 8);
+        let intent_a = test_intent(&ask, 5, 7);
+        let intent_b = test_intent(&ask, 6, 7);
+        assert_ne!(
+            intent_a.commitment().unwrap(),
+            intent_b.commitment().unwrap()
+        );
+        let commit_for_b = CommitRef::new(
+            ProducerPosition::new(900, 1, [3; 32]),
+            0,
+            intent_b.commitment().unwrap(),
+        );
+
+        let error = prepare_reveal(
+            RevealInputs {
+                intent: intent_a,
+                commit: commit_for_b,
+                replacement_predecessor: None,
+                registration_note,
+                scope: Scope::External,
+                fvk,
+                ask,
+                designated_action_index: 2,
+                operation_height: 40,
+                successor_seed: [9; 32],
+            },
+            params,
+        )
+        .err()
+        .expect("REVEAL must reject a COMMIT reference bound to a different intent");
+        assert!(
+            error
+                .to_string()
+                .contains("does not match the supplied COMMIT reference"),
+            "failure should be the intent/COMMIT binding check, got: {error}"
+        );
     }
 
     #[test]
