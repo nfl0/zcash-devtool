@@ -373,30 +373,6 @@ impl Command {
         .await?
         {}
 
-        if !shutdown.requested() {
-            let frozen_wallet_tip = crate::coppice_support::wallet_tip(&db_data)?.0;
-            if let Some(outcome) = crate::coppice_support::reconcile(
-                &params,
-                &mut client,
-                frozen_wallet_tip,
-                wallet_dir.as_ref(),
-            )
-            .await?
-            {
-                let (_, runtime, pending) = crate::coppice_support::load_existing_at_tip(
-                    &params,
-                    wallet_dir.as_ref(),
-                    frozen_wallet_tip,
-                )?
-                .ok_or_else(|| anyhow!("Coppice protection unexpectedly disabled after replay"))?;
-                crate::coppice_support::reconcile_wallet_locks(&runtime, &pending, &mut db_data)?;
-                info!(
-                    "Coppice synchronized to {} ({} blocks applied, {} rewound)",
-                    outcome.final_tip.height, outcome.blocks_applied, outcome.blocks_rewound,
-                );
-            }
-        }
-
         Ok(())
     }
 }

@@ -1546,15 +1546,12 @@ fn value_sum_parts(value_balance: i64) -> Result<(u64, bool)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use coppice_names::{
-        carrier::bulletin_address,
-        config::REGTEST,
-        names_application::names_application_id,
-        v2::{
-            CommitRef, GenesisStatement, IronwoodActionRef, NameState, OrchardV2ProofProver,
-            ProducerPosition, RegistrationIntent, StateData, StateRef, StateStatus, V2Operation,
-            V2Parameters, decode_operation, encode_operation, operation_footprint,
-        },
+    use crate::names_v2_config::{REGTEST, bulletin_address};
+    use coppice_names::v2::names_application_id;
+    use coppice_names::v2::{
+        CommitRef, GenesisStatement, IronwoodActionRef, NameState, OrchardV2ProofProver,
+        ProducerPosition, RegistrationIntent, StateData, StateRef, StateStatus, V2Operation,
+        V2Parameters, decode_operation, encode_operation, operation_footprint,
     };
     use incrementalmerkletree::{Marking, Position, Retention};
     use orchard::{

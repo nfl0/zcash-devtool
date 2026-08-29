@@ -18,16 +18,12 @@ use bip0039::{English, Mnemonic};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use coppice::{carrier::CoreRendezvous, transport::reconstruct_frames};
 use coppice_librustzcash::{CanonicalBlockSource, FullTransactionSource};
-use coppice_names::{
-    carrier::bulletin_address,
-    config::REGTEST,
-    names_application::names_application_id,
-    v2::{
-        AppliedOperationKind, AppliedOperationResult, CanonicalBlock, CanonicalTransaction,
-        CommitRef, FreshResolver, IronwoodActionRef, NameState, OrchardV2ProofProver,
-        OrchardV2ProofVerifier, ProducerPosition, RegistrationIntent, ResolutionStatus, StateRef,
-        StateStatus, V2Operation, V2Parameters, V2StateMachine, decode_operation,
-    },
+use coppice_names::v2::names_application_id;
+use coppice_names::v2::{
+    AppliedOperationKind, AppliedOperationResult, CanonicalBlock, CanonicalTransaction, CommitRef,
+    FreshResolver, IronwoodActionRef, NameState, OrchardV2ProofProver, OrchardV2ProofVerifier,
+    ProducerPosition, RegistrationIntent, ResolutionStatus, StateRef, StateStatus, V2Operation,
+    V2Parameters, V2StateMachine, decode_operation,
 };
 use orchard::{
     circuit::state_note_binding::spend_auth_owner_key_bytes,
@@ -47,6 +43,7 @@ use zcash_client_backend::{
     wallet::OvkPolicy,
 };
 use zcash_client_sqlite::{WalletDb, error::SqliteClientError, util::SystemClock};
+use zcash_devtool::names_v2_config::{REGTEST, bulletin_address};
 use zcash_keys::{address::UnifiedAddress, keys::UnifiedSpendingKey};
 use zcash_primitives::transaction::{Transaction, TxVersion as TransactionVersion};
 use zcash_proofs::prover::LocalTxProver;

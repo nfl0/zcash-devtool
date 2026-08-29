@@ -70,35 +70,24 @@ impl Command {
             ),
         );
         let input_selector = GreedyInputSelector::new();
-        let orchard_fvk = account.ufvk().and_then(|ufvk| ufvk.orchard()).cloned();
-
         let request = TransactionRequest::new(vec![Payment::without_memo(
             ZcashAddress::from_str(&self.address).map_err(|_| error::Error::InvalidRecipient)?,
             Zatoshis::from_u64(self.value).map_err(|_| error::Error::InvalidAmount)?,
         )])
         .map_err(error::Error::from)?;
 
-        let proposal = crate::coppice_support::with_spend_protection(
-            &params,
-            wallet_dir.as_ref(),
+        let proposal = propose_transfer(
             &mut db_data,
+            &params,
             account.id(),
-            orchard_fvk.as_ref(),
-            |db| {
-                propose_transfer(
-                    db,
-                    &params,
-                    account.id(),
-                    &input_selector,
-                    &change_strategy,
-                    request,
-                    ConfirmationsPolicy::default(),
-                    &SpendPolicy::default(),
-                    None,
-                    None,
-                )
-            },
-        )?
+            &input_selector,
+            &change_strategy,
+            request,
+            ConfirmationsPolicy::default(),
+            &SpendPolicy::default(),
+            None,
+            None,
+        )
         .map_err(error::Error::from)?;
 
         // Display the proposal

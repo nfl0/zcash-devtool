@@ -31,7 +31,7 @@
 
 use anyhow::{Context, Result, ensure};
 use coppice::transport::{encode_frames, reconstruct_frames};
-use coppice_names::names_application::names_application_id;
+use coppice_names::v2::names_application_id;
 use coppice_names::v2::schedule::is_anchor_height;
 use coppice_names::v2::wire::OperationFootprint;
 use coppice_names::v2::{

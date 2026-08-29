@@ -7,10 +7,11 @@ developers, for developers for use in prototyping Zcash functionality, and
 should not be considered production-ready. The command-line API that this tool
 exposes can and will change at any time and without warning.
 
-The local Coppice integration keeps the repository boundary explicit: generic
-canonical ingest and reconciliation come from `coppice` and
-`coppice-librustzcash`, while Names protocol and wallet policy come from
-`coppice-names` and `coppice-names-librustzcash`.
+The local Names v2 tooling keeps the repository boundary explicit: generic
+wallet, PCZT, and canonical-ingest functionality remains in this repository
+and its Coppice dependencies, while Names state, wire encoding, and proof
+construction live in `coppice-names`. The standalone `names-v2-live` binary is
+qualification tooling; generic wallet commands do not carry Names policy.
 
 ## Security Warnings
 
@@ -73,53 +74,25 @@ If you want to run with debug or trace logging:
 RUST_LOG=debug cargo run --release -- wallet -w <wallet_dir> <command>
 ```
 
-## Coppice wallet integration
+## Names v2 development harness
 
-The configured Coppice Testnet and Regtest values are qualification/development
-parameters; no public Coppice Testnet or Mainnet deployment has been announced.
+The `names-v2-live` binary and `scripts/live-qualification.sh` exercise the
+disposable local lifecycle `COMMIT -> REVEAL -> UPDATE -> RENEW -> RELEASE`
+against the pinned Zakura/Zaino stack. The harness also checks canonical
+resolution and replay parity. It is development/qualification tooling only;
+it is not a wallet policy layer or a public deployment.
 
-Testnet and regtest wallets default to fail-closed Coppice protection. A
-missing, corrupt, or stale Coppice snapshot is not interpreted as an opt-out:
-ordinary sends and PCZT proposal creation remain blocked until `wallet sync`
-rebuilds canonical state and reconstructs bond-note locks. The durable setting
-can be inspected or deliberately changed with:
+Run the infrastructure phase first, followed by the lifecycle phase:
 
-```text
-wallet coppice protection
-wallet coppice protection enabled
-wallet coppice protection guard-only
-wallet coppice protection off
+```bash
+scripts/live-qualification.sh --phase 1
+scripts/live-qualification.sh --phase 2
 ```
 
-`wallet coppice` exposes canonical status and resolution, name-gated payment,
-REGISTER/COMMIT, canonical-COMMIT observation, REVEAL, UPDATE, RELEASE,
-completion/abandonment, and explicit Break Bond commands. Run
-`wallet coppice --help` for the exact arguments. Carrier construction uses the
-normal wallet proposal, fee, proof, storage, and submission path. Local pending
-metadata advances to broadcast only after the exact stored transaction is
-accepted by the configured server.
-
-Coppice names are stored and resolved as bare canonical labels. Coppice-aware
-wallet commands accept either `alice` or the presentation form `alice.zec`;
-the suffix is stripped before normalization, lookup, commitments, signatures,
-and pending metadata. Status output keeps the canonical `name` and also
-provides a `display_name` ending in `.zec` for wallet/frontend presentation.
-
-Canonical replay targets the exact wallet-selected height and hash captured
-after wallet scanning; a lightwalletd tip that advances during the pass is only
-transport and is caught on the next wallet sync. Replay progress is persisted
-atomically after every block and immediately after a retained reorg rewind. An
-unusable snapshot or a reorg deeper than retained undo history rebuilds from
-Coppice activation. A successful sync then reconciles account-scoped pending
-registrations and locks for every wallet account before returning.
-
-Explicit `off` removes only Coppice-owned advisory locks and preserves foreign
-locks. Automatic sends and proposal creation repeat that exact-owner cleanup in
-Off mode as a recovery boundary. In protected modes, ordinary wallet proposals,
-PCZT creation, and submission of already-signed PCZTs all fail closed if
-canonical state is missing or stale. Signed PCZT Ironwood nullifiers are gated
-before wallet storage; a transaction that spends an active or pending bond must
-use the explicit Break Bond workflow.
+The generic wallet and PCZT commands remain application-blind. Hosts that
+construct Names v2 operations use the typed helpers in
+`src/names_v2_operation.rs` and `src/names_v2_builder.rs`, then submit them
+through the ordinary transaction pipeline.
 
 ### Video tutorial of Zcash Devtool
 Kris Nuttycombe (@nuttycom) presented this tool during ZconVI. The session is available

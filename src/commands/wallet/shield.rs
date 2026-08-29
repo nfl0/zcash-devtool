@@ -177,12 +177,6 @@ impl Command {
         let transaction = db_data
             .get_transaction(txid)?
             .ok_or(anyhow!("Transaction not found for id {:?}", txid))?;
-        crate::coppice_support::ensure_external_transaction_respects_coppice(
-            &params,
-            wallet_dir.as_ref(),
-            &db_data,
-            &transaction,
-        )?;
         let mut raw_tx = service::RawTransaction::default();
         transaction
             .write(&mut raw_tx.data)

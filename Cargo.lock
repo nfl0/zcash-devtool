@@ -1389,42 +1389,13 @@ dependencies = [
  "halo2_gadgets",
  "halo2_proofs",
  "hex",
- "incrementalmerkletree",
  "orchard",
  "pasta_curves",
  "postcard",
- "rand_chacha 0.3.1",
  "rand_core 0.6.4",
  "serde",
  "serde_json",
  "sha2 0.10.9",
- "shardtree",
- "zcash_address",
- "zcash_note_encryption",
- "zcash_primitives",
- "zcash_protocol",
-]
-
-[[package]]
-name = "coppice-names-librustzcash"
-version = "0.1.0"
-dependencies = [
- "coppice",
- "coppice-librustzcash",
- "coppice-names",
- "incrementalmerkletree",
- "orchard",
- "rand_core 0.6.4",
- "sapling-crypto",
- "serde",
- "serde_json",
- "shardtree",
- "zcash_address",
- "zcash_client_backend",
- "zcash_keys",
- "zcash_primitives",
- "zcash_protocol",
- "zip321",
 ]
 
 [[package]]
@@ -9574,7 +9545,6 @@ dependencies = [
  "coppice",
  "coppice-librustzcash",
  "coppice-names",
- "coppice-names-librustzcash",
  "coppice-receipts",
  "coppice-zcash-rpc",
  "crossterm",

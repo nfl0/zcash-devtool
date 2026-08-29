@@ -1,154 +1,20 @@
-# Local Coppice qualification
+# Names v2 live qualification
 
-These scripts build and exercise the local Zakura → patched Zaino →
-`zcash-devtool` stack.
-
-## Repository layout
-
-Run the commands from the Coppice workspace root. The scripts expect:
-
-```text
-Coppice/
-├── zakura/
-├── zaino/              # patched fork, not upstream Zaino
-├── zcash-devtool/
-├── coppice/
-└── bin/                # created by build.sh
-```
-
-The required Zaino fork is:
-
-```text
-https://github.com/nfl0/zaino.git
-```
-
-Use the fork's `dev` branch (or another branch containing the Ironwood
-`GetSubtreeRoots` plumbing). Upstream `https://github.com/zingolabs/zaino.git`
-is currently missing the Coppice-required feature and must not be substituted.
-
-If cloning from scratch:
+`live-qualification.sh` is a disposable local-regtest harness for the current
+Names protocol. It launches the pinned Zakura/Zaino stack, funds a wallet with
+Ironwood value, and then drives the canonical lifecycle through the
+`names-v2-live` binary.
 
 ```sh
-git clone https://github.com/nfl0/zaino.git zaino
-git -C zaino checkout dev
+./scripts/live-qualification.sh --phase 1
+./scripts/live-qualification.sh --phase 2 --keep-state
 ```
 
-Verify the checkout before building:
+Phase 1 checks JSON-RPC/gRPC readiness, Ironwood subtree-root serving, wallet
+initialization, and spendable Ironwood funding. Phase 2 additionally mines and
+verifies `COMMIT -> REVEAL -> UPDATE -> RENEW -> RELEASE`, including replay /
+FreshResolver parity and the exact `Released -> Expired` claimability edge.
 
-```sh
-git -C zaino remote -v
-git -C zaino log -1 --oneline
-```
-
-## Build the binaries
-
-From the workspace root:
-
-```sh
-./zcash-devtool/scripts/build.sh
-```
-
-By default this only builds or refreshes:
-
-```text
-bin/zcash-devtool
-```
-
-Build the complete local qualification stack when needed:
-
-```sh
-./zcash-devtool/scripts/build.sh --all
-```
-
-Individual targets can also be selected or combined with `--zakura`,
-`--zaino`, and `--zcash-devtool`. The complete-stack invocation creates or
-refreshes:
-
-```text
-bin/zakurad
-bin/zainod
-bin/zcash-devtool
-```
-
-The build uses locked release builds and enables `regtest_support` for
-`zcash-devtool`. It also checks that each binary starts and responds to its
-version/help command.
-
-## Run the live qualification
-
-After a successful build:
-
-```sh
-./zcash-devtool/scripts/live-qualification.sh
-```
-
-For a shorter targeted run, stop after a requested phase:
-
-```sh
-./zcash-devtool/scripts/live-qualification.sh --phase 1
-./zcash-devtool/scripts/live-qualification.sh --phase 2
-```
-
-When iterating on Phase 5, preserve the Phase 4 checkpoint once, then resume
-only Phase 5 on later runs:
-
-```sh
-./zcash-devtool/scripts/live-qualification.sh --phase 4 --keep-state
-./zcash-devtool/scripts/live-qualification.sh \
-  --resume /tmp/coppice-live-qualification.XXXXXX --phase 5
-```
-
-The first command prints the actual run directory and the exact resume command.
-The default invocation runs all five live phases. `--phase 7` runs those same
-live phases and then the beyond-retention deep-reorg qualification. Phase 5
-cannot be resumed from a Phase 1–3 checkpoint because its adversarial fixture
-depends on the canonical two-account state produced by Phase 4.
-
-Phase 6 is intentionally separate from the live stack. It constructs a
-deterministic Coppice Names / `coppice-names-librustzcash` chain using the
-public Coppice runtime, exercises the 121-block retention horizon with a
-15-block retained fork and a deeper 135-block fork, verifies the rebuild
-signal and atomicity, compares replacement replay with an independent clean
-replay, and reconstructs only Active-bond locks:
-
-```sh
-./zcash-devtool/scripts/live-qualification.sh --phase 6
-```
-
-It does not launch Zakura or Zaino and does not manufacture a large live
-Regtest reorganization. Failed Phase 6 logs are preserved under
-`/tmp/coppice-phase6-deep-reorg.*`; use `--keep-state` to preserve them after
-success.
-
-The harness creates an isolated disposable Regtest stack and runs:
-
-- Phase 1: Ironwood `GetSubtreeRoots`, wallet sync, and an ordinary Ironwood
-  receive/spend.
-- Phase 2: Coppice COMMIT, REVEAL, `coppice complete`, UPDATE, RELEASE, second
-  registration, Break Bond, restart recovery, and a same-height shallow reorg.
-- Phase 3: fresh same-seed wallet initialization from Coppice activation,
-  canonical replay, bond-lock reconstruction, protected ordinary-send rejection,
-  and fresh-wallet Break Bond.
-- Phase 4: same-seed multi-account registration and lock isolation, persisted
-  restart recovery, and fresh two-account recovery.
-- Phase 5: adversarial wallet/PCZT spend-path rejection under Enabled and
-  GuardOnly, exact-owner Break Bond, Off-mode lock cleanup, foreign-lock
-  preservation, and an unsynchronized ordinary Off-mode send.
-- Phase 7: a fresh real-stack run through Phase 5 followed by a 131-block
-  beyond-retention reorg, activation rebuild, and independent same-seed
-  snapshot convergence.
-
-The separate Phase 6 entry point runs deterministic retained reorg, deep-fork
-`NeedsRebuild`-equivalent signaling, activation-checkpoint rebuild equivalence,
-and post-rebuild bond lock reconstruction.
-
-`--phase 7` is the complete live qualification entry point; it is intentionally
-fresh and does not resume a Phase 4 checkpoint. It exercises the real stack
-through the live lifecycle and then forces the deep reorg described above.
-
-On success, temporary state and logs are removed. On failure, the run directory
-under `/tmp/coppice-live-qualification.*` is preserved and printed so the
-Zakura, Zaino, wallet, and gRPC logs can be inspected.
-
-The harness uses loopback ports `18232`/`18233` for Zakura and `8137` for Zaino.
-Stop any conflicting local services before running it.
+All node state, wallet data, and logs are disposable and live below
+`/tmp/coppice-names-v2-live.*`. The script does not perform release artifact
+generation or performance qualification.

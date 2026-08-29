@@ -6,16 +6,14 @@ use pczt::{
     Pczt,
     roles::{spend_finalizer::SpendFinalizer, tx_extractor::TransactionExtractor},
 };
-use rand::rngs::OsRng;
 use tokio::{
     fs::File,
     io::{AsyncReadExt, stdin},
 };
 use zcash_client_backend::proto::service;
-use zcash_client_sqlite::{WalletDb, util::SystemClock};
 use zcash_proofs::prover::LocalTxProver;
 
-use crate::{config::WalletConfig, data::get_db_paths, error, remote::ConnectionArgs};
+use crate::{config::WalletConfig, error, remote::ConnectionArgs};
 
 // Options accepted for the `pczt send-without-storing` command
 #[derive(Debug, Args)]
@@ -55,15 +53,6 @@ impl Command {
             .extract()
             .map_err(|e| anyhow!("Failed to extract transaction from PCZT: {e:?}"))?;
         let txid = tx.txid();
-        let (_, db_path) = get_db_paths(wallet_dir.as_ref());
-        let db = WalletDb::for_path(db_path, params, SystemClock, OsRng)?;
-        crate::coppice_support::ensure_external_transaction_respects_coppice(
-            &params,
-            wallet_dir.as_ref(),
-            &db,
-            &tx,
-        )?;
-
         // Send the transaction.
         println!("Sending transaction...");
         let raw_tx = {

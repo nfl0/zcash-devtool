@@ -30,20 +30,11 @@ pub(crate) struct Command {
 }
 
 impl Command {
-    pub(crate) async fn run(self, wallet_dir: Option<String>) -> Result<(), anyhow::Error> {
+    pub(crate) async fn run(self, _wallet_dir: Option<String>) -> Result<(), anyhow::Error> {
         let mut buf = vec![];
         stdin().read_to_end(&mut buf).await?;
 
         let pczt = Pczt::parse(&buf).map_err(|e| anyhow!("Failed to read PCZT: {:?}", e))?;
-
-        if wallet_dir.is_some() {
-            let config = crate::config::WalletConfig::read(wallet_dir.as_ref())?;
-            crate::coppice_support::ensure_external_pczt_respects_coppice(
-                &config.network(),
-                wallet_dir.as_ref(),
-                &pczt,
-            )?;
-        }
 
         let tx = extract_final_transaction(pczt)?;
         if self.raw_hex {

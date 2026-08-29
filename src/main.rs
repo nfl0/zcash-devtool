@@ -13,7 +13,6 @@ use tracing_subscriber::{Layer, layer::SubscriberExt};
 
 mod commands;
 mod config;
-mod coppice_support;
 mod data;
 mod error;
 mod helpers;
@@ -177,7 +176,6 @@ fn main() -> Result<(), anyhow::Error> {
                 commands::wallet::Command::Propose(command) => command.run(wallet_dir).await,
                 commands::wallet::Command::Pay(command) => command.run(wallet_dir).await,
                 commands::wallet::Command::Send(command) => command.run(wallet_dir).await,
-                commands::wallet::Command::Coppice(command) => command.run(wallet_dir).await,
                 commands::wallet::Command::FanOut(command) => command.run(wallet_dir).await,
                 commands::wallet::Command::Tree(command) => match command {
                     #[cfg(feature = "tui")]

@@ -50,15 +50,6 @@ impl Command {
 
         let pczt = Pczt::parse(&buf).map_err(|e| anyhow!("Failed to read PCZT: {:?}", e))?;
 
-        if wallet_dir.is_some() {
-            let config = WalletConfig::read(wallet_dir.as_ref())?;
-            crate::coppice_support::ensure_external_pczt_respects_coppice(
-                &config.network(),
-                wallet_dir.as_ref(),
-                &pczt,
-            )?;
-        }
-
         // If we have Sapling spends, we need Sapling proof generation keys.
         let pczt = if !pczt.sapling().spends().is_empty() {
             enum PgkSource {

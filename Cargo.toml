@@ -16,7 +16,6 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(zcash_unstable, values("nu
 anyhow = "1"
 coppice = { path = "../coppice/crates/coppice" }
 coppice-librustzcash = { path = "../coppice/crates/coppice-librustzcash" }
-coppice-names-librustzcash = { path = "../coppice-names/crates/coppice-names-librustzcash" }
 coppice-names = { path = "../coppice-names/crates/coppice-names" }
 coppice-receipts = { path = "../coppice-receipts" }
 coppice-zcash-rpc = { path = "../coppice/crates/coppice-zcash-rpc" }
@@ -165,7 +164,7 @@ tui = [
 # extension. A git dependency's own nested patches do not propagate to ours,
 # so this workspace needs its own matching entry or the graph disagrees on
 # which orchard it is building against. Names v2 pins the corrected complete
-# local-transition circuit; frozen v1 artifacts are unaffected.
+# local-transition circuit.
 orchard = { git = "https://github.com/nfl0/orchard-coppice.git", rev = "84e22d5bc62bb138bce5d8a21ec61d3afe01bc12" }
 equihash = { git = "https://github.com/zcash/librustzcash.git", rev = "6c07e5f3297febf469e5cc8d0b91321e0767cdd7" }
 f4jumble = { git = "https://github.com/zcash/librustzcash.git", rev = "6c07e5f3297febf469e5cc8d0b91321e0767cdd7" }
