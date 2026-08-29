@@ -5,6 +5,7 @@
 //! COMMIT, the existing designated-pair builder for the REVEAL, and ordinary
 //! JSON-RPC acquisition for canonical producer positions and replay.
 
+use rand::rngs::ThreadRng;
 use std::{
     collections::BTreeMap,
     io::Cursor,
@@ -31,7 +32,6 @@ use orchard::{
     note::{ExtractedNoteCommitment, Note, NoteVersion, RandomSeed, Rho},
     value::NoteValue,
 };
-use rand::rngs::OsRng;
 use zcash_client_backend::{
     data_api::wallet::{
         ConfirmationsPolicy, SpendingKeys, create_proposed_transactions,
@@ -404,9 +404,14 @@ fn wallet_usk(params: &LocalNetwork) -> Result<UnifiedSpendingKey> {
 fn open_wallet(
     wallet_dir: &PathBuf,
     params: LocalNetwork,
-) -> Result<WalletDb<rusqlite::Connection, LocalNetwork, SystemClock, OsRng>> {
-    WalletDb::for_path(wallet_dir.join("data.sqlite"), params, SystemClock, OsRng)
-        .context("open live wallet database")
+) -> Result<WalletDb<rusqlite::Connection, LocalNetwork, SystemClock, ThreadRng>> {
+    WalletDb::for_path(
+        wallet_dir.join("data.sqlite"),
+        params,
+        SystemClock,
+        rand::rng(),
+    )
+    .context("open live wallet database")
 }
 
 fn names_recipient() -> Result<orchard::Address> {
@@ -1338,7 +1343,7 @@ fn find_canonical_commit(
 }
 
 fn selected_notes(
-    db: &WalletDb<rusqlite::Connection, LocalNetwork, SystemClock, OsRng>,
+    db: &WalletDb<rusqlite::Connection, LocalNetwork, SystemClock, ThreadRng>,
     height: u32,
     account_id: zcash_client_sqlite::AccountUuid,
 ) -> Result<Vec<(Note, Scope, incrementalmerkletree::Position, u64)>> {
@@ -1366,7 +1371,7 @@ fn selected_notes(
 }
 
 fn wallet_witnesses(
-    db: &mut WalletDb<rusqlite::Connection, LocalNetwork, SystemClock, OsRng>,
+    db: &mut WalletDb<rusqlite::Connection, LocalNetwork, SystemClock, ThreadRng>,
     anchor_height: BlockHeight,
     positions: [incrementalmerkletree::Position; 2],
 ) -> Result<(orchard::Anchor, [orchard::tree::MerklePath; 2])> {
@@ -1502,7 +1507,7 @@ fn reveal_with_replacement(
         .prove_genesis(
             preparation.statement(),
             preparation.witness().clone(),
-            OsRng,
+            rand::rng(),
         )
         .map_err(|error| anyhow::anyhow!("create Names genesis proof: {error:?}"))?;
     let proof_elapsed = proof_started.elapsed();
@@ -1522,7 +1527,7 @@ fn reveal_with_replacement(
         &names_fvk,
         &funding_note,
     )?;
-    let built = build_names_v1_bundle(planned.plan, OsRng)?;
+    let built = build_names_v1_bundle(planned.plan, rand::rng())?;
     ensure!(
         built.action_count == planned.planned_shape.action_count,
         "built Names v1 action count differs from fee-planned shape"
@@ -2112,7 +2117,7 @@ fn update(args: UpdateArgs) -> Result<()> {
         .prove_transition(
             preparation.statement(),
             preparation.witness().clone(),
-            OsRng,
+            rand::rng(),
         )
         .map_err(|error| anyhow::anyhow!("create Names UPDATE proof: {error:?}"))?;
     let names_proof_elapsed = names_proof_started.elapsed();
@@ -2135,7 +2140,7 @@ fn update(args: UpdateArgs) -> Result<()> {
         &names_fvk,
         &funding_note,
     )?;
-    let built = build_names_v1_bundle(planned.plan, OsRng)?;
+    let built = build_names_v1_bundle(planned.plan, rand::rng())?;
     ensure!(
         built.action_count == planned.planned_shape.action_count,
         "UPDATE built action count differs from fee-planned shape"
@@ -2425,7 +2430,7 @@ fn abandon(args: AbandonArgs) -> Result<()> {
         names_v1_ironwood_shape(&plan)? == planned_shape,
         "out-of-band plan shape changed after fee planning"
     );
-    let built = build_names_v1_bundle(plan, OsRng)?;
+    let built = build_names_v1_bundle(plan, rand::rng())?;
     ensure!(
         built.action_count == planned_shape.action_count
             && built.ironwood_value_balance
@@ -2728,7 +2733,7 @@ fn renew(args: RenewArgs) -> Result<()> {
         .prove_transition(
             preparation.statement(),
             preparation.witness().clone(),
-            OsRng,
+            rand::rng(),
         )
         .map_err(|error| anyhow::anyhow!("create Names RENEW proof: {error:?}"))?;
     let names_proof_elapsed = names_proof_started.elapsed();
@@ -2751,7 +2756,7 @@ fn renew(args: RenewArgs) -> Result<()> {
         &names_fvk,
         &funding_note,
     )?;
-    let built = build_names_v1_bundle(planned.plan, OsRng)?;
+    let built = build_names_v1_bundle(planned.plan, rand::rng())?;
     ensure!(
         built.action_count == planned.planned_shape.action_count,
         "RENEW built action count differs from fee-planned shape"
@@ -3048,7 +3053,7 @@ fn release(args: ReleaseArgs) -> Result<()> {
         .prove_transition(
             preparation.statement(),
             preparation.witness().clone(),
-            OsRng,
+            rand::rng(),
         )
         .map_err(|error| anyhow::anyhow!("create Names RELEASE proof: {error:?}"))?;
     let names_proof_elapsed = names_proof_started.elapsed();
@@ -3071,7 +3076,7 @@ fn release(args: ReleaseArgs) -> Result<()> {
         &names_fvk,
         &funding_note,
     )?;
-    let built = build_names_v1_bundle(planned.plan, OsRng)?;
+    let built = build_names_v1_bundle(planned.plan, rand::rng())?;
     ensure!(
         built.action_count == planned.planned_shape.action_count,
         "RELEASE built action count differs from fee-planned shape"

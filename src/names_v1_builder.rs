@@ -13,7 +13,7 @@ use pczt::roles::{
     creator::Creator, io_finalizer::IoFinalizer, prover::Prover, signer::Signer,
     tx_extractor::TransactionExtractor, updater::Updater,
 };
-use rand::RngCore;
+use rand::Rng;
 use zcash_client_backend::fees::StandardFeeRule;
 use zcash_primitives::transaction::{
     Transaction, TxId, TxVersion as TransactionVersion,
@@ -319,7 +319,7 @@ pub fn required_zip317_fee_for_names_v1<P: Parameters>(
 /// Builds the Ironwood portion of a Names v1 PCZT without proving or signing.
 pub fn build_names_v1_bundle(
     plan: NamesV1IronwoodPlan,
-    rng: impl RngCore,
+    rng: impl Rng,
 ) -> Result<NamesV1BuiltBundle> {
     let shape = names_v1_ironwood_shape(&plan)?;
     let designated_nullifier = plan.designated_spend.nullifier(&plan.designated_fvk);

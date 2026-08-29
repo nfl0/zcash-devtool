@@ -3,7 +3,6 @@ use std::path::PathBuf;
 use anyhow::anyhow;
 use clap::Args;
 use pczt::Pczt;
-use rand::rngs::OsRng;
 use tokio::{
     fs::File,
     io::{AsyncReadExt, stdin},
@@ -30,7 +29,7 @@ impl Command {
         let params = config.network();
 
         let (_, db_data) = get_db_paths(wallet_dir.as_ref());
-        let mut db_data = WalletDb::for_path(db_data, params, SystemClock, OsRng)?;
+        let mut db_data = WalletDb::for_path(db_data, params, SystemClock, rand::rng())?;
 
         let mut client = self.connection.connect(params, wallet_dir.as_ref()).await?;
 

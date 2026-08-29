@@ -53,9 +53,6 @@ pub(crate) enum Command {
     /// Send funds using PCZTs
     Pczt(commands::Pczt),
 
-    /// Migrate wallet funds between value pools (Orchard -> Ironwood)
-    Migration(commands::Migration),
-
     /// Emulate a Keystone device
     #[cfg(feature = "pczt-qr")]
     Keystone(commands::Keystone),
@@ -236,15 +233,6 @@ fn main() -> Result<(), anyhow::Error> {
                 commands::pczt::Command::FromQrBatch(command) => command.run(shutdown).await,
                 #[cfg(feature = "pczt-qr")]
                 commands::pczt::Command::BatchSign(command) => command.run(shutdown).await,
-            },
-            Command::Migration(commands::Migration {
-                wallet_dir,
-                command,
-            }) => match command {
-                commands::migration::Command::Plan(command) => command.run(wallet_dir),
-                commands::migration::Command::Commit(command) => command.run(wallet_dir),
-                commands::migration::Command::Status(command) => command.run(wallet_dir),
-                commands::migration::Command::Advance(command) => command.run(wallet_dir),
             },
             #[cfg(feature = "pczt-qr")]
             Command::Keystone(commands::Keystone {

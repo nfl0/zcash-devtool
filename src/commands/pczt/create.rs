@@ -7,7 +7,6 @@ use std::{
 
 use anyhow::anyhow;
 use clap::Args;
-use rand::rngs::OsRng;
 use tokio::{
     fs::File,
     io::{AsyncWriteExt, stdout},
@@ -83,7 +82,7 @@ impl Command {
         let params = config.network();
 
         let (_, db_data) = get_db_paths(wallet_dir.as_ref());
-        let mut db_data = WalletDb::for_path(db_data, params, SystemClock, OsRng)?;
+        let mut db_data = WalletDb::for_path(db_data, params, SystemClock, rand::rng())?;
         let account = select_account(&db_data, self.account_id)?;
 
         // Create the PCZT.

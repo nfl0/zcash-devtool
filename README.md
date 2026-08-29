@@ -69,6 +69,12 @@ necessary migrations:
 cargo run --release -- wallet -w <wallet_dir> upgrade
 ```
 
+The Zakura wallet-libraries fork does not currently ship the upstream
+Orchard-to-Ironwood pool-migration engine, so this Zakura-backed devtool build
+does not expose the separate `migration` subcommand. The wallet, PCZT, and
+Names qualification paths remain available; pool-migration support can be
+added once a Zakura-compatible engine/store is published.
+
 If you want to run with debug or trace logging:
 ```
 RUST_LOG=debug cargo run --release -- wallet -w <wallet_dir> <command>

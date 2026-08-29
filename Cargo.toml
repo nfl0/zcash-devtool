@@ -2,7 +2,7 @@
 name = "zcash-devtool"
 version = "1.0.0"
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.91"
 license = "MIT OR Apache-2.0"
 publish = false
 
@@ -17,13 +17,12 @@ anyhow = "1"
 coppice = { path = "../coppice/crates/coppice" }
 coppice-librustzcash = { path = "../coppice/crates/coppice-librustzcash" }
 coppice-names = { path = "../coppice-names/crates/coppice-names" }
-coppice-receipts = { path = "../coppice-receipts" }
 coppice-zcash-rpc = { path = "../coppice/crates/coppice-zcash-rpc" }
 bip0039 = { version = "0.14", features = ["std", "all-languages"] }
 bip32 = { version = "=0.6.0-pre.1", default-features = false, features = ["secp256k1-ffi"] }
 futures-util = "0.3"
 hex = "0.4"
-jubjub = "0.10"
+jubjub = { package = "zakura-jubjub", version = "=1.0.0" }
 nonempty = { version = "0.11", default-features = false }
 prost = "0.14"
 rayon = "1.7"
@@ -46,48 +45,34 @@ uuid = "1"
 
 # Zcash
 #
-# NOTE: zcash_client_backend/zcash_client_sqlite/pczt/zip321 version reqs
-# below are pinned to the exact prerelease versions on the librustzcash
-# main revision in [patch.crates-io] below — these are ahead of the last
-# crates.io releases. If the patch rev changes,
-# re-check these against the new rev's Cargo.toml files, or Cargo will
-# silently fall back to stale crates.io versions for the unsatisfied ones
-# and duplicate half the dependency graph (as happened here).
-orchard = { version = "=0.15.3", default-features = false }
-pczt = { version = "0.9.1", features = ["io-finalizer", "orchard", "prover", "signer", "spend-finalizer", "transparent", "tx-extractor"] }
-sapling = { package = "sapling-crypto", version = "0.7" }
+# Keep one Zakura type family across the devtool, Coppice, and Names crates.
+# The `orchard` source is the Coppice extension; the remaining wallet/proving
+# crates are the released Zakura packages.
+orchard = { package = "zakura-orchard", version = "=1.0.0", default-features = false, features = ["std", "state-note"] }
+pczt = { package = "zakura-pczt", version = "=0.1.0-rc2", features = ["io-finalizer", "orchard", "prover", "signer", "spend-finalizer", "transparent", "tx-extractor"] }
+sapling = { package = "zakura-sapling-crypto", version = "=1.0.0" }
 transparent = { package = "zcash_transparent", version = "0.10.0", features = ["test-dependencies", "transparent-inputs"] }
 zcash_address = "0.13.0"
-zcash_client_backend = { version = "0.24.0-rc.6", features = ["lightwalletd-tonic-tls-webpki-roots", "orchard", "pczt", "tor", "unstable"] }
+zcash_client_backend = { package = "zakura-client-backend", version = "=0.1.0-rc4", features = ["lightwalletd-tonic-tls-webpki-roots", "orchard", "pczt", "tor", "unstable"] }
 # `transparent-inputs` is enabled unconditionally: `zcash_client_backend`'s `pczt`
 # feature (always on here) already forces `zcash_client_backend/transparent-inputs`,
 # so `zcash_client_sqlite` must match or its `WalletRead`/`WalletWrite` impls fail to
 # cover the trait's transparent methods.
-zcash_client_sqlite = { version = "0.22.0-rc.6", features = ["transparent-inputs", "unstable", "orchard", "serde", "test-dependencies"] }
-zcash_keys = { version = "0.16.1", features = ["orchard", "sapling", "unstable", "unstable-frost"] }
-zcash_primitives = "0.30.0"
-zcash_proofs = { version = "0.30.0", features = ["bundled-prover"] }
-zcash_protocol = { version = "0.10.3", features = ["local-consensus"] }
+zcash_client_sqlite = { package = "zakura-client-sqlite", version = "=0.1.0-rc4", features = ["transparent-inputs", "unstable", "orchard", "serde", "test-dependencies"] }
+zcash_keys = { package = "zakura-keys", version = "=1.0.0", features = ["orchard", "sapling", "unstable", "unstable-frost"] }
+zcash_primitives = { package = "zakura-primitives", version = "=1.0.0" }
+zcash_proofs = { package = "zakura-proofs", version = "=1.0.0", features = ["bundled-prover", "directories"] }
+zcash_protocol = { version = "=0.10.5", features = ["local-consensus"] }
 zcash_script = "0.4"
 zip32 = "0.2"
-zip321 = "0.9.0-rc.1"
+zip321 = "=0.9.0"
 
-# Backend-agnostic value-pool migration engine (Orchard -> Ironwood, NU6.3).
-# Not yet published to crates.io; lives in librustzcash main now that #2663
-# (engine) and #2710 (proving) are both merged. Pinned to the same commit as
-# the [patch.crates-io] block above. `wallet` feature pulls in the
-# `WalletMigration` adapter used to drive the engine over our own WalletDb.
-zcash_pool_migration = { git = "https://github.com/zcash/librustzcash.git", rev = "6c07e5f3297febf469e5cc8d0b91321e0767cdd7", features = ["wallet"] }
-# The standalone zcash_pool_migration_sqlite crate is gone as of this pin: the
-# SQLite store (pool_migrations tables + PoolMigrationRead/Write) moved into
-# zcash_client_sqlite::pool_migration::orchard_ironwood as a hard (non-optional)
-# dependency, so no separate crate/feature is needed for it any more.
 
 # CLI
 clap = { version = "4.5", features = ["derive", "string", "unstable-styles"] }
 
 # CSPRNG
-rand = { version = "0.8", default-features = false }
+rand = { version = "0.10", default-features = false, features = ["thread_rng"] }
 
 # Seed encryption
 age = { version = "0.12", features = ["armor", "plugin"] }
@@ -100,12 +85,12 @@ rust_decimal = "1"
 
 # Inspect
 bech32 = "0.11"
-bellman = "0.14"
+bellman = { package = "zakura-bellman", version = "=1.0.0" }
 blake2b_simd = "1"
 bs58 = "0.5"
 ed25519-zebra = "4"
-equihash = "0.2"
-group = "0.13"
+equihash = "0.3"
+group = "0.14"
 lazy_static = "1"
 phf = { version = "0.11", features = ["macros"] }
 regex = "1"
@@ -114,7 +99,7 @@ sha2 = "0.10"
 sha3 = "0.10"
 uint = "0.10"
 zcash_encoding = "0.4"
-zcash_note_encryption = "0.4.1"
+zcash_note_encryption = "0.4.2"
 
 # PCZT QR codes
 image = { version = "0.25", optional = true }
@@ -152,29 +137,6 @@ tui = [
 ]
 
 [patch.crates-io]
-# Pinned to zcash/librustzcash main as of 2026-07-30. The pool-migration
-# engine (#2663) and its proving support (#2710, "consult the drawn anchor
-# boundary at proving time") are both merged upstream now, so this no longer
-# tracks Danny Willems' feat/pool-migration-sqlite branch -- that branch is
-# superseded, main has everything it had plus the proving primitive
-# (zcash_pool_migration is still not published to crates.io, so it remains
-# pinned by git revision.)
-#
-# orchard is patched here too, to the dedicated non-consensus Coppice Names
-# extension. A git dependency's own nested patches do not propagate to ours,
-# so this workspace needs its own matching entry or the graph disagrees on
-# which orchard it is building against. Names v1 pins the post-reset complete
-# local-transition circuit.
-orchard = { git = "https://github.com/nfl0/orchard-coppice.git", rev = "5588c4e42d7158233a50471c04340ea58615bb0e" }
-equihash = { git = "https://github.com/zcash/librustzcash.git", rev = "6c07e5f3297febf469e5cc8d0b91321e0767cdd7" }
-f4jumble = { git = "https://github.com/zcash/librustzcash.git", rev = "6c07e5f3297febf469e5cc8d0b91321e0767cdd7" }
-zcash_address = { git = "https://github.com/zcash/librustzcash.git", rev = "6c07e5f3297febf469e5cc8d0b91321e0767cdd7" }
-zcash_protocol = { git = "https://github.com/zcash/librustzcash.git", rev = "6c07e5f3297febf469e5cc8d0b91321e0767cdd7" }
-zip321 = { git = "https://github.com/zcash/librustzcash.git", rev = "6c07e5f3297febf469e5cc8d0b91321e0767cdd7" }
-pczt = { git = "https://github.com/zcash/librustzcash.git", rev = "6c07e5f3297febf469e5cc8d0b91321e0767cdd7" }
-zcash_client_backend = { git = "https://github.com/zcash/librustzcash.git", rev = "6c07e5f3297febf469e5cc8d0b91321e0767cdd7" }
-zcash_client_sqlite = { git = "https://github.com/zcash/librustzcash.git", rev = "6c07e5f3297febf469e5cc8d0b91321e0767cdd7" }
-zcash_keys = { git = "https://github.com/zcash/librustzcash.git", rev = "6c07e5f3297febf469e5cc8d0b91321e0767cdd7" }
-zcash_primitives = { git = "https://github.com/zcash/librustzcash.git", rev = "6c07e5f3297febf469e5cc8d0b91321e0767cdd7" }
-zcash_proofs = { git = "https://github.com/zcash/librustzcash.git", rev = "6c07e5f3297febf469e5cc8d0b91321e0767cdd7" }
-zcash_transparent = { git = "https://github.com/zcash/librustzcash.git", rev = "6c07e5f3297febf469e5cc8d0b91321e0767cdd7" }
+# The extension is a package-name patch so every direct and transitive edge
+# that asks for `zakura-orchard` resolves to the same Coppice artifact.
+zakura-orchard = { git = "https://github.com/nfl0/orchard-coppice.git", rev = "0e09398970130b9510ce5011129acafc5039e79f" }

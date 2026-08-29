@@ -4,7 +4,6 @@ use std::{path::PathBuf, str::FromStr};
 use anyhow::anyhow;
 use clap::Args;
 use pczt::roles::{creator::Creator, io_finalizer::IoFinalizer, updater::Updater};
-use rand::rngs::OsRng;
 use tokio::{
     fs::File,
     io::{AsyncWriteExt, stdout},
@@ -84,7 +83,7 @@ impl Command {
             let config = WalletConfig::read(wallet_dir.as_ref())?;
             config.network()
         };
-        let rng = OsRng;
+        let rng = rand::rng();
 
         let coins = parse_coins(&self.coins)?;
         let recipient = ZcashAddress::from_str(&self.address)

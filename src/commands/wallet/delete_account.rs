@@ -1,5 +1,4 @@
 use clap::Args;
-use rand::rngs::OsRng;
 use uuid::Uuid;
 use zcash_client_backend::data_api::{Account as _, WalletWrite};
 use zcash_client_sqlite::{WalletDb, util::SystemClock};
@@ -18,7 +17,7 @@ impl Command {
         let params = get_wallet_network(wallet_dir.as_ref())?;
 
         let (_, db_data) = get_db_paths(wallet_dir.as_ref());
-        let mut db_data = WalletDb::for_path(db_data, params, SystemClock, OsRng)?;
+        let mut db_data = WalletDb::for_path(db_data, params, SystemClock, rand::rng())?;
         let account = select_account(&db_data, self.account_id)?;
 
         db_data.delete_account(account.id())?;
