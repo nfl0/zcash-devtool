@@ -63,7 +63,7 @@ ZAKURA_P2P_ADDR="127.0.0.1:18233"
 ZAINO_GRPC_ADDR="127.0.0.1:8137"
 ZAINO_GRPC_URL="http://$ZAINO_GRPC_ADDR"
 
-WALLET_MNEMONIC="abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon art"
+WALLET_MNEMONIC="abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon art"
 SAPLING_DISCARD_MNEMONIC="abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about"
 
 WORK_DIR="$(mktemp -d /tmp/coppice-names-v1-live.XXXXXX)"
