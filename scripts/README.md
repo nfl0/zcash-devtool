@@ -3,7 +3,10 @@
 `live-qualification.sh` is a disposable local-regtest harness for the current
 Names protocol. It launches the pinned Zakura/Zaino stack, funds a wallet with
 Ironwood value, and then drives the canonical lifecycle through the
-`names-v1-live` binary.
+`names-v1-live` binary. The Zakura-backed run on 2026-08-30 completed
+`COMMIT -> REVEAL -> UPDATE -> RENEW -> RELEASE` and both exact
+`Released -> Expired` boundary checks; its preserved logs are recorded in
+`coppice-names/docs/QUALIFICATION.md`.
 
 ```sh
 ./scripts/live-qualification.sh --phase 1
@@ -17,4 +20,5 @@ FreshResolver parity and the exact `Released -> Expired` claimability edge.
 
 All node state, wallet data, and logs are disposable and live below
 `/tmp/coppice-names-v1-live.*`. The script does not perform release artifact
-generation or performance qualification.
+generation or performance qualification; those deterministic values are
+checked and frozen by `coppice-names`.
