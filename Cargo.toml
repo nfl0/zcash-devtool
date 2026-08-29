@@ -166,7 +166,7 @@ tui = [
 # so this workspace needs its own matching entry or the graph disagrees on
 # which orchard it is building against. Names v2 pins the corrected complete
 # local-transition circuit; frozen v1 artifacts are unaffected.
-orchard = { git = "https://github.com/nfl0/orchard-coppice.git", rev = "c33aa79bcdd08c916c73d2268d610b8a1818308c" }
+orchard = { git = "https://github.com/nfl0/orchard-coppice.git", rev = "84e22d5bc62bb138bce5d8a21ec61d3afe01bc12" }
 equihash = { git = "https://github.com/zcash/librustzcash.git", rev = "6c07e5f3297febf469e5cc8d0b91321e0767cdd7" }
 f4jumble = { git = "https://github.com/zcash/librustzcash.git", rev = "6c07e5f3297febf469e5cc8d0b91321e0767cdd7" }
 zcash_address = { git = "https://github.com/zcash/librustzcash.git", rev = "6c07e5f3297febf469e5cc8d0b91321e0767cdd7" }
