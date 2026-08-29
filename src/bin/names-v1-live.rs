@@ -1,4 +1,4 @@
-//! One disposable live Names v2 COMMIT -> REVEAL qualification flow.
+//! One disposable live Names v1 COMMIT -> REVEAL qualification flow.
 //!
 //! This binary intentionally owns only the narrow orchestration needed by the
 //! live qualification script. It uses ordinary wallet construction for the
@@ -18,12 +18,12 @@ use bip0039::{English, Mnemonic};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use coppice::{carrier::CoreRendezvous, transport::reconstruct_frames};
 use coppice_librustzcash::{CanonicalBlockSource, FullTransactionSource};
-use coppice_names::v2::names_application_id;
-use coppice_names::v2::{
+use coppice_names::v1::names_application_id;
+use coppice_names::v1::{
     AppliedOperationKind, AppliedOperationResult, CanonicalBlock, CanonicalTransaction, CommitRef,
-    FreshResolver, IronwoodActionRef, NameState, OrchardV2ProofProver, OrchardV2ProofVerifier,
-    ProducerPosition, RegistrationIntent, ResolutionStatus, StateRef, StateStatus, V2Operation,
-    V2Parameters, V2StateMachine, decode_operation,
+    FreshResolver, IronwoodActionRef, NameState, OrchardV1ProofProver, OrchardV1ProofVerifier,
+    ProducerPosition, RegistrationIntent, ResolutionStatus, StateRef, StateStatus, V1Operation,
+    V1Parameters, V1StateMachine, decode_operation,
 };
 use orchard::{
     circuit::state_note_binding::spend_auth_owner_key_bytes,
@@ -43,7 +43,7 @@ use zcash_client_backend::{
     wallet::OvkPolicy,
 };
 use zcash_client_sqlite::{WalletDb, error::SqliteClientError, util::SystemClock};
-use zcash_devtool::names_v2_config::{REGTEST, bulletin_address};
+use zcash_devtool::names_v1_config::{REGTEST, bulletin_address};
 use zcash_keys::{address::UnifiedAddress, keys::UnifiedSpendingKey};
 use zcash_primitives::transaction::{Transaction, TxVersion as TransactionVersion};
 use zcash_proofs::prover::LocalTxProver;
@@ -56,14 +56,14 @@ use zcash_protocol::{
 };
 use zip321::{Payment, TransactionRequest};
 
-use zcash_devtool::names_v2_builder::{
-    ChangeOutput, FundingSpend, NamesV2IronwoodPlan, NamesV2IronwoodWitness, NamesV2PcztPlan,
-    NamesV2SigningPlan, NamesV2WitnessPlan, build_names_v2_bundle, build_names_v2_pczt,
-    extract_names_v2_transaction, finalize_names_v2_pczt_io, install_names_v2_ironwood_witnesses,
-    names_v2_ironwood_shape, names_v2_ironwood_shape_from_counts, prove_names_v2_ironwood_pczt,
-    required_zip317_fee_for_names_v2, sign_names_v2_ironwood_pczt, verify_designated_action,
+use zcash_devtool::names_v1_builder::{
+    ChangeOutput, FundingSpend, NamesV1IronwoodPlan, NamesV1IronwoodWitness, NamesV1PcztPlan,
+    NamesV1SigningPlan, NamesV1WitnessPlan, build_names_v1_bundle, build_names_v1_pczt,
+    extract_names_v1_transaction, finalize_names_v1_pczt_io, install_names_v1_ironwood_witnesses,
+    names_v1_ironwood_shape, names_v1_ironwood_shape_from_counts, prove_names_v1_ironwood_pczt,
+    required_zip317_fee_for_names_v1, sign_names_v1_ironwood_pczt, verify_designated_action,
 };
-use zcash_devtool::names_v2_operation::{
+use zcash_devtool::names_v1_operation::{
     CarrierPlan, FinalizedOperation, OperationFunding, RevealInputs, StateOperationPlan,
     SuccessorTransport, TransitionInputs, plan_state_operation,
     planned_state_operation_shape_and_fee, prepare_commit, prepare_release, prepare_renew,
@@ -87,8 +87,8 @@ const RECLAIM_SECRET: [u8; 32] = [11; 32];
 const RECLAIM_SUCCESSOR_SEED: u8 = 7;
 
 #[derive(Parser)]
-#[command(name = "names-v2-live")]
-#[command(about = "Disposable live Names v2 COMMIT -> REVEAL qualification")]
+#[command(name = "names-v1-live")]
+#[command(about = "Disposable live Names v1 COMMIT -> REVEAL qualification")]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -96,29 +96,29 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Build, authorize, and submit the one-frame v2 COMMIT transaction.
+    /// Build, authorize, and submit the one-frame v1 COMMIT transaction.
     Commit(CommonArgs),
-    /// Print the next legal v2 anchor height for the deterministic name.
+    /// Print the next legal v1 anchor height for the deterministic name.
     Target(TargetArgs),
-    /// Build, authorize, and submit the real v2 REVEAL at the current target height.
+    /// Build, authorize, and submit the real v1 REVEAL at the current target height.
     Reveal(RevealArgs),
     /// Replay the canonical chain and verify the initial active state.
     Verify(VerifyArgs),
-    /// Build, authorize, and submit one real v2 UPDATE for the accepted name.
+    /// Build, authorize, and submit one real v1 UPDATE for the accepted name.
     Update(UpdateArgs),
-    /// Replay the canonical chain and verify one real v2 UPDATE.
+    /// Replay the canonical chain and verify one real v1 UPDATE.
     VerifyUpdate(VerifyUpdateArgs),
     /// Spend the accepted state note without publishing a Names operation.
     Abandon(AbandonArgs),
     /// Replay and independently resolve an out-of-band state-note spend.
     VerifyAbandon(VerifyAbandonArgs),
-    /// Build, authorize, and submit one real v2 RENEW for the accepted name.
+    /// Build, authorize, and submit one real v1 RENEW for the accepted name.
     Renew(RenewArgs),
-    /// Replay the canonical chain and verify one real v2 RENEW.
+    /// Replay the canonical chain and verify one real v1 RENEW.
     VerifyRenew(VerifyRenewArgs),
-    /// Build, authorize, and submit one real v2 RELEASE for the accepted name.
+    /// Build, authorize, and submit one real v1 RELEASE for the accepted name.
     Release(ReleaseArgs),
-    /// Replay the canonical chain and verify one real v2 RELEASE.
+    /// Replay the canonical chain and verify one real v1 RELEASE.
     VerifyRelease(VerifyReleaseArgs),
     /// Verify the exact Released -> Expired claimability boundary.
     VerifyReleaseBoundary(VerifyReleaseBoundaryArgs),
@@ -373,8 +373,8 @@ fn local_consensus() -> LocalNetwork {
     }
 }
 
-fn v2_parameters() -> V2Parameters {
-    V2Parameters::testing()
+fn v1_parameters() -> V1Parameters {
+    V1Parameters::testing()
 }
 
 fn registration_intent(
@@ -391,10 +391,10 @@ fn registration_intent(
 }
 
 fn wallet_usk(params: &LocalNetwork) -> Result<UnifiedSpendingKey> {
-    let phrase = std::env::var("NAMES_V2_LIVE_MNEMONIC")
-        .context("NAMES_V2_LIVE_MNEMONIC is required by the disposable live flow")?;
+    let phrase = std::env::var("NAMES_V1_LIVE_MNEMONIC")
+        .context("NAMES_V1_LIVE_MNEMONIC is required by the disposable live flow")?;
     let mnemonic = <Mnemonic<English>>::from_phrase(&phrase)
-        .context("NAMES_V2_LIVE_MNEMONIC is not a valid English mnemonic")?;
+        .context("NAMES_V1_LIVE_MNEMONIC is not a valid English mnemonic")?;
     let seed = mnemonic.to_seed("");
     UnifiedSpendingKey::from_seed(params, &seed, zip32::AccountId::ZERO)
         .map_err(anyhow::Error::from)
@@ -567,7 +567,7 @@ fn plan_qualified_funding(
     )?;
     ensure!(
         planned.planned_shape == planned_shape,
-        "Names v2 plan shape changed after fee planning"
+        "Names v1 plan shape changed after fee planning"
     );
     Ok(planned)
 }
@@ -615,13 +615,13 @@ fn build_commit_for(
 }
 
 fn print_target(args: TargetArgs) -> Result<()> {
-    let params = v2_parameters();
+    let params = v1_parameters();
     // The name schedule depends only on the canonical name identifier, not on
     // the owner or hidden COMMIT preimage.
-    let name_id = coppice_names::v2::state::name_id(NAME)
-        .map_err(|error| anyhow::anyhow!("derive Names v2 name id: {error:?}"))?;
-    let target = coppice_names::v2::schedule::next_anchor_height(name_id, args.from_height, params)
-        .context("no future Names v2 anchor height exists")?;
+    let name_id = coppice_names::v1::state::name_id(NAME)
+        .map_err(|error| anyhow::anyhow!("derive Names v1 name id: {error:?}"))?;
+    let target = coppice_names::v1::schedule::next_anchor_height(name_id, args.from_height, params)
+        .context("no future Names v1 anchor height exists")?;
     println!("TARGET_REVEAL_HEIGHT={target}");
     println!("COMMIT_TTL_BLOCKS={}", params.commit_ttl_blocks);
     println!("REFRESH_DEADLINE_BLOCKS={}", params.refresh_deadline_blocks);
@@ -785,7 +785,7 @@ struct ReplayedNamesLineage {
     activation_height: u32,
     activation_parent_hash: [u8; 32],
     name_id: [u8; 32],
-    machine: V2StateMachine,
+    machine: V1StateMachine,
     full_status: ResolutionStatus,
     full_head: NameState,
     fresh_status: ResolutionStatus,
@@ -811,7 +811,7 @@ fn replay_names_lineage(
     update_txid: Option<[u8; 32]>,
     renew_txid: Option<[u8; 32]>,
     release_txid: Option<[u8; 32]>,
-    verifier: &OrchardV2ProofVerifier,
+    verifier: &OrchardV1ProofVerifier,
 ) -> Result<ReplayedNamesLineage> {
     let blocks = canonical_chain(source, params, rendezvous, app_id)?;
     let canonical_tip_height = blocks
@@ -828,7 +828,7 @@ fn replay_names_lineage(
         reveal.operations.len() == 1,
         "canonical REVEAL does not expose exactly one operation"
     );
-    let V2Operation::Reveal {
+    let V1Operation::Reveal {
         intent,
         commit,
         state,
@@ -854,7 +854,7 @@ fn replay_names_lineage(
     let reveal_operation_index = reveal
         .operations
         .iter()
-        .position(|operation| matches!(operation, V2Operation::Reveal { .. }))
+        .position(|operation| matches!(operation, V1Operation::Reveal { .. }))
         .context("canonical REVEAL operation index missing")
         .and_then(|index| {
             u32::try_from(index).context("canonical REVEAL operation index exceeds u32")
@@ -881,7 +881,7 @@ fn replay_names_lineage(
         commit_transaction.operations.len() == 1,
         "canonical COMMIT does not expose exactly one operation"
     );
-    let V2Operation::Commit {
+    let V1Operation::Commit {
         commitment: canonical_commitment,
     } = &commit_transaction.operations[0]
     else {
@@ -920,7 +920,7 @@ fn replay_names_lineage(
             "canonical UPDATE does not expose exactly one operation"
         );
         ensure!(
-            matches!(transaction.operations[0], V2Operation::Update { .. }),
+            matches!(transaction.operations[0], V1Operation::Update { .. }),
             "canonical UPDATE operation kind mismatch"
         );
         Some(transaction)
@@ -931,7 +931,7 @@ fn replay_names_lineage(
         let index = transaction
             .operations
             .iter()
-            .position(|operation| matches!(operation, V2Operation::Update { .. }))
+            .position(|operation| matches!(operation, V1Operation::Update { .. }))
             .expect("UPDATE operation was checked above");
         Some(u32::try_from(index).context("canonical UPDATE operation index exceeds u32")?)
     } else {
@@ -954,7 +954,7 @@ fn replay_names_lineage(
             "canonical RENEW does not expose exactly one operation"
         );
         ensure!(
-            matches!(transaction.operations[0], V2Operation::Renew { .. }),
+            matches!(transaction.operations[0], V1Operation::Renew { .. }),
             "canonical RENEW operation kind mismatch"
         );
         Some(transaction)
@@ -965,7 +965,7 @@ fn replay_names_lineage(
         let index = transaction
             .operations
             .iter()
-            .position(|operation| matches!(operation, V2Operation::Renew { .. }))
+            .position(|operation| matches!(operation, V1Operation::Renew { .. }))
             .expect("RENEW operation was checked above");
         Some(u32::try_from(index).context("canonical RENEW operation index exceeds u32")?)
     } else {
@@ -989,7 +989,7 @@ fn replay_names_lineage(
             "canonical RELEASE does not expose exactly one operation"
         );
         ensure!(
-            matches!(transaction.operations[0], V2Operation::Release { .. }),
+            matches!(transaction.operations[0], V1Operation::Release { .. }),
             "canonical RELEASE operation kind mismatch"
         );
         Some(transaction)
@@ -1000,21 +1000,21 @@ fn replay_names_lineage(
         let index = transaction
             .operations
             .iter()
-            .position(|operation| matches!(operation, V2Operation::Release { .. }))
+            .position(|operation| matches!(operation, V1Operation::Release { .. }))
             .expect("RELEASE operation was checked above");
         Some(u32::try_from(index).context("canonical RELEASE operation index exceeds u32")?)
     } else {
         None
     };
 
-    let v2 = v2_parameters();
-    let activation_height = v2.activation_height;
+    let v1 = v1_parameters();
+    let activation_height = v1.activation_height;
     let activation_block = blocks
         .get(&activation_height)
-        .context("canonical replay source is missing the v2 activation block")?;
+        .context("canonical replay source is missing the v1 activation block")?;
     let activation_parent_hash = activation_block.prev_block_hash;
-    let mut machine = V2StateMachine::from_activation_parent(v2, activation_parent_hash)
-        .map_err(|error| anyhow::anyhow!("construct Names v2 replay machine: {error:?}"))?;
+    let mut machine = V1StateMachine::from_activation_parent(v1, activation_parent_hash)
+        .map_err(|error| anyhow::anyhow!("construct Names v1 replay machine: {error:?}"))?;
     let mut commit_seen = false;
     let mut reveal_seen = false;
     let mut update_seen = false;
@@ -1025,7 +1025,7 @@ fn replay_names_lineage(
             .get(&height)
             .context("canonical replay source is missing a sequential block")?;
         let applied = machine.apply_block(block, verifier).map_err(|error| {
-            anyhow::anyhow!("Names v2 full replay failed at h{height}: {error:?}")
+            anyhow::anyhow!("Names v1 full replay failed at h{height}: {error:?}")
         })?;
         for transaction in &block.transactions {
             if transaction.txid == commit_txid {
@@ -1217,8 +1217,8 @@ fn replay_names_lineage(
             "full replay registration future nullifier mismatch"
         );
     }
-    let resolver = FreshResolver::new(v2)
-        .map_err(|error| anyhow::anyhow!("construct Names v2 fresh resolver: {error:?}"))?;
+    let resolver = FreshResolver::new(v1)
+        .map_err(|error| anyhow::anyhow!("construct Names v1 fresh resolver: {error:?}"))?;
     let (fresh_status, fresh_anchor, fresh_head, fresh_available) =
         match resolver.resolve(NAME, &blocks, verifier) {
             Ok(fresh_result) => {
@@ -1254,7 +1254,7 @@ fn replay_names_lineage(
             Err(_) if full_status == ResolutionStatus::Stale => {
                 (full_status, None, full_head.clone(), false)
             }
-            Err(error) => bail!("Names v2 FreshResolver failed: {error:?}"),
+            Err(error) => bail!("Names v1 FreshResolver failed: {error:?}"),
         };
 
     Ok(ReplayedNamesLineage {
@@ -1304,7 +1304,7 @@ fn find_canonical_commit(
                 .enumerate()
                 .map(|(index, operation)| -> Result<Option<u32>> {
                     match operation {
-                        V2Operation::Commit { commitment }
+                        V1Operation::Commit { commitment }
                             if *commitment == expected_commitment =>
                         {
                             Ok(Some(
@@ -1406,7 +1406,7 @@ fn reveal_with_replacement(
     flow_label: &str,
 ) -> Result<()> {
     let params = local_consensus();
-    let v2 = v2_parameters();
+    let v1 = v1_parameters();
     let commit_txid = parse_txid_hex(&args.commit_txid)?;
     let mut source = source_for(&args.common.rpc_url)?;
     let rendezvous = CoreRendezvous::try_new(
@@ -1441,8 +1441,8 @@ fn reveal_with_replacement(
         .name_id()
         .map_err(|error| anyhow::anyhow!("derive REVEAL name id: {error:?}"))?;
     let target_height =
-        coppice_names::v2::schedule::next_anchor_height(name_id, construction_height, v2)
-            .context("no future legal Names v2 reveal height exists")?;
+        coppice_names::v1::schedule::next_anchor_height(name_id, construction_height, v1)
+            .context("no future legal Names v1 reveal height exists")?;
     ensure!(
         construction_height == target_height,
         "REVEAL must be constructed at its scheduled anchor height; current height is {construction_height}, target is {target_height}"
@@ -1452,8 +1452,8 @@ fn reveal_with_replacement(
         "REVEAL cannot be in the COMMIT block"
     );
     ensure!(
-        construction_height - commit_height <= v2.commit_ttl_blocks,
-        "canonical COMMIT is outside its v2 lifetime"
+        construction_height - commit_height <= v1.commit_ttl_blocks,
+        "canonical COMMIT is outside its v1 lifetime"
     );
 
     let mut db = open_wallet(&args.common.wallet_dir, params)?;
@@ -1465,7 +1465,7 @@ fn reveal_with_replacement(
     let mut candidates = notes
         .into_iter()
         .filter(|(_, scope, _, value)| {
-            *scope == Scope::External && *value >= v2.minimum_bond_zatoshis
+            *scope == Scope::External && *value >= v1.minimum_bond_zatoshis
         })
         .collect::<Vec<_>>();
     ensure!(
@@ -1491,12 +1491,12 @@ fn reveal_with_replacement(
             operation_height: construction_height,
             successor_seed: [successor_seed; 32],
         },
-        v2,
+        v1,
     )?;
     let successor_commitment = preparation.statement().commitment;
     let successor_future_nf = preparation.statement().state_nullifier;
     let lease_expiry = preparation.statement().lease_expiry;
-    let names_prover = OrchardV2ProofProver::new();
+    let names_prover = OrchardV1ProofProver::new();
     let proof_started = Instant::now();
     let genesis_proof = names_prover
         .prove_genesis(
@@ -1522,35 +1522,35 @@ fn reveal_with_replacement(
         &names_fvk,
         &funding_note,
     )?;
-    let built = build_names_v2_bundle(planned.plan, OsRng)?;
+    let built = build_names_v1_bundle(planned.plan, OsRng)?;
     ensure!(
         built.action_count == planned.planned_shape.action_count,
-        "built Names v2 action count differs from fee-planned shape"
+        "built Names v1 action count differs from fee-planned shape"
     );
     ensure!(
         built.ironwood_value_balance
             == i64::try_from(planned.required_fee.into_u64())
                 .context("ZIP-317 fee does not fit signed balance")?,
-        "built Names v2 value balance differs from required ZIP-317 fee"
+        "built Names v1 value balance differs from required ZIP-317 fee"
     );
-    let complete = build_names_v2_pczt(NamesV2PcztPlan {
+    let complete = build_names_v1_pczt(NamesV1PcztPlan {
         ironwood: built,
         params,
         consensus_branch_id: BranchId::Nu6_3,
         expiry_height: BlockHeight::from_u32(construction_height),
         fallback_lock_time: 0,
     })?;
-    let finalized = finalize_names_v2_pczt_io(complete)?;
-    let witnessed = install_names_v2_ironwood_witnesses(
+    let finalized = finalize_names_v1_pczt_io(complete)?;
+    let witnessed = install_names_v1_ironwood_witnesses(
         finalized,
-        NamesV2WitnessPlan {
+        NamesV1WitnessPlan {
             anchor,
             spends: vec![
-                NamesV2IronwoodWitness {
+                NamesV1IronwoodWitness {
                     nullifier: registration_nf,
                     merkle_path: paths[0].clone(),
                 },
-                NamesV2IronwoodWitness {
+                NamesV1IronwoodWitness {
                     nullifier: funding_nf,
                     merkle_path: paths[1].clone(),
                 },
@@ -1561,24 +1561,24 @@ fn reveal_with_replacement(
         orchard::bundle::BundleVersion::ironwood_v3().circuit_version(),
     );
     let consensus_proof_started = Instant::now();
-    let proved = prove_names_v2_ironwood_pczt(witnessed, &consensus_proving_key)?;
+    let proved = prove_names_v1_ironwood_pczt(witnessed, &consensus_proving_key)?;
     let consensus_proof_elapsed = consensus_proof_started.elapsed();
-    let signed = sign_names_v2_ironwood_pczt(
+    let signed = sign_names_v1_ironwood_pczt(
         proved,
-        NamesV2SigningPlan {
+        NamesV1SigningPlan {
             spends: vec![
-                zcash_devtool::names_v2_builder::NamesV2IronwoodSigningKey {
+                zcash_devtool::names_v1_builder::NamesV1IronwoodSigningKey {
                     nullifier: registration_nf,
                     ask: names_ask,
                 },
-                zcash_devtool::names_v2_builder::NamesV2IronwoodSigningKey {
+                zcash_devtool::names_v1_builder::NamesV1IronwoodSigningKey {
                     nullifier: funding_nf,
                     ask: SpendAuthorizingKey::from(usk.orchard()),
                 },
             ],
         },
     )?;
-    let extracted = extract_names_v2_transaction(signed)?;
+    let extracted = extract_names_v1_transaction(signed)?;
     let mut raw = Vec::new();
     extracted.transaction.write(&mut raw)?;
     let reveal_txid = submit_raw(&args.common.rpc_url, &raw)?;
@@ -1606,7 +1606,7 @@ fn reveal_with_replacement(
     println!("LEASE_EXPIRY={lease_expiry}");
     println!("NAMES_PROOF_BYTES={}", genesis_proof.len());
     println!("NAMES_PROOF_ELAPSED_MS={}", proof_elapsed.as_millis());
-    println!("CNV2_REVEAL_BYTES={}", finalized_operation.encoded().len());
+    println!("CNV1_REVEAL_BYTES={}", finalized_operation.encoded().len());
     println!("CPV1_FRAMES={}", finalized_operation.frames().len());
     println!("REVEAL_TXID={}", hex::encode(final_txid));
     println!("REVEAL_ACTION_INDEX={ACTION_INDEX}");
@@ -1650,7 +1650,7 @@ struct ReclaimContext {
 
 fn reclaim_context(args: &ReclaimRevealArgs) -> Result<ReclaimContext> {
     let params = local_consensus();
-    let v2 = v2_parameters();
+    let v1 = v1_parameters();
     let reveal_txid = parse_txid_hex(&args.reveal_txid)?;
     let update_txid = parse_txid_hex(&args.update_txid)?;
     let renew_txid = parse_txid_hex(&args.renew_txid)?;
@@ -1664,7 +1664,7 @@ fn reclaim_context(args: &ReclaimRevealArgs) -> Result<ReclaimContext> {
     let app_id = names_application_id().to_bytes();
     let (_, transition_verifier, _, genesis_verifier) =
         orchard::circuit::state_note_binding::keygen();
-    let names_verifier = OrchardV2ProofVerifier::from_parts(transition_verifier, genesis_verifier);
+    let names_verifier = OrchardV1ProofVerifier::from_parts(transition_verifier, genesis_verifier);
     let lineage = replay_names_lineage(
         &mut source,
         &params,
@@ -1687,7 +1687,7 @@ fn reclaim_context(args: &ReclaimRevealArgs) -> Result<ReclaimContext> {
         terminal.data.status == StateStatus::Released,
         "replacement predecessor is not an explicitly released terminal state"
     );
-    let claimable_height = v2
+    let claimable_height = v1
         .claimable_from(
             terminal.data.status,
             terminal.data.lease_expiry,
@@ -1771,7 +1771,7 @@ fn verify_reclaim(args: VerifyReclaimArgs) -> Result<()> {
     let app_id = names_application_id().to_bytes();
     let (_, transition_verifier, _, genesis_verifier) =
         orchard::circuit::state_note_binding::keygen();
-    let names_verifier = OrchardV2ProofVerifier::from_parts(transition_verifier, genesis_verifier);
+    let names_verifier = OrchardV1ProofVerifier::from_parts(transition_verifier, genesis_verifier);
     let reveal_txid = parse_txid_hex(&args.reveal_txid)?;
     let lineage = replay_names_lineage(
         &mut source,
@@ -1814,7 +1814,7 @@ fn verify_reclaim(args: VerifyReclaimArgs) -> Result<()> {
         .values()
         .find(|block| block.transactions.iter().any(|tx| tx.txid == reveal_txid))
         .context("canonical replacement REVEAL block is absent")?;
-    let V2Operation::Reveal {
+    let V1Operation::Reveal {
         replacement_predecessor,
         action_index,
         state_commitment,
@@ -1884,7 +1884,7 @@ fn verify_reclaim_renew(args: VerifyReclaimRenewArgs) -> Result<()> {
     let app_id = names_application_id().to_bytes();
     let (_, transition_verifier, _, genesis_verifier) =
         orchard::circuit::state_note_binding::keygen();
-    let names_verifier = OrchardV2ProofVerifier::from_parts(transition_verifier, genesis_verifier);
+    let names_verifier = OrchardV1ProofVerifier::from_parts(transition_verifier, genesis_verifier);
     let renew_txid = parse_txid_hex(&args.renew_txid)?;
     let lineage = replay_names_lineage(
         &mut source,
@@ -1973,8 +1973,8 @@ fn update(args: UpdateArgs) -> Result<()> {
     let app_id = names_application_id().to_bytes();
     let (transition_prover, transition_verifier, genesis_prover, genesis_verifier) =
         orchard::circuit::state_note_binding::keygen();
-    let names_prover = OrchardV2ProofProver::from_parts(transition_prover, genesis_prover);
-    let names_verifier = OrchardV2ProofVerifier::from_parts(transition_verifier, genesis_verifier);
+    let names_prover = OrchardV1ProofProver::from_parts(transition_prover, genesis_prover);
+    let names_verifier = OrchardV1ProofVerifier::from_parts(transition_verifier, genesis_verifier);
     let lineage = replay_names_lineage(
         &mut source,
         &params,
@@ -1988,7 +1988,7 @@ fn update(args: UpdateArgs) -> Result<()> {
     )?;
     ensure!(
         lineage.full_status == ResolutionStatus::Active,
-        "current Names v2 state is not active: {:?}",
+        "current Names v1 state is not active: {:?}",
         lineage.full_status
     );
     ensure!(
@@ -2001,7 +2001,7 @@ fn update(args: UpdateArgs) -> Result<()> {
         "full replay and FreshResolver disagree before UPDATE construction"
     );
     let predecessor = lineage.full_head;
-    let v2 = v2_parameters();
+    let v1 = v1_parameters();
     if renew_txid.is_none() {
         ensure!(
             predecessor.data.sequence == 0,
@@ -2013,9 +2013,9 @@ fn update(args: UpdateArgs) -> Result<()> {
         );
         ensure!(
             predecessor.data.lease_expiry
-                == v2
+                == v1
                     .lease_expiry(predecessor.state_ref.producer_height)
-                    .context("Names v2 predecessor lease expiry overflow")?,
+                    .context("Names v1 predecessor lease expiry overflow")?,
             "UPDATE predecessor lease does not match its reveal-height schedule"
         );
     }
@@ -2030,7 +2030,7 @@ fn update(args: UpdateArgs) -> Result<()> {
     ensure!(
         lineage.tip_height < predecessor.data.lease_expiry
             && construction_height < predecessor.data.lease_expiry,
-        "qualified Names v2 lineage is at or beyond its exclusive lease expiry"
+        "qualified Names v1 lineage is at or beyond its exclusive lease expiry"
     );
 
     let usk = wallet_usk(&params)?;
@@ -2103,7 +2103,7 @@ fn update(args: UpdateArgs) -> Result<()> {
             successor_seed: [successor_seed; 32],
         },
         update_record.to_vec(),
-        v2,
+        v1,
     )?;
     let successor_commitment = preparation.statement().successor_commitment;
     let successor_future_nf = preparation.statement().successor_nullifier;
@@ -2135,7 +2135,7 @@ fn update(args: UpdateArgs) -> Result<()> {
         &names_fvk,
         &funding_note,
     )?;
-    let built = build_names_v2_bundle(planned.plan, OsRng)?;
+    let built = build_names_v1_bundle(planned.plan, OsRng)?;
     ensure!(
         built.action_count == planned.planned_shape.action_count,
         "UPDATE built action count differs from fee-planned shape"
@@ -2146,24 +2146,24 @@ fn update(args: UpdateArgs) -> Result<()> {
                 .context("UPDATE ZIP-317 fee does not fit balance")?,
         "UPDATE built value balance differs from ZIP-317 fee"
     );
-    let complete = build_names_v2_pczt(NamesV2PcztPlan {
+    let complete = build_names_v1_pczt(NamesV1PcztPlan {
         ironwood: built,
         params,
         consensus_branch_id: BranchId::Nu6_3,
         expiry_height: BlockHeight::from_u32(construction_height),
         fallback_lock_time: 0,
     })?;
-    let finalized = finalize_names_v2_pczt_io(complete)?;
-    let witnessed = install_names_v2_ironwood_witnesses(
+    let finalized = finalize_names_v1_pczt_io(complete)?;
+    let witnessed = install_names_v1_ironwood_witnesses(
         finalized,
-        NamesV2WitnessPlan {
+        NamesV1WitnessPlan {
             anchor,
             spends: vec![
-                NamesV2IronwoodWitness {
+                NamesV1IronwoodWitness {
                     nullifier: predecessor_nf,
                     merkle_path: paths[0].clone(),
                 },
-                NamesV2IronwoodWitness {
+                NamesV1IronwoodWitness {
                     nullifier: funding_nf,
                     merkle_path: paths[1].clone(),
                 },
@@ -2174,24 +2174,24 @@ fn update(args: UpdateArgs) -> Result<()> {
         orchard::bundle::BundleVersion::ironwood_v3().circuit_version(),
     );
     let consensus_proof_started = Instant::now();
-    let proved = prove_names_v2_ironwood_pczt(witnessed, &consensus_proving_key)?;
+    let proved = prove_names_v1_ironwood_pczt(witnessed, &consensus_proving_key)?;
     let consensus_proof_elapsed = consensus_proof_started.elapsed();
-    let signed = sign_names_v2_ironwood_pczt(
+    let signed = sign_names_v1_ironwood_pczt(
         proved,
-        NamesV2SigningPlan {
+        NamesV1SigningPlan {
             spends: vec![
-                zcash_devtool::names_v2_builder::NamesV2IronwoodSigningKey {
+                zcash_devtool::names_v1_builder::NamesV1IronwoodSigningKey {
                     nullifier: predecessor_nf,
                     ask: SpendAuthorizingKey::from(usk.orchard()),
                 },
-                zcash_devtool::names_v2_builder::NamesV2IronwoodSigningKey {
+                zcash_devtool::names_v1_builder::NamesV1IronwoodSigningKey {
                     nullifier: funding_nf,
                     ask: SpendAuthorizingKey::from(usk.orchard()),
                 },
             ],
         },
     )?;
-    let extracted = extract_names_v2_transaction(signed)?;
+    let extracted = extract_names_v1_transaction(signed)?;
     ensure!(
         extracted.action_count == planned.planned_shape.action_count
             && extracted.ironwood_value_balance
@@ -2227,7 +2227,7 @@ fn update(args: UpdateArgs) -> Result<()> {
         "{label}_NAMES_PROOF_ELAPSED_MS={}",
         names_proof_elapsed.as_millis()
     );
-    println!("CNV2_{label}_BYTES={}", finalized_operation.encoded().len());
+    println!("CNV1_{label}_BYTES={}", finalized_operation.encoded().len());
     println!("CPV1_{label}_FRAMES={}", finalized_operation.frames().len());
     println!("{label}_TXID={}", hex::encode(final_txid));
     println!("{label}_ACTION_INDEX={UPDATE_ACTION_INDEX}");
@@ -2284,7 +2284,7 @@ fn abandon(args: AbandonArgs) -> Result<()> {
     let app_id = names_application_id().to_bytes();
     let (_, transition_verifier, _, genesis_verifier) =
         orchard::circuit::state_note_binding::keygen();
-    let names_verifier = OrchardV2ProofVerifier::from_parts(transition_verifier, genesis_verifier);
+    let names_verifier = OrchardV1ProofVerifier::from_parts(transition_verifier, genesis_verifier);
     let lineage = replay_names_lineage(
         &mut source,
         &params,
@@ -2385,8 +2385,8 @@ fn abandon(args: AbandonArgs) -> Result<()> {
         ExtractedNoteCommitment::from(successor_note.commitment()).to_bytes();
     let successor_future_nf = successor_note.nullifier(&names_fvk).to_bytes();
     let carrier_outputs = Vec::new();
-    let planned_shape = names_v2_ironwood_shape_from_counts(2, 0, 1, 0)?;
-    let required_fee = required_zip317_fee_for_names_v2(
+    let planned_shape = names_v1_ironwood_shape_from_counts(2, 0, 1, 0)?;
+    let required_fee = required_zip317_fee_for_names_v1(
         &params,
         BlockHeight::from_u32(
             lineage
@@ -2400,7 +2400,7 @@ fn abandon(args: AbandonArgs) -> Result<()> {
     let change_value = funding_value
         .checked_sub(required_fee_value)
         .context("funding note cannot cover the out-of-band spend fee")?;
-    let plan = NamesV2IronwoodPlan {
+    let plan = NamesV1IronwoodPlan {
         designated_fvk: names_fvk.clone(),
         designated_spend: predecessor_note,
         successor_note,
@@ -2422,10 +2422,10 @@ fn abandon(args: AbandonArgs) -> Result<()> {
         operation_height: construction_height,
     };
     ensure!(
-        names_v2_ironwood_shape(&plan)? == planned_shape,
+        names_v1_ironwood_shape(&plan)? == planned_shape,
         "out-of-band plan shape changed after fee planning"
     );
-    let built = build_names_v2_bundle(plan, OsRng)?;
+    let built = build_names_v1_bundle(plan, OsRng)?;
     ensure!(
         built.action_count == planned_shape.action_count
             && built.ironwood_value_balance
@@ -2448,24 +2448,24 @@ fn abandon(args: AbandonArgs) -> Result<()> {
         anchor_height,
         [predecessor_position, funding_position],
     )?;
-    let complete = build_names_v2_pczt(NamesV2PcztPlan {
+    let complete = build_names_v1_pczt(NamesV1PcztPlan {
         ironwood: built,
         params,
         consensus_branch_id: BranchId::Nu6_3,
         expiry_height: BlockHeight::from_u32(construction_height),
         fallback_lock_time: 0,
     })?;
-    let finalized = finalize_names_v2_pczt_io(complete)?;
-    let witnessed = install_names_v2_ironwood_witnesses(
+    let finalized = finalize_names_v1_pczt_io(complete)?;
+    let witnessed = install_names_v1_ironwood_witnesses(
         finalized,
-        NamesV2WitnessPlan {
+        NamesV1WitnessPlan {
             anchor,
             spends: vec![
-                NamesV2IronwoodWitness {
+                NamesV1IronwoodWitness {
                     nullifier: predecessor_nf,
                     merkle_path: paths[0].clone(),
                 },
-                NamesV2IronwoodWitness {
+                NamesV1IronwoodWitness {
                     nullifier: funding_nf,
                     merkle_path: paths[1].clone(),
                 },
@@ -2476,24 +2476,24 @@ fn abandon(args: AbandonArgs) -> Result<()> {
         orchard::bundle::BundleVersion::ironwood_v3().circuit_version(),
     );
     let proof_started = Instant::now();
-    let proved = prove_names_v2_ironwood_pczt(witnessed, &consensus_proving_key)?;
+    let proved = prove_names_v1_ironwood_pczt(witnessed, &consensus_proving_key)?;
     let proof_elapsed = proof_started.elapsed();
-    let signed = sign_names_v2_ironwood_pczt(
+    let signed = sign_names_v1_ironwood_pczt(
         proved,
-        NamesV2SigningPlan {
+        NamesV1SigningPlan {
             spends: vec![
-                zcash_devtool::names_v2_builder::NamesV2IronwoodSigningKey {
+                zcash_devtool::names_v1_builder::NamesV1IronwoodSigningKey {
                     nullifier: predecessor_nf,
                     ask: names_ask,
                 },
-                zcash_devtool::names_v2_builder::NamesV2IronwoodSigningKey {
+                zcash_devtool::names_v1_builder::NamesV1IronwoodSigningKey {
                     nullifier: funding_nf,
                     ask: SpendAuthorizingKey::from(usk.orchard()),
                 },
             ],
         },
     )?;
-    let extracted = extract_names_v2_transaction(signed)?;
+    let extracted = extract_names_v1_transaction(signed)?;
     let mut raw = Vec::new();
     extracted.transaction.write(&mut raw)?;
     let txid = submit_raw(&args.common.rpc_url, &raw)?;
@@ -2529,7 +2529,7 @@ fn abandon(args: AbandonArgs) -> Result<()> {
 
 fn renew(args: RenewArgs) -> Result<()> {
     let params = local_consensus();
-    let v2 = v2_parameters();
+    let v1 = v1_parameters();
     let reveal_txid = parse_txid_hex(&args.reveal_txid)?;
     let update_txid = args
         .update_txid
@@ -2545,8 +2545,8 @@ fn renew(args: RenewArgs) -> Result<()> {
     let app_id = names_application_id().to_bytes();
     let (transition_prover, transition_verifier, genesis_prover, genesis_verifier) =
         orchard::circuit::state_note_binding::keygen();
-    let names_prover = OrchardV2ProofProver::from_parts(transition_prover, genesis_prover);
-    let names_verifier = OrchardV2ProofVerifier::from_parts(transition_verifier, genesis_verifier);
+    let names_prover = OrchardV1ProofProver::from_parts(transition_prover, genesis_prover);
+    let names_verifier = OrchardV1ProofVerifier::from_parts(transition_verifier, genesis_verifier);
     let lineage = replay_names_lineage(
         &mut source,
         &params,
@@ -2563,7 +2563,7 @@ fn renew(args: RenewArgs) -> Result<()> {
             lineage.full_status,
             ResolutionStatus::Active | ResolutionStatus::Stale
         ),
-        "current Names v2 state is not renewable: {:?}",
+        "current Names v1 state is not renewable: {:?}",
         lineage.full_status
     );
     ensure!(
@@ -2598,9 +2598,9 @@ fn renew(args: RenewArgs) -> Result<()> {
         .iter()
         .position(|operation| {
             if update_txid.is_some() {
-                matches!(operation, V2Operation::Update { .. })
+                matches!(operation, V1Operation::Update { .. })
             } else {
-                matches!(operation, V2Operation::Reveal { .. })
+                matches!(operation, V1Operation::Reveal { .. })
             }
         })
         .context("canonical RENEW predecessor operation index missing")?;
@@ -2626,11 +2626,11 @@ fn renew(args: RenewArgs) -> Result<()> {
         .checked_add(1)
         .context("live RENEW construction height overflow")?;
     let renew_height =
-        coppice_names::v2::schedule::next_anchor_height(lineage.name_id, construction_height, v2)
-            .context("no future scheduled Names v2 RENEW height exists")?;
+        coppice_names::v1::schedule::next_anchor_height(lineage.name_id, construction_height, v1)
+            .context("no future scheduled Names v1 RENEW height exists")?;
     ensure!(
-        coppice_names::v2::schedule::is_anchor_height(lineage.name_id, renew_height, v2),
-        "derived RENEW height is not a Names v2 anchor"
+        coppice_names::v1::schedule::is_anchor_height(lineage.name_id, renew_height, v1),
+        "derived RENEW height is not a Names v1 anchor"
     );
     ensure!(
         renew_height == construction_height,
@@ -2718,7 +2718,7 @@ fn renew(args: RenewArgs) -> Result<()> {
                 RENEW_SUCCESSOR_SEED + 3
             }; 32],
         },
-        v2,
+        v1,
     )?;
     let successor_commitment = preparation.statement().successor_commitment;
     let successor_future_nf = preparation.statement().successor_nullifier;
@@ -2751,7 +2751,7 @@ fn renew(args: RenewArgs) -> Result<()> {
         &names_fvk,
         &funding_note,
     )?;
-    let built = build_names_v2_bundle(planned.plan, OsRng)?;
+    let built = build_names_v1_bundle(planned.plan, OsRng)?;
     ensure!(
         built.action_count == planned.planned_shape.action_count,
         "RENEW built action count differs from fee-planned shape"
@@ -2762,24 +2762,24 @@ fn renew(args: RenewArgs) -> Result<()> {
                 .context("RENEW ZIP-317 fee does not fit balance")?,
         "RENEW built value balance differs from ZIP-317 fee"
     );
-    let complete = build_names_v2_pczt(NamesV2PcztPlan {
+    let complete = build_names_v1_pczt(NamesV1PcztPlan {
         ironwood: built,
         params,
         consensus_branch_id: BranchId::Nu6_3,
         expiry_height: BlockHeight::from_u32(construction_height),
         fallback_lock_time: 0,
     })?;
-    let finalized = finalize_names_v2_pczt_io(complete)?;
-    let witnessed = install_names_v2_ironwood_witnesses(
+    let finalized = finalize_names_v1_pczt_io(complete)?;
+    let witnessed = install_names_v1_ironwood_witnesses(
         finalized,
-        NamesV2WitnessPlan {
+        NamesV1WitnessPlan {
             anchor,
             spends: vec![
-                NamesV2IronwoodWitness {
+                NamesV1IronwoodWitness {
                     nullifier: predecessor_nf,
                     merkle_path: paths[0].clone(),
                 },
-                NamesV2IronwoodWitness {
+                NamesV1IronwoodWitness {
                     nullifier: funding_nf,
                     merkle_path: paths[1].clone(),
                 },
@@ -2790,24 +2790,24 @@ fn renew(args: RenewArgs) -> Result<()> {
         orchard::bundle::BundleVersion::ironwood_v3().circuit_version(),
     );
     let consensus_proof_started = Instant::now();
-    let proved = prove_names_v2_ironwood_pczt(witnessed, &consensus_proving_key)?;
+    let proved = prove_names_v1_ironwood_pczt(witnessed, &consensus_proving_key)?;
     let consensus_proof_elapsed = consensus_proof_started.elapsed();
-    let signed = sign_names_v2_ironwood_pczt(
+    let signed = sign_names_v1_ironwood_pczt(
         proved,
-        NamesV2SigningPlan {
+        NamesV1SigningPlan {
             spends: vec![
-                zcash_devtool::names_v2_builder::NamesV2IronwoodSigningKey {
+                zcash_devtool::names_v1_builder::NamesV1IronwoodSigningKey {
                     nullifier: predecessor_nf,
                     ask: names_ask,
                 },
-                zcash_devtool::names_v2_builder::NamesV2IronwoodSigningKey {
+                zcash_devtool::names_v1_builder::NamesV1IronwoodSigningKey {
                     nullifier: funding_nf,
                     ask: SpendAuthorizingKey::from(usk.orchard()),
                 },
             ],
         },
     )?;
-    let extracted = extract_names_v2_transaction(signed)?;
+    let extracted = extract_names_v1_transaction(signed)?;
     ensure!(
         extracted.action_count == planned.planned_shape.action_count
             && extracted.ironwood_value_balance
@@ -2833,7 +2833,7 @@ fn renew(args: RenewArgs) -> Result<()> {
         "RENEW_NAMES_PROOF_ELAPSED_MS={}",
         names_proof_elapsed.as_millis()
     );
-    println!("CNV2_RENEW_BYTES={}", finalized_operation.encoded().len());
+    println!("CNV1_RENEW_BYTES={}", finalized_operation.encoded().len());
     println!("CPV1_RENEW_FRAMES={}", finalized_operation.frames().len());
     println!("RENEW_TXID={}", hex::encode(final_txid));
     println!("RENEW_ACTION_INDEX={RENEW_ACTION_INDEX}");
@@ -2883,8 +2883,8 @@ fn release(args: ReleaseArgs) -> Result<()> {
     let app_id = names_application_id().to_bytes();
     let (transition_prover, transition_verifier, genesis_prover, genesis_verifier) =
         orchard::circuit::state_note_binding::keygen();
-    let names_prover = OrchardV2ProofProver::from_parts(transition_prover, genesis_prover);
-    let names_verifier = OrchardV2ProofVerifier::from_parts(transition_verifier, genesis_verifier);
+    let names_prover = OrchardV1ProofProver::from_parts(transition_prover, genesis_prover);
+    let names_verifier = OrchardV1ProofVerifier::from_parts(transition_verifier, genesis_verifier);
     let lineage = replay_names_lineage(
         &mut source,
         &params,
@@ -2898,7 +2898,7 @@ fn release(args: ReleaseArgs) -> Result<()> {
     )?;
     ensure!(
         lineage.full_status == ResolutionStatus::Active,
-        "current Names v2 state is not active: {:?}",
+        "current Names v1 state is not active: {:?}",
         lineage.full_status
     );
     ensure!(
@@ -2911,15 +2911,15 @@ fn release(args: ReleaseArgs) -> Result<()> {
         "full replay and FreshResolver disagree before RELEASE construction"
     );
     let predecessor = lineage.full_head;
-    let v2 = v2_parameters();
+    let v1 = v1_parameters();
     {
         ensure!(
             predecessor.data.sequence == 2
                 && predecessor.data.record.as_slice() == UPDATE_RECORD.as_slice()
                 && predecessor.data.lease_expiry
-                    == v2
+                    == v1
                         .lease_expiry(predecessor.state_ref.producer_height)
-                        .context("Names v2 predecessor lease expiry overflow")?
+                        .context("Names v1 predecessor lease expiry overflow")?
                 && predecessor.data.status == StateStatus::Active
                 && predecessor.data.terminal_height == 0,
             "qualified RELEASE fixture does not have the expected active sequence-two predecessor"
@@ -2940,9 +2940,9 @@ fn release(args: ReleaseArgs) -> Result<()> {
     let renew_operation_index = renew_transaction
         .operations
         .iter()
-        .position(|operation| matches!(operation, V2Operation::Renew { .. }))
+        .position(|operation| matches!(operation, V1Operation::Renew { .. }))
         .context("canonical RENEW operation index missing")?;
-    let V2Operation::Renew {
+    let V1Operation::Renew {
         action_index: renew_action_index,
         ..
     } = &renew_transaction.operations[renew_operation_index]
@@ -2966,7 +2966,7 @@ fn release(args: ReleaseArgs) -> Result<()> {
     ensure!(
         lineage.tip_height < predecessor.data.lease_expiry
             && construction_height < predecessor.data.lease_expiry,
-        "qualified Names v2 lineage is at or beyond its exclusive lease expiry"
+        "qualified Names v1 lineage is at or beyond its exclusive lease expiry"
     );
     let release_height = construction_height;
 
@@ -3039,7 +3039,7 @@ fn release(args: ReleaseArgs) -> Result<()> {
             designated_action_index: RELEASE_ACTION_INDEX,
             successor_seed: [RELEASE_SUCCESSOR_SEED; 32],
         },
-        v2,
+        v1,
     )?;
     let successor_commitment = preparation.statement().successor_commitment;
     let successor_future_nf = preparation.statement().successor_nullifier;
@@ -3071,7 +3071,7 @@ fn release(args: ReleaseArgs) -> Result<()> {
         &names_fvk,
         &funding_note,
     )?;
-    let built = build_names_v2_bundle(planned.plan, OsRng)?;
+    let built = build_names_v1_bundle(planned.plan, OsRng)?;
     ensure!(
         built.action_count == planned.planned_shape.action_count,
         "RELEASE built action count differs from fee-planned shape"
@@ -3082,24 +3082,24 @@ fn release(args: ReleaseArgs) -> Result<()> {
                 .context("RELEASE ZIP-317 fee does not fit balance")?,
         "RELEASE built value balance differs from ZIP-317 fee"
     );
-    let complete = build_names_v2_pczt(NamesV2PcztPlan {
+    let complete = build_names_v1_pczt(NamesV1PcztPlan {
         ironwood: built,
         params,
         consensus_branch_id: BranchId::Nu6_3,
         expiry_height: BlockHeight::from_u32(construction_height),
         fallback_lock_time: 0,
     })?;
-    let finalized = finalize_names_v2_pczt_io(complete)?;
-    let witnessed = install_names_v2_ironwood_witnesses(
+    let finalized = finalize_names_v1_pczt_io(complete)?;
+    let witnessed = install_names_v1_ironwood_witnesses(
         finalized,
-        NamesV2WitnessPlan {
+        NamesV1WitnessPlan {
             anchor,
             spends: vec![
-                NamesV2IronwoodWitness {
+                NamesV1IronwoodWitness {
                     nullifier: predecessor_nf,
                     merkle_path: paths[0].clone(),
                 },
-                NamesV2IronwoodWitness {
+                NamesV1IronwoodWitness {
                     nullifier: funding_nf,
                     merkle_path: paths[1].clone(),
                 },
@@ -3110,24 +3110,24 @@ fn release(args: ReleaseArgs) -> Result<()> {
         orchard::bundle::BundleVersion::ironwood_v3().circuit_version(),
     );
     let consensus_proof_started = Instant::now();
-    let proved = prove_names_v2_ironwood_pczt(witnessed, &consensus_proving_key)?;
+    let proved = prove_names_v1_ironwood_pczt(witnessed, &consensus_proving_key)?;
     let consensus_proof_elapsed = consensus_proof_started.elapsed();
-    let signed = sign_names_v2_ironwood_pczt(
+    let signed = sign_names_v1_ironwood_pczt(
         proved,
-        NamesV2SigningPlan {
+        NamesV1SigningPlan {
             spends: vec![
-                zcash_devtool::names_v2_builder::NamesV2IronwoodSigningKey {
+                zcash_devtool::names_v1_builder::NamesV1IronwoodSigningKey {
                     nullifier: predecessor_nf,
                     ask: names_ask,
                 },
-                zcash_devtool::names_v2_builder::NamesV2IronwoodSigningKey {
+                zcash_devtool::names_v1_builder::NamesV1IronwoodSigningKey {
                     nullifier: funding_nf,
                     ask: SpendAuthorizingKey::from(usk.orchard()),
                 },
             ],
         },
     )?;
-    let extracted = extract_names_v2_transaction(signed)?;
+    let extracted = extract_names_v1_transaction(signed)?;
     ensure!(
         extracted.action_count == planned.planned_shape.action_count
             && extracted.ironwood_value_balance
@@ -3152,7 +3152,7 @@ fn release(args: ReleaseArgs) -> Result<()> {
         "RELEASE_NAMES_PROOF_ELAPSED_MS={}",
         names_proof_elapsed.as_millis()
     );
-    println!("CNV2_RELEASE_BYTES={}", finalized_operation.encoded().len());
+    println!("CNV1_RELEASE_BYTES={}", finalized_operation.encoded().len());
     println!("CPV1_RELEASE_FRAMES={}", finalized_operation.frames().len());
     println!("RELEASE_TXID={}", hex::encode(final_txid));
     println!("RELEASE_ACTION_INDEX={RELEASE_ACTION_INDEX}");
@@ -3195,7 +3195,7 @@ fn release(args: ReleaseArgs) -> Result<()> {
 
 fn verify_release(args: VerifyReleaseArgs) -> Result<()> {
     let params = local_consensus();
-    let v2 = v2_parameters();
+    let v1 = v1_parameters();
     let reveal_txid = parse_txid_hex(&args.reveal_txid)?;
     let update_txid = parse_txid_hex(&args.update_txid)?;
     let renew_txid = parse_txid_hex(&args.renew_txid)?;
@@ -3209,7 +3209,7 @@ fn verify_release(args: VerifyReleaseArgs) -> Result<()> {
     let mut source = source_for(&args.rpc_url)?;
     let (_, transition_verifier, _, genesis_verifier) =
         orchard::circuit::state_note_binding::keygen();
-    let names_verifier = OrchardV2ProofVerifier::from_parts(transition_verifier, genesis_verifier);
+    let names_verifier = OrchardV1ProofVerifier::from_parts(transition_verifier, genesis_verifier);
     let lineage = replay_names_lineage(
         &mut source,
         &params,
@@ -3257,9 +3257,9 @@ fn verify_release(args: VerifyReleaseArgs) -> Result<()> {
     let renew_operation_index = renew
         .operations
         .iter()
-        .position(|operation| matches!(operation, V2Operation::Renew { .. }))
+        .position(|operation| matches!(operation, V1Operation::Renew { .. }))
         .context("canonical RENEW operation index missing")?;
-    let V2Operation::Renew {
+    let V1Operation::Renew {
         state_commitment,
         state_nullifier,
         action_index: renew_action_index,
@@ -3294,9 +3294,9 @@ fn verify_release(args: VerifyReleaseArgs) -> Result<()> {
     let release_operation_index = release
         .operations
         .iter()
-        .position(|operation| matches!(operation, V2Operation::Release { .. }))
+        .position(|operation| matches!(operation, V1Operation::Release { .. }))
         .context("canonical RELEASE operation index missing")?;
-    let V2Operation::Release {
+    let V1Operation::Release {
         predecessor,
         state,
         state_commitment,
@@ -3349,14 +3349,14 @@ fn verify_release(args: VerifyReleaseArgs) -> Result<()> {
             && accepted.data.sequence == 3
             && accepted.data.record.as_slice() == UPDATE_RECORD.as_slice()
             && accepted.data.lease_expiry
-                == v2
+                == v1
                     .lease_expiry(renew_block.height)
                     .context("canonical RENEW lease expiry overflow")?
             && accepted.data.status == StateStatus::Released
             && accepted.data.terminal_height == release_block.height,
         "accepted RELEASE state values are not the expected terminal successor"
     );
-    let claimable_height = v2
+    let claimable_height = v1
         .claimable_from(
             accepted.data.status,
             accepted.data.lease_expiry,
@@ -3435,7 +3435,7 @@ fn verify_release(args: VerifyReleaseArgs) -> Result<()> {
 
 fn verify_release_boundary(args: VerifyReleaseBoundaryArgs) -> Result<()> {
     let params = local_consensus();
-    let v2 = v2_parameters();
+    let v1 = v1_parameters();
     let reveal_txid = parse_txid_hex(&args.reveal_txid)?;
     let update_txid = parse_txid_hex(&args.update_txid)?;
     let renew_txid = parse_txid_hex(&args.renew_txid)?;
@@ -3449,7 +3449,7 @@ fn verify_release_boundary(args: VerifyReleaseBoundaryArgs) -> Result<()> {
     let mut source = source_for(&args.rpc_url)?;
     let (_, transition_verifier, _, genesis_verifier) =
         orchard::circuit::state_note_binding::keygen();
-    let names_verifier = OrchardV2ProofVerifier::from_parts(transition_verifier, genesis_verifier);
+    let names_verifier = OrchardV1ProofVerifier::from_parts(transition_verifier, genesis_verifier);
     let lineage = replay_names_lineage(
         &mut source,
         &params,
@@ -3507,9 +3507,9 @@ fn verify_release_boundary(args: VerifyReleaseBoundaryArgs) -> Result<()> {
     let renew_operation_index = renew
         .operations
         .iter()
-        .position(|operation| matches!(operation, V2Operation::Renew { .. }))
+        .position(|operation| matches!(operation, V1Operation::Renew { .. }))
         .context("canonical RENEW operation index missing")?;
-    let V2Operation::Renew {
+    let V1Operation::Renew {
         state_commitment: renew_commitment,
         state_nullifier: renew_nullifier,
         action_index: renew_action_index,
@@ -3540,9 +3540,9 @@ fn verify_release_boundary(args: VerifyReleaseBoundaryArgs) -> Result<()> {
     let release_operation_index = release
         .operations
         .iter()
-        .position(|operation| matches!(operation, V2Operation::Release { .. }))
+        .position(|operation| matches!(operation, V1Operation::Release { .. }))
         .context("canonical RELEASE operation index missing")?;
-    let V2Operation::Release {
+    let V1Operation::Release {
         predecessor,
         state,
         state_commitment,
@@ -3573,7 +3573,7 @@ fn verify_release_boundary(args: VerifyReleaseBoundaryArgs) -> Result<()> {
         *state_nullifier,
     );
     ensure!(
-        coppice_names::v2::schedule::is_anchor_height(lineage.name_id, renew_block.height, v2)
+        coppice_names::v1::schedule::is_anchor_height(lineage.name_id, renew_block.height, v1)
             && renew_state_ref.producer_action_index == 4
             && renew_state_ref.producer_operation_index == 0
             && release_block.height == renew_block.height + 1
@@ -3601,7 +3601,7 @@ fn verify_release_boundary(args: VerifyReleaseBoundaryArgs) -> Result<()> {
             && accepted.data.sequence == 3
             && accepted.data.record.as_slice() == UPDATE_RECORD.as_slice()
             && accepted.data.lease_expiry
-                == v2
+                == v1
                     .lease_expiry(renew_block.height)
                     .context("canonical RENEW lease expiry overflow")?
             && accepted.data.status == StateStatus::Released
@@ -3610,7 +3610,7 @@ fn verify_release_boundary(args: VerifyReleaseBoundaryArgs) -> Result<()> {
             && accepted.state_ref.nullifier == *state_nullifier,
         "terminal RELEASE NameState changed across the claimability boundary"
     );
-    let claimable_height = v2
+    let claimable_height = v1
         .claimable_from(
             accepted.data.status,
             accepted.data.lease_expiry,
@@ -3623,7 +3623,7 @@ fn verify_release_boundary(args: VerifyReleaseBoundaryArgs) -> Result<()> {
     let expected_claimable_height = accepted
         .data
         .terminal_height
-        .checked_add(v2.reuse_delay_blocks)
+        .checked_add(v1.reuse_delay_blocks)
         .context("RELEASE claimability height overflow")?;
     ensure!(
         claimable_height == expected_claimable_height,
@@ -3720,7 +3720,7 @@ fn verify_update(args: VerifyUpdateArgs) -> Result<()> {
     let mut source = source_for(&args.rpc_url)?;
     let (_, transition_verifier, _, genesis_verifier) =
         orchard::circuit::state_note_binding::keygen();
-    let names_verifier = OrchardV2ProofVerifier::from_parts(transition_verifier, genesis_verifier);
+    let names_verifier = OrchardV1ProofVerifier::from_parts(transition_verifier, genesis_verifier);
     let lineage = replay_names_lineage(
         &mut source,
         &params,
@@ -3767,9 +3767,9 @@ fn verify_update(args: VerifyUpdateArgs) -> Result<()> {
     let update_operation_index = update
         .operations
         .iter()
-        .position(|operation| matches!(operation, V2Operation::Update { .. }))
+        .position(|operation| matches!(operation, V1Operation::Update { .. }))
         .context("canonical UPDATE operation index missing")?;
-    let V2Operation::Update {
+    let V1Operation::Update {
         predecessor,
         state,
         state_commitment,
@@ -3846,7 +3846,7 @@ fn verify_update(args: VerifyUpdateArgs) -> Result<()> {
 
 fn verify_abandon(args: VerifyAbandonArgs) -> Result<()> {
     let params = local_consensus();
-    let v2 = v2_parameters();
+    let v1 = v1_parameters();
     let reveal_txid = parse_txid_hex(&args.reveal_txid)?;
     let update_txid = parse_txid_hex(&args.update_txid)?;
     let abandon_txid = parse_txid_hex(&args.abandon_txid)?;
@@ -3859,7 +3859,7 @@ fn verify_abandon(args: VerifyAbandonArgs) -> Result<()> {
     let mut source = source_for(&args.rpc_url)?;
     let (_, transition_verifier, _, genesis_verifier) =
         orchard::circuit::state_note_binding::keygen();
-    let names_verifier = OrchardV2ProofVerifier::from_parts(transition_verifier, genesis_verifier);
+    let names_verifier = OrchardV1ProofVerifier::from_parts(transition_verifier, genesis_verifier);
     let lineage = replay_names_lineage(
         &mut source,
         &params,
@@ -3938,9 +3938,9 @@ fn verify_abandon(args: VerifyAbandonArgs) -> Result<()> {
     let update_operation_index = update
         .operations
         .iter()
-        .position(|operation| matches!(operation, V2Operation::Update { .. }))
+        .position(|operation| matches!(operation, V1Operation::Update { .. }))
         .context("canonical UPDATE operation index missing during abandonment verification")?;
-    let V2Operation::Update {
+    let V1Operation::Update {
         state,
         state_commitment,
         state_nullifier,
@@ -3968,7 +3968,7 @@ fn verify_abandon(args: VerifyAbandonArgs) -> Result<()> {
             && accepted.data.terminal_height == 0,
         "accepted state changed unexpectedly when its note was spent"
     );
-    let claimable_height = v2
+    let claimable_height = v1
         .head_claimable_from(&accepted.data, Some(abandoned_height))
         .context("abandonment claimability height overflow")?;
     match args.expected_status {
@@ -3992,7 +3992,7 @@ fn verify_abandon(args: VerifyAbandonArgs) -> Result<()> {
         .values()
         .find(|block| block.transactions.iter().any(|tx| tx.txid == reveal_txid))
         .context("canonical REVEAL block missing during abandonment verification")?;
-    let V2Operation::Reveal {
+    let V1Operation::Reveal {
         state_commitment,
         state_nullifier,
         action_index,
@@ -4058,7 +4058,7 @@ fn verify_abandon(args: VerifyAbandonArgs) -> Result<()> {
 
 fn verify_renew(args: VerifyRenewArgs) -> Result<()> {
     let params = local_consensus();
-    let v2 = v2_parameters();
+    let v1 = v1_parameters();
     let reveal_txid = parse_txid_hex(&args.reveal_txid)?;
     let update_txid = parse_txid_hex(&args.update_txid)?;
     let renew_txid = parse_txid_hex(&args.renew_txid)?;
@@ -4071,7 +4071,7 @@ fn verify_renew(args: VerifyRenewArgs) -> Result<()> {
     let mut source = source_for(&args.rpc_url)?;
     let (_, transition_verifier, _, genesis_verifier) =
         orchard::circuit::state_note_binding::keygen();
-    let names_verifier = OrchardV2ProofVerifier::from_parts(transition_verifier, genesis_verifier);
+    let names_verifier = OrchardV1ProofVerifier::from_parts(transition_verifier, genesis_verifier);
     let lineage = replay_names_lineage(
         &mut source,
         &params,
@@ -4123,9 +4123,9 @@ fn verify_renew(args: VerifyRenewArgs) -> Result<()> {
     let renew_operation_index = renew
         .operations
         .iter()
-        .position(|operation| matches!(operation, V2Operation::Renew { .. }))
+        .position(|operation| matches!(operation, V1Operation::Renew { .. }))
         .context("canonical RENEW operation index missing")?;
-    let V2Operation::Renew {
+    let V1Operation::Renew {
         predecessor,
         state,
         state_commitment,
@@ -4147,25 +4147,25 @@ fn verify_renew(args: VerifyRenewArgs) -> Result<()> {
         renew_action.commitment == *state_commitment,
         "canonical RENEW successor CMX does not match its designated action"
     );
-    let expected_renew_height = coppice_names::v2::schedule::next_anchor_height(
+    let expected_renew_height = coppice_names::v1::schedule::next_anchor_height(
         lineage.name_id,
         update_block
             .height
             .checked_add(1)
             .context("RENEW schedule height overflow")?,
-        v2,
+        v1,
     )
     .context("no scheduled RENEW height follows the accepted UPDATE")?;
     ensure!(
         renew_block.height == expected_renew_height
-            && coppice_names::v2::schedule::is_anchor_height(
+            && coppice_names::v1::schedule::is_anchor_height(
                 lineage.name_id,
                 renew_block.height,
-                v2,
+                v1,
             ),
         "canonical RENEW was not mined at the next scheduled anchor height"
     );
-    let expected_lease_expiry = v2
+    let expected_lease_expiry = v1
         .lease_expiry(renew_block.height)
         .context("canonical RENEW lease expiry overflow")?;
     let expected_position = ProducerPosition::new(renew_block.height, renew.tx_index, renew.txid);
@@ -4276,7 +4276,7 @@ fn verify(args: VerifyArgs) -> Result<()> {
         "canonical COMMIT does not expose exactly one operation"
     );
     ensure!(
-        matches!(commit.operations[0], V2Operation::Commit { .. }),
+        matches!(commit.operations[0], V1Operation::Commit { .. }),
         "canonical COMMIT operation kind mismatch"
     );
     ensure!(
@@ -4284,7 +4284,7 @@ fn verify(args: VerifyArgs) -> Result<()> {
         "canonical REVEAL does not expose exactly one operation"
     );
     let reveal_operation = &reveal.operations[0];
-    let V2Operation::Reveal {
+    let V1Operation::Reveal {
         intent,
         commit: commit_ref,
         replacement_predecessor,
@@ -4308,7 +4308,7 @@ fn verify(args: VerifyArgs) -> Result<()> {
     let canonical_commit = commit
         .operations
         .iter()
-        .position(|operation| matches!(operation, V2Operation::Commit { .. }))
+        .position(|operation| matches!(operation, V1Operation::Commit { .. }))
         .context("canonical COMMIT operation index missing")
         .and_then(|index| {
             u32::try_from(index).context("canonical COMMIT operation index exceeds u32")
@@ -4334,7 +4334,7 @@ fn verify(args: VerifyArgs) -> Result<()> {
         "REVEAL CommitRef operation index mismatch"
     );
     let commit_operation = &commit.operations[canonical_commit as usize];
-    let V2Operation::Commit { commitment } = commit_operation else {
+    let V1Operation::Commit { commitment } = commit_operation else {
         bail!("canonical COMMIT operation changed kind");
     };
     ensure!(
@@ -4352,19 +4352,19 @@ fn verify(args: VerifyArgs) -> Result<()> {
         commit_txid != reveal_txid,
         "COMMIT and REVEAL txids must differ"
     );
-    let v2 = v2_parameters();
+    let v1 = v1_parameters();
     let intent_name_id = intent
         .name_id()
         .map_err(|error| anyhow::anyhow!("derive replay intent name id: {error:?}"))?;
     let reveal_operation_index = reveal
         .operations
         .iter()
-        .position(|operation| matches!(operation, V2Operation::Reveal { .. }))
+        .position(|operation| matches!(operation, V1Operation::Reveal { .. }))
         .context("canonical REVEAL operation index missing")
         .and_then(|index| {
             u32::try_from(index).context("canonical REVEAL operation index exceeds u32")
         })?;
-    let activation_height = v2.activation_height;
+    let activation_height = v1.activation_height;
     let canonical_tip_height = blocks
         .keys()
         .next_back()
@@ -4372,19 +4372,19 @@ fn verify(args: VerifyArgs) -> Result<()> {
         .context("canonical replay source contains no blocks")?;
     let activation_block = blocks
         .get(&activation_height)
-        .context("canonical replay source is missing the v2 activation block")?;
+        .context("canonical replay source is missing the v1 activation block")?;
     // The parent is taken from the canonical activation block itself. The
     // state machine still authenticates this value against the first block
     // and every subsequent predecessor in apply_block.
     let activation_parent_hash = activation_block.prev_block_hash;
     let (_, transition_verifier, _, genesis_verifier) =
         orchard::circuit::state_note_binding::keygen();
-    let verifier = coppice_names::v2::transition::OrchardV2ProofVerifier::from_parts(
+    let verifier = coppice_names::v1::transition::OrchardV1ProofVerifier::from_parts(
         transition_verifier,
         genesis_verifier,
     );
-    let mut machine = V2StateMachine::from_activation_parent(v2, activation_parent_hash)
-        .map_err(|error| anyhow::anyhow!("construct Names v2 full replay machine: {error:?}"))?;
+    let mut machine = V1StateMachine::from_activation_parent(v1, activation_parent_hash)
+        .map_err(|error| anyhow::anyhow!("construct Names v1 full replay machine: {error:?}"))?;
     let mut commit_full_replay_seen = false;
     let mut reveal_full_replay_seen = false;
     for height in activation_height..=canonical_tip_height {
@@ -4392,7 +4392,7 @@ fn verify(args: VerifyArgs) -> Result<()> {
             .get(&height)
             .context("canonical replay source is missing a sequential block")?;
         let applied = machine.apply_block(block, &verifier).map_err(|error| {
-            anyhow::anyhow!("Names v2 full replay failed at h{height}: {error:?}")
+            anyhow::anyhow!("Names v1 full replay failed at h{height}: {error:?}")
         })?;
         for transaction in &block.transactions {
             if transaction.txid == commit_txid {
@@ -4403,7 +4403,7 @@ fn verify(args: VerifyArgs) -> Result<()> {
                 let operation_index = transaction
                     .operations
                     .iter()
-                    .position(|operation| matches!(operation, V2Operation::Commit { .. }))
+                    .position(|operation| matches!(operation, V1Operation::Commit { .. }))
                     .context("full replay COMMIT operation index missing")
                     .and_then(|index| {
                         u32::try_from(index)
@@ -4473,25 +4473,25 @@ fn verify(args: VerifyArgs) -> Result<()> {
     let full_status = machine.resolution_at(intent_name_id, canonical_tip_height);
     ensure!(
         full_status == ResolutionStatus::Active,
-        "full Names v2 replay did not accept an active registration: {full_status:?}"
+        "full Names v1 replay did not accept an active registration: {full_status:?}"
     );
     let full_head = machine
         .head(intent_name_id)
-        .context("full Names v2 replay returned no accepted state")?;
+        .context("full Names v1 replay returned no accepted state")?;
 
-    let resolver = FreshResolver::new(v2)
-        .map_err(|error| anyhow::anyhow!("construct Names v2 fresh resolver: {error:?}"))?;
+    let resolver = FreshResolver::new(v1)
+        .map_err(|error| anyhow::anyhow!("construct Names v1 fresh resolver: {error:?}"))?;
     let result = resolver
         .resolve(NAME, &blocks, &verifier)
-        .map_err(|error| anyhow::anyhow!("Names v2 canonical replay failed: {error:?}"))?;
+        .map_err(|error| anyhow::anyhow!("Names v1 canonical replay failed: {error:?}"))?;
     ensure!(
         result.status == ResolutionStatus::Active,
-        "Names v2 replay did not accept an active registration: {:?}",
+        "Names v1 replay did not accept an active registration: {:?}",
         result.status
     );
     let accepted = result
         .state
-        .context("Names v2 replay returned no accepted state")?;
+        .context("Names v1 replay returned no accepted state")?;
     ensure!(
         accepted.data.name_id == intent_name_id,
         "accepted state name id mismatch"

@@ -7,10 +7,10 @@ developers, for developers for use in prototyping Zcash functionality, and
 should not be considered production-ready. The command-line API that this tool
 exposes can and will change at any time and without warning.
 
-The local Names v2 tooling keeps the repository boundary explicit: generic
+The local Names v1 tooling keeps the repository boundary explicit: generic
 wallet, PCZT, and canonical-ingest functionality remains in this repository
 and its Coppice dependencies, while Names state, wire encoding, and proof
-construction live in `coppice-names`. The standalone `names-v2-live` binary is
+construction live in `coppice-names`. The standalone `names-v1-live` binary is
 qualification tooling; generic wallet commands do not carry Names policy.
 
 ## Security Warnings
@@ -74,9 +74,9 @@ If you want to run with debug or trace logging:
 RUST_LOG=debug cargo run --release -- wallet -w <wallet_dir> <command>
 ```
 
-## Names v2 development harness
+## Names v1 development harness
 
-The `names-v2-live` binary and `scripts/live-qualification.sh` exercise the
+The `names-v1-live` binary and `scripts/live-qualification.sh` exercise the
 disposable local lifecycle `COMMIT -> REVEAL -> UPDATE -> RENEW -> RELEASE`
 against the pinned Zakura/Zaino stack. The harness also checks canonical
 resolution and replay parity. It is development/qualification tooling only;
@@ -90,8 +90,8 @@ scripts/live-qualification.sh --phase 2
 ```
 
 The generic wallet and PCZT commands remain application-blind. Hosts that
-construct Names v2 operations use the typed helpers in
-`src/names_v2_operation.rs` and `src/names_v2_builder.rs`, then submit them
+construct Names v1 operations use the typed helpers in
+`src/names_v1_operation.rs` and `src/names_v1_builder.rs`, then submit them
 through the ordinary transaction pipeline.
 
 ### Video tutorial of Zcash Devtool

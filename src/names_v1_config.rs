@@ -1,24 +1,24 @@
-//! Host configuration used by the disposable Names v2 live harness.
+//! Host configuration used by the disposable Names v1 live harness.
 //!
 //! The receiver is an incoming-only Orchard capability. It is testnet/
 //! regtest tooling configuration, not Names semantic state or consensus.
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct NamesV2Rendezvous {
+pub struct NamesV1Rendezvous {
     pub orchard_ivk: [u8; 64],
     pub orchard_receiver: [u8; 43],
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct NamesV2NetworkConfig {
-    pub rendezvous: NamesV2Rendezvous,
+pub struct NamesV1NetworkConfig {
+    pub rendezvous: NamesV1Rendezvous,
 }
 
-/// Disposable local-regtest receiver used by the v2 live qualification
+/// Disposable local-regtest receiver used by the v1 live qualification
 /// harness. These bytes are intentionally unchanged from the established
 /// qualification fixture.
-pub const REGTEST: NamesV2NetworkConfig = NamesV2NetworkConfig {
-    rendezvous: NamesV2Rendezvous {
+pub const REGTEST: NamesV1NetworkConfig = NamesV1NetworkConfig {
+    rendezvous: NamesV1Rendezvous {
         orchard_ivk: [
             101, 222, 178, 179, 238, 122, 198, 144, 32, 84, 63, 64, 242, 17, 34, 203, 109, 193,
             244, 32, 26, 50, 159, 205, 249, 213, 227, 187, 45, 251, 186, 190, 41, 213, 66, 53, 47,
@@ -35,15 +35,15 @@ pub const REGTEST: NamesV2NetworkConfig = NamesV2NetworkConfig {
 
 /// Decodes the configured incoming-only Orchard receiver.
 pub fn bulletin_address(
-    rendezvous: NamesV2Rendezvous,
-) -> Result<orchard::Address, NamesV2ConfigError> {
+    rendezvous: NamesV1Rendezvous,
+) -> Result<orchard::Address, NamesV1ConfigError> {
     Option::from(orchard::Address::from_raw_address_bytes(
         &rendezvous.orchard_receiver,
     ))
-    .ok_or(NamesV2ConfigError::InvalidReceiver)
+    .ok_or(NamesV1ConfigError::InvalidReceiver)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum NamesV2ConfigError {
+pub enum NamesV1ConfigError {
     InvalidReceiver,
 }

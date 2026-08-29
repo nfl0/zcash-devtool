@@ -1,9 +1,9 @@
-//! High-level Names v2 operation construction.
+//! High-level Names v1 operation construction.
 //!
 //! This module sits between the canonical protocol layer in `coppice-names`
-//! and the low-level Ironwood PCZT builder in [`crate::names_v2_builder`]. It
-//! turns typed caller-supplied inputs into the canonical [`V2Operation`]s,
-//! their CNV2 encodings and CPV1 carrier frames, and the designated-pair
+//! and the low-level Ironwood PCZT builder in [`crate::names_v1_builder`]. It
+//! turns typed caller-supplied inputs into the canonical [`V1Operation`]s,
+//! their CNV1 encodings and CPV1 carrier frames, and the designated-pair
 //! Ironwood bundle plan. It contains no qualification-fixture values: names,
 //! records, secrets, seeds, action indices, and canonical positions are all
 //! caller-supplied.
@@ -15,8 +15,8 @@
 //!    state note. At this stage everything except the Names proof is already
 //!    cryptographically/protocol-bound.
 //! 2. The caller generates the genesis or transition proof with
-//!    `coppice_names::v2::OrchardV2ProofProver` and calls `finalize` on the
-//!    preparation, producing the complete [`V2Operation`], its CNV2 bytes,
+//!    `coppice_names::v1::OrchardV1ProofProver` and calls `finalize` on the
+//!    preparation, producing the complete [`V1Operation`], its CNV1 bytes,
 //!    CPV1 frames, and the typed successor material for later wallet stages.
 //!
 //! [`prepare_commit`] is single-stage: COMMIT carries no proof and no
@@ -31,13 +31,13 @@
 
 use anyhow::{Context, Result, ensure};
 use coppice::transport::{encode_frames, reconstruct_frames};
-use coppice_names::v2::names_application_id;
-use coppice_names::v2::schedule::is_anchor_height;
-use coppice_names::v2::wire::OperationFootprint;
-use coppice_names::v2::{
+use coppice_names::v1::names_application_id;
+use coppice_names::v1::schedule::is_anchor_height;
+use coppice_names::v1::wire::OperationFootprint;
+use coppice_names::v1::{
     CommitRef, GenesisStatement, IronwoodActionRef, NameState, OperationKind, ProducerPosition,
-    RegistrationIntent, StateData, StateRef, StateStatus, TransitionStatement, V2Operation,
-    V2Parameters, decode_operation, encode_operation, operation_footprint,
+    RegistrationIntent, StateData, StateRef, StateStatus, TransitionStatement, V1Operation,
+    V1Parameters, decode_operation, encode_operation, operation_footprint,
 };
 use orchard::circuit::state_note_binding::{
     GenesisWitness, TransitionWitness, spend_auth_owner_key_bytes,
@@ -48,9 +48,9 @@ use orchard::value::NoteValue;
 use zcash_protocol::consensus::{BlockHeight, Parameters};
 use zcash_protocol::value::Zatoshis;
 
-use crate::names_v2_builder::{
-    CarrierOutput, ChangeOutput, FundingSpend, NamesV2IronwoodPlan, NamesV2IronwoodShape,
-    names_v2_ironwood_shape, names_v2_ironwood_shape_from_counts, required_zip317_fee_for_names_v2,
+use crate::names_v1_builder::{
+    CarrierOutput, ChangeOutput, FundingSpend, NamesV1IronwoodPlan, NamesV1IronwoodShape,
+    names_v1_ironwood_shape, names_v1_ironwood_shape_from_counts, required_zip317_fee_for_names_v1,
 };
 
 /// The canonical pre-broadcast COMMIT for a hidden registration intent.
@@ -61,31 +61,31 @@ use crate::names_v2_builder::{
 /// once the COMMIT transaction has a canonical producer position.
 pub struct PreparedCommit {
     commitment: [u8; 32],
-    operation: V2Operation,
+    operation: V1Operation,
     encoded: Vec<u8>,
     frames: Vec<[u8; 512]>,
 }
 
-/// Prepares the canonical `V2Operation::Commit` transport for `intent`.
+/// Prepares the canonical `V1Operation::Commit` transport for `intent`.
 ///
-/// The returned value already carries the final CNV2 bytes and CPV1 frames;
+/// The returned value already carries the final CNV1 bytes and CPV1 frames;
 /// the caller broadcasts them by ordinary carrier outputs and later locates
 /// the canonical [`CommitRef`] in the chain for the REVEAL it enables.
 pub fn prepare_commit(intent: &RegistrationIntent) -> Result<PreparedCommit> {
     let commitment = intent
         .commitment()
-        .map_err(|error| anyhow::anyhow!("derive Names v2 COMMIT commitment: {error:?}"))?;
-    let operation = V2Operation::Commit { commitment };
+        .map_err(|error| anyhow::anyhow!("derive Names v1 COMMIT commitment: {error:?}"))?;
+    let operation = V1Operation::Commit { commitment };
     let encoded = encode_operation(&operation)
-        .map_err(|error| anyhow::anyhow!("encode Names v2 COMMIT operation: {error:?}"))?;
+        .map_err(|error| anyhow::anyhow!("encode Names v1 COMMIT operation: {error:?}"))?;
     let decoded = decode_operation(&encoded)
-        .map_err(|error| anyhow::anyhow!("decode Names v2 COMMIT operation: {error:?}"))?;
+        .map_err(|error| anyhow::anyhow!("decode Names v1 COMMIT operation: {error:?}"))?;
     ensure!(
         decoded == operation,
-        "Names v2 COMMIT wire round-trip mismatch"
+        "Names v1 COMMIT wire round-trip mismatch"
     );
     let frames = encode_frames(names_application_id().to_bytes(), &encoded)
-        .map_err(|error| anyhow::anyhow!("frame Names v2 COMMIT operation: {error:?}"))?;
+        .map_err(|error| anyhow::anyhow!("frame Names v1 COMMIT operation: {error:?}"))?;
     Ok(PreparedCommit {
         commitment,
         operation,
@@ -101,11 +101,11 @@ impl PreparedCommit {
     }
 
     /// The canonical COMMIT operation.
-    pub const fn operation(&self) -> &V2Operation {
+    pub const fn operation(&self) -> &V1Operation {
         &self.operation
     }
 
-    /// Canonical CNV2 encoding of the COMMIT operation.
+    /// Canonical CNV1 encoding of the COMMIT operation.
     pub fn encoded(&self) -> &[u8] {
         &self.encoded
     }
@@ -183,7 +183,7 @@ pub struct RevealPreparation {
 /// the exact successor note and its commitment/future nullifier, the
 /// designated action index, and the genesis statement and witness. The only
 /// missing protocol-bound value is the genesis proof.
-pub fn prepare_reveal(inputs: RevealInputs, params: V2Parameters) -> Result<RevealPreparation> {
+pub fn prepare_reveal(inputs: RevealInputs, params: V1Parameters) -> Result<RevealPreparation> {
     let RevealInputs {
         intent,
         commit,
@@ -224,7 +224,7 @@ pub fn prepare_reveal(inputs: RevealInputs, params: V2Parameters) -> Result<Reve
                 .position
                 .height
                 .checked_add(params.commit_ttl_blocks)
-                .context("Names v2 COMMIT lifetime overflow")?,
+                .context("Names v1 COMMIT lifetime overflow")?,
         "intended REVEAL height is beyond the canonical COMMIT lifetime"
     );
     ensure!(
@@ -244,7 +244,7 @@ pub fn prepare_reveal(inputs: RevealInputs, params: V2Parameters) -> Result<Reve
     let successor_future_nullifier = successor_note.nullifier(&fvk).to_bytes();
     let lease_expiry = params
         .lease_expiry(operation_height)
-        .context("Names v2 lease expiry overflow at the REVEAL height")?;
+        .context("Names v1 lease expiry overflow at the REVEAL height")?;
     let state_data = StateData {
         name_id,
         owner_pk: intent.owner_pk,
@@ -273,7 +273,7 @@ pub fn prepare_reveal(inputs: RevealInputs, params: V2Parameters) -> Result<Reve
     };
     let statement =
         GenesisStatement::from_reveal(&intent, &state, action, operation_height, params)
-            .map_err(|error| anyhow::anyhow!("construct Names v2 genesis statement: {error:?}"))?;
+            .map_err(|error| anyhow::anyhow!("construct Names v1 genesis statement: {error:?}"))?;
     let witness = GenesisWitness::new(
         registration_note.clone(),
         successor_note.clone(),
@@ -324,10 +324,10 @@ impl RevealPreparation {
     }
 
     /// Attaches the generated genesis proof and completes the canonical
-    /// REVEAL operation, its CNV2 bytes, and its CPV1 frames.
+    /// REVEAL operation, its CNV1 bytes, and its CPV1 frames.
     pub fn finalize(self, genesis_proof: Vec<u8>) -> Result<FinalizedOperation> {
-        ensure!(!genesis_proof.is_empty(), "Names v2 genesis proof is empty");
-        let operation = V2Operation::Reveal {
+        ensure!(!genesis_proof.is_empty(), "Names v1 genesis proof is empty");
+        let operation = V1Operation::Reveal {
             intent: Box::new(self.intent),
             commit: self.commit,
             replacement_predecessor: self.replacement_predecessor,
@@ -397,7 +397,7 @@ pub struct TransitionPreparation {
 pub fn prepare_update(
     inputs: TransitionInputs,
     record: Vec<u8>,
-    params: V2Parameters,
+    params: V1Parameters,
 ) -> Result<TransitionPreparation> {
     ensure!(
         record != inputs.predecessor.data.record,
@@ -417,7 +417,7 @@ pub fn prepare_update(
 /// scheduled anchor or would not strictly extend the lease.
 pub fn prepare_renew(
     inputs: TransitionInputs,
-    params: V2Parameters,
+    params: V1Parameters,
 ) -> Result<TransitionPreparation> {
     let name_id = inputs.predecessor.data.name_id;
     ensure!(
@@ -426,7 +426,7 @@ pub fn prepare_renew(
     );
     let lease_expiry = params
         .lease_expiry(inputs.operation_height)
-        .context("Names v2 lease expiry overflow at the RENEW height")?;
+        .context("Names v1 lease expiry overflow at the RENEW height")?;
     ensure!(
         lease_expiry > inputs.predecessor.data.lease_expiry,
         "RENEW lease must strictly extend the predecessor lease"
@@ -443,7 +443,7 @@ pub fn prepare_renew(
 /// sequence increased by one.
 pub fn prepare_release(
     inputs: TransitionInputs,
-    params: V2Parameters,
+    params: V1Parameters,
 ) -> Result<TransitionPreparation> {
     let mut successor_data = active_successor_data(&inputs.predecessor.data)?;
     successor_data.status = StateStatus::Released;
@@ -478,14 +478,14 @@ impl TransitionPreparation {
     }
 
     /// Attaches the generated transition proof and completes the canonical
-    /// operation, its CNV2 bytes, and its CPV1 frames.
+    /// operation, its CNV1 bytes, and its CPV1 frames.
     pub fn finalize(self, transition_proof: Vec<u8>) -> Result<FinalizedOperation> {
         ensure!(
             !transition_proof.is_empty(),
-            "Names v2 transition proof is empty"
+            "Names v1 transition proof is empty"
         );
         let operation = match self.statement.operation {
-            OperationKind::Update => V2Operation::Update {
+            OperationKind::Update => V1Operation::Update {
                 predecessor: self.predecessor_state_ref,
                 state: self.state_data,
                 state_commitment: self.statement.successor_commitment,
@@ -493,7 +493,7 @@ impl TransitionPreparation {
                 action_index: self.designated_action_index,
                 proof: transition_proof,
             },
-            OperationKind::Renew => V2Operation::Renew {
+            OperationKind::Renew => V1Operation::Renew {
                 predecessor: self.predecessor_state_ref,
                 state: self.state_data,
                 state_commitment: self.statement.successor_commitment,
@@ -501,7 +501,7 @@ impl TransitionPreparation {
                 action_index: self.designated_action_index,
                 proof: transition_proof,
             },
-            OperationKind::Release => V2Operation::Release {
+            OperationKind::Release => V1Operation::Release {
                 predecessor: self.predecessor_state_ref,
                 state: self.state_data,
                 state_commitment: self.statement.successor_commitment,
@@ -578,20 +578,20 @@ pub fn planned_state_operation_shape_and_fee<P: Parameters>(
     finalized: &FinalizedOperation,
     funding_spend_count: usize,
     change_output_count: usize,
-) -> Result<(NamesV2IronwoodShape, Zatoshis)> {
+) -> Result<(NamesV1IronwoodShape, Zatoshis)> {
     let carrier_count = finalized.frames().len();
     let designated_action_index = usize::try_from(finalized.designated_action_index())
         .context("designated Names action index does not fit usize")?;
     let real_spend_count = 1usize
         .checked_add(funding_spend_count)
-        .context("Names v2 real-spend count overflowed usize")?;
-    let shape = names_v2_ironwood_shape_from_counts(
+        .context("Names v1 real-spend count overflowed usize")?;
+    let shape = names_v1_ironwood_shape_from_counts(
         real_spend_count,
         carrier_count,
         change_output_count,
         designated_action_index,
     )?;
-    let fee = required_zip317_fee_for_names_v2(
+    let fee = required_zip317_fee_for_names_v1(
         params,
         BlockHeight::from_u32(finalized.operation_height()),
         shape,
@@ -602,14 +602,14 @@ pub fn planned_state_operation_shape_and_fee<P: Parameters>(
 /// The designated-pair Ironwood plan for one finalized state operation,
 /// together with the ZIP-317 fee the planned shape requires.
 pub struct StateOperationPlan {
-    /// Plan for [`crate::names_v2_builder::build_names_v2_bundle`]. The
+    /// Plan for [`crate::names_v1_builder::build_names_v1_bundle`]. The
     /// designated spend and the exact successor occupy the same action,
     /// which is the action index already encoded in the operation, and the
     /// plan carries the operation's intended height for the later PCZT
     /// expiry binding.
-    pub plan: NamesV2IronwoodPlan,
+    pub plan: NamesV1IronwoodPlan,
     /// Physical shape `plan` must produce.
-    pub planned_shape: NamesV2IronwoodShape,
+    pub planned_shape: NamesV1IronwoodShape,
     /// ZIP-317 fee required for `planned_shape` at the operation height. The
     /// built bundle's value balance must equal this fee.
     pub required_fee: Zatoshis,
@@ -652,14 +652,14 @@ pub fn plan_state_operation<P: Parameters>(
         .context("designated Names action index does not fit usize")?;
     let real_spend_count = 1usize
         .checked_add(funding.funding_spends.len())
-        .context("Names v2 real-spend count overflowed usize")?;
-    let planned_shape = names_v2_ironwood_shape_from_counts(
+        .context("Names v1 real-spend count overflowed usize")?;
+    let planned_shape = names_v1_ironwood_shape_from_counts(
         real_spend_count,
         carrier_outputs.len(),
         funding.change_outputs.len(),
         designated_action_index,
     )?;
-    let required_fee = required_zip317_fee_for_names_v2(
+    let required_fee = required_zip317_fee_for_names_v1(
         params,
         BlockHeight::from_u32(operation_height),
         planned_shape,
@@ -702,11 +702,11 @@ pub fn plan_state_operation<P: Parameters>(
         .context("funding does not cover the carrier outputs and change outputs")?;
     ensure!(
         contributed_fee == required_fee.into_u64(),
-        "Names v2 funding does not balance: supplied inputs contribute {contributed_fee} zatoshis toward a required ZIP-317 fee of {}",
+        "Names v1 funding does not balance: supplied inputs contribute {contributed_fee} zatoshis toward a required ZIP-317 fee of {}",
         required_fee.into_u64()
     );
 
-    let plan = NamesV2IronwoodPlan {
+    let plan = NamesV1IronwoodPlan {
         designated_fvk: finalized.owner_fvk.clone(),
         designated_spend: finalized.designated_note.clone(),
         successor_note: finalized.successor_note.clone(),
@@ -719,8 +719,8 @@ pub fn plan_state_operation<P: Parameters>(
         operation_height,
     };
     ensure!(
-        names_v2_ironwood_shape(&plan)? == planned_shape,
-        "Names v2 plan shape changed after fee planning"
+        names_v1_ironwood_shape(&plan)? == planned_shape,
+        "Names v1 plan shape changed after fee planning"
     );
     Ok(StateOperationPlan {
         plan,
@@ -734,10 +734,10 @@ pub fn plan_state_operation<P: Parameters>(
 /// A complete, proof-carrying state operation and its canonical transport.
 ///
 /// Everything exposed here is protocol-bound: the operation commits to its
-/// designated action index, the CNV2 bytes are final, and the successor note
+/// designated action index, the CNV1 bytes are final, and the successor note
 /// is the exact opening created by the designated action.
 pub struct FinalizedOperation {
-    operation: V2Operation,
+    operation: V1Operation,
     encoded: Vec<u8>,
     frames: Vec<[u8; 512]>,
     footprint: OperationFootprint,
@@ -749,11 +749,11 @@ pub struct FinalizedOperation {
 
 impl FinalizedOperation {
     /// The canonical, proof-carrying operation.
-    pub const fn operation(&self) -> &V2Operation {
+    pub const fn operation(&self) -> &V1Operation {
         &self.operation
     }
 
-    /// Canonical CNV2 encoding of the operation.
+    /// Canonical CNV1 encoding of the operation.
     pub fn encoded(&self) -> &[u8] {
         &self.encoded
     }
@@ -821,7 +821,7 @@ fn active_successor_data(predecessor: &StateData) -> Result<StateData> {
         sequence: predecessor
             .sequence
             .checked_add(1)
-            .context("Names v2 successor sequence overflow")?,
+            .context("Names v1 successor sequence overflow")?,
         record: predecessor.record.clone(),
         lease_expiry: predecessor.lease_expiry,
         status: StateStatus::Active,
@@ -835,7 +835,7 @@ fn prepare_transition(
     inputs: TransitionInputs,
     successor_data: StateData,
     kind: OperationKind,
-    params: V2Parameters,
+    params: V1Parameters,
 ) -> Result<TransitionPreparation> {
     let TransitionInputs {
         predecessor,
@@ -909,7 +909,7 @@ fn prepare_transition(
         operation_height,
         params,
     )
-    .map_err(|error| anyhow::anyhow!("construct Names v2 transition statement: {error:?}"))?;
+    .map_err(|error| anyhow::anyhow!("construct Names v1 transition statement: {error:?}"))?;
     let witness = TransitionWitness::new(
         predecessor_note.clone(),
         successor_note.clone(),
@@ -929,36 +929,36 @@ fn prepare_transition(
     })
 }
 
-/// Encodes a proof-carrying operation and verifies its CNV2 and CPV1 round
+/// Encodes a proof-carrying operation and verifies its CNV1 and CPV1 round
 /// trips before anything is exposed to the caller.
 fn finalize_operation(
-    operation: V2Operation,
+    operation: V1Operation,
     owner_fvk: FullViewingKey,
     designated_note: Note,
     successor_note: Note,
     operation_height: u32,
 ) -> Result<FinalizedOperation> {
     let encoded = encode_operation(&operation)
-        .map_err(|error| anyhow::anyhow!("encode Names v2 operation: {error:?}"))?;
+        .map_err(|error| anyhow::anyhow!("encode Names v1 operation: {error:?}"))?;
     let decoded = decode_operation(&encoded)
-        .map_err(|error| anyhow::anyhow!("decode Names v2 operation: {error:?}"))?;
-    ensure!(decoded == operation, "Names v2 wire round-trip mismatch");
+        .map_err(|error| anyhow::anyhow!("decode Names v1 operation: {error:?}"))?;
+    ensure!(decoded == operation, "Names v1 wire round-trip mismatch");
     let footprint = operation_footprint(&operation)
-        .map_err(|error| anyhow::anyhow!("measure Names v2 operation: {error:?}"))?;
+        .map_err(|error| anyhow::anyhow!("measure Names v1 operation: {error:?}"))?;
     let app_id = names_application_id().to_bytes();
     let frames = encode_frames(app_id, &encoded)
-        .map_err(|error| anyhow::anyhow!("frame Names v2 operation: {error:?}"))?;
+        .map_err(|error| anyhow::anyhow!("frame Names v1 operation: {error:?}"))?;
     let reconstructed = reconstruct_frames(&frames, app_id)
-        .map_err(|error| anyhow::anyhow!("reconstruct Names v2 frames: {error:?}"))?;
+        .map_err(|error| anyhow::anyhow!("reconstruct Names v1 frames: {error:?}"))?;
     ensure!(
         reconstructed == encoded,
-        "CPV1 reconstruction changed the CNV2 bytes"
+        "CPV1 reconstruction changed the CNV1 bytes"
     );
     let reconstructed_operation = decode_operation(&reconstructed)
-        .map_err(|error| anyhow::anyhow!("decode reconstructed Names v2 operation: {error:?}"))?;
+        .map_err(|error| anyhow::anyhow!("decode reconstructed Names v1 operation: {error:?}"))?;
     ensure!(
         reconstructed_operation == operation,
-        "CPV1 decode changed the Names v2 operation"
+        "CPV1 decode changed the Names v1 operation"
     );
     ensure!(
         frames.len() == footprint.cpv1_frames,
@@ -979,11 +979,11 @@ fn finalize_operation(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::names_v2_builder::{
-        NamesV2PcztPlan, build_names_v2_bundle, build_names_v2_pczt,
-        required_zip317_fee_for_names_v2,
+    use crate::names_v1_builder::{
+        NamesV1PcztPlan, build_names_v1_bundle, build_names_v1_pczt,
+        required_zip317_fee_for_names_v1,
     };
-    use coppice_names::v2::schedule::next_anchor_height;
+    use coppice_names::v1::schedule::next_anchor_height;
     use orchard::keys::SpendingKey;
     use rand::{SeedableRng, rngs::StdRng};
     use zcash_protocol::consensus::BranchId;
@@ -1051,7 +1051,7 @@ mod tests {
     /// its TTL, and at the name's scheduled anchor.
     fn reveal_commit_and_height(
         intent: &RegistrationIntent,
-        params: V2Parameters,
+        params: V1Parameters,
     ) -> (CommitRef, u32) {
         let commit_height = 30;
         let reveal_height =
@@ -1070,33 +1070,33 @@ mod tests {
     /// Builds the canonical predecessor head a machine would reconstruct from
     /// a mined operation.
     fn accepted_head(
-        operation: &V2Operation,
+        operation: &V1Operation,
         producer_height: u32,
         producer_txid: [u8; 32],
     ) -> NameState {
         let (state, commitment, nullifier, action_index) = match operation {
-            V2Operation::Reveal {
+            V1Operation::Reveal {
                 state,
                 state_commitment,
                 state_nullifier,
                 action_index,
                 ..
             }
-            | V2Operation::Update {
+            | V1Operation::Update {
                 state,
                 state_commitment,
                 state_nullifier,
                 action_index,
                 ..
             }
-            | V2Operation::Renew {
+            | V1Operation::Renew {
                 state,
                 state_commitment,
                 state_nullifier,
                 action_index,
                 ..
             }
-            | V2Operation::Release {
+            | V1Operation::Release {
                 state,
                 state_commitment,
                 state_nullifier,
@@ -1108,7 +1108,7 @@ mod tests {
                 *state_nullifier,
                 *action_index,
             ),
-            V2Operation::Commit { .. } => panic!("COMMIT does not create a state head"),
+            V1Operation::Commit { .. } => panic!("COMMIT does not create a state head"),
         };
         let state_ref = StateRef::new(
             ProducerPosition::new(producer_height, 0, producer_txid),
@@ -1130,7 +1130,7 @@ mod tests {
         assert_eq!(prepared.commitment(), expected_commitment);
         assert_eq!(
             prepared.operation(),
-            &V2Operation::Commit {
+            &V1Operation::Commit {
                 commitment: expected_commitment
             }
         );
@@ -1149,7 +1149,7 @@ mod tests {
 
     #[test]
     fn first_reveal_binds_exact_successor_statement_and_wire() {
-        let params = V2Parameters::testing();
+        let params = V1Parameters::testing();
         let (fvk, ask) = key_material(11);
         let registration_note = bond_note(&fvk, 50_000, 1, 2);
         let registration_nullifier = registration_note.nullifier(&fvk).to_bytes();
@@ -1207,9 +1207,9 @@ mod tests {
         let finalized = preparation.finalize(dummy_proof.clone()).unwrap();
 
         // The manual composition below reproduces the pre-extraction live
-        // construction from the same typed inputs; CNV2 bytes must be
+        // construction from the same typed inputs; CNV1 bytes must be
         // identical.
-        let manual = V2Operation::Reveal {
+        let manual = V1Operation::Reveal {
             intent: Box::new(intent.clone()),
             commit,
             replacement_predecessor: None,
@@ -1233,7 +1233,7 @@ mod tests {
             *finalized.operation()
         );
         match finalized.operation() {
-            V2Operation::Reveal {
+            V1Operation::Reveal {
                 replacement_predecessor,
                 state,
                 state_commitment,
@@ -1268,7 +1268,7 @@ mod tests {
 
     #[test]
     fn replacement_reveal_carries_the_exact_prior_terminal_reference() {
-        let params = V2Parameters::testing();
+        let params = V1Parameters::testing();
         let (fvk, ask) = key_material(12);
         let registration_note = bond_note(&fvk, 50_000, 2, 3);
         let intent = test_intent(&ask, 5, 7);
@@ -1307,7 +1307,7 @@ mod tests {
             (&replacement, Some(prior_terminal)),
         ] {
             match finalized.operation() {
-                V2Operation::Reveal {
+                V1Operation::Reveal {
                     replacement_predecessor,
                     ..
                 } => assert_eq!(*replacement_predecessor, expected_predecessor),
@@ -1321,7 +1321,7 @@ mod tests {
 
     #[test]
     fn reveal_rejects_commit_reference_for_a_different_intent() {
-        let params = V2Parameters::testing();
+        let params = V1Parameters::testing();
         let (fvk, ask) = key_material(17);
         let registration_note = bond_note(&fvk, 40_000, 7, 8);
         let intent_a = test_intent(&ask, 5, 7);
@@ -1363,7 +1363,7 @@ mod tests {
 
     #[test]
     fn update_changes_record_and_preserves_lease() {
-        let params = V2Parameters::testing();
+        let params = V1Parameters::testing();
         let (fvk, ask) = key_material(13);
         let registration_note = bond_note(&fvk, 40_000, 2, 3);
         let intent = test_intent(&ask, 5, 7);
@@ -1437,7 +1437,7 @@ mod tests {
         let dummy_proof = vec![0xA5; 1_920];
         let finalized = update_preparation.finalize(dummy_proof.clone()).unwrap();
 
-        let manual = V2Operation::Update {
+        let manual = V1Operation::Update {
             predecessor: predecessor.state_ref,
             state: StateData {
                 name_id: predecessor.data.name_id,
@@ -1455,7 +1455,7 @@ mod tests {
         };
         assert_eq!(encode_operation(&manual).unwrap(), finalized.encoded());
         match finalized.operation() {
-            V2Operation::Update {
+            V1Operation::Update {
                 predecessor: encoded_predecessor,
                 state,
                 action_index: encoded_action_index,
@@ -1502,7 +1502,7 @@ mod tests {
 
     #[test]
     fn renew_preserves_record_and_extends_lease_at_scheduled_height() {
-        let params = V2Parameters::testing();
+        let params = V1Parameters::testing();
         let (fvk, ask) = key_material(14);
         let registration_note = bond_note(&fvk, 40_000, 3, 4);
         let intent = test_intent(&ask, 5, 7);
@@ -1575,7 +1575,7 @@ mod tests {
         let successor_future_nullifier = statement.successor_nullifier;
         let successor_lease_expiry = statement.successor_lease_expiry;
         let finalized = renew_preparation.finalize(vec![0xA5; 1_920]).unwrap();
-        let manual = V2Operation::Renew {
+        let manual = V1Operation::Renew {
             predecessor: predecessor.state_ref,
             state: StateData {
                 name_id: predecessor.data.name_id,
@@ -1593,7 +1593,7 @@ mod tests {
         };
         assert_eq!(encode_operation(&manual).unwrap(), finalized.encoded());
         match finalized.operation() {
-            V2Operation::Renew { state, .. } => {
+            V1Operation::Renew { state, .. } => {
                 assert_eq!(state.record, predecessor.data.record);
                 assert_eq!(state.lease_expiry, successor_lease_expiry);
                 assert_eq!(state.status, StateStatus::Active);
@@ -1607,14 +1607,14 @@ mod tests {
         );
 
         let non_anchor_height = (reveal_height + 1..predecessor.data.lease_expiry)
-            .find(|height| !coppice_names::v2::schedule::is_anchor_height(name_id, *height, params))
+            .find(|height| !coppice_names::v1::schedule::is_anchor_height(name_id, *height, params))
             .unwrap();
         assert!(prepare_renew(inputs(non_anchor_height, 1), params).is_err());
     }
 
     #[test]
     fn release_preserves_record_and_lease_and_terminates_at_operation_height() {
-        let params = V2Parameters::testing();
+        let params = V1Parameters::testing();
         let (fvk, ask) = key_material(15);
         let registration_note = bond_note(&fvk, 40_000, 4, 5);
         let intent = test_intent(&ask, 5, 7);
@@ -1680,7 +1680,7 @@ mod tests {
         let successor_commitment = statement.successor_commitment;
         let successor_future_nullifier = statement.successor_nullifier;
         let finalized = release_preparation.finalize(vec![0xA5; 1_920]).unwrap();
-        let manual = V2Operation::Release {
+        let manual = V1Operation::Release {
             predecessor: predecessor.state_ref,
             state: StateData {
                 name_id: predecessor.data.name_id,
@@ -1698,7 +1698,7 @@ mod tests {
         };
         assert_eq!(encode_operation(&manual).unwrap(), finalized.encoded());
         match finalized.operation() {
-            V2Operation::Release { state, .. } => {
+            V1Operation::Release { state, .. } => {
                 assert_eq!(state.record, predecessor.data.record);
                 assert_eq!(state.lease_expiry, predecessor.data.lease_expiry);
                 assert_eq!(state.status, StateStatus::Released);
@@ -1729,7 +1729,7 @@ mod tests {
 
     #[test]
     fn state_operation_plan_matches_shape_fee_and_designated_pair() {
-        let params = V2Parameters::testing();
+        let params = V1Parameters::testing();
         let consensus_params = local_v6_params();
         let (fvk, ask) = key_material(16);
         let registration_note = bond_note(&fvk, 40_000, 5, 6);
@@ -1831,11 +1831,11 @@ mod tests {
         );
         assert_eq!(
             planned.planned_shape,
-            names_v2_ironwood_shape(&planned.plan).unwrap()
+            names_v1_ironwood_shape(&planned.plan).unwrap()
         );
         assert_eq!(
             planned.required_fee,
-            required_zip317_fee_for_names_v2(
+            required_zip317_fee_for_names_v1(
                 &consensus_params,
                 BlockHeight::from_u32(update_height),
                 planned.planned_shape,
@@ -1843,7 +1843,7 @@ mod tests {
             .unwrap()
         );
 
-        let built = build_names_v2_bundle(planned.plan, StdRng::from_seed([77; 32])).unwrap();
+        let built = build_names_v1_bundle(planned.plan, StdRng::from_seed([77; 32])).unwrap();
         assert_eq!(built.action_count, planned.planned_shape.action_count);
         assert_eq!(
             built.ironwood_value_balance,
@@ -1858,7 +1858,7 @@ mod tests {
 
     #[test]
     fn state_operation_plan_supports_zero_and_multi_note_funding() {
-        let params = V2Parameters::testing();
+        let params = V1Parameters::testing();
         let consensus_params = local_v6_params();
         let (fvk, ask) = key_material(18);
         let carrier_recipient = key_material(31).0.address_at(0u32, Scope::External);
@@ -1981,7 +1981,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(multi_funding.planned_shape, shape);
-        let built = build_names_v2_bundle(multi_funding.plan, StdRng::from_seed([79; 32])).unwrap();
+        let built = build_names_v1_bundle(multi_funding.plan, StdRng::from_seed([79; 32])).unwrap();
         assert_eq!(
             built.ironwood_value_balance,
             i64::try_from(multi_funding.required_fee.into_u64()).unwrap()
@@ -2016,7 +2016,7 @@ mod tests {
 
     #[test]
     fn reveal_rejects_heights_outside_the_commit_lifetime_or_schedule() {
-        let params = V2Parameters::testing();
+        let params = V1Parameters::testing();
         let (fvk, ask) = key_material(19);
         let registration_note = bond_note(&fvk, 40_000, 12, 13);
         let intent = test_intent(&ask, 5, 7);
@@ -2062,7 +2062,7 @@ mod tests {
         );
         // Inside the lifetime but off the name's scheduled anchor: rejected.
         let non_anchor = (commit_height + 1..legal_height)
-            .find(|height| !coppice_names::v2::schedule::is_anchor_height(name_id, *height, params))
+            .find(|height| !coppice_names::v1::schedule::is_anchor_height(name_id, *height, params))
             .expect("a scheduled anchor window contains non-anchor heights");
         assert!(
             prepare_reveal(inputs(non_anchor), params)
@@ -2077,7 +2077,7 @@ mod tests {
 
     #[test]
     fn finalized_operation_binds_fee_planning_and_pczt_expiry_to_its_height() {
-        let params = V2Parameters::testing();
+        let params = V1Parameters::testing();
         let consensus_params = local_v6_params();
         let (fvk, ask) = key_material(20);
         let registration_note = bond_note(&fvk, 60_000, 14, 15);
@@ -2109,7 +2109,7 @@ mod tests {
             planned_state_operation_shape_and_fee(&consensus_params, &finalized, 1, 1).unwrap();
         assert_eq!(
             fee,
-            required_zip317_fee_for_names_v2(
+            required_zip317_fee_for_names_v1(
                 &consensus_params,
                 BlockHeight::from_u32(reveal_height),
                 shape,
@@ -2155,7 +2155,7 @@ mod tests {
         assert_eq!(planned.operation_height, reveal_height);
         assert_eq!(planned.carrier_value_total, carrier_value_total);
 
-        let built = build_names_v2_bundle(planned.plan, StdRng::from_seed([80; 32])).unwrap();
+        let built = build_names_v1_bundle(planned.plan, StdRng::from_seed([80; 32])).unwrap();
         assert_eq!(built.operation_height, reveal_height);
 
         // A PCZT expiry height different from the Names operation height is
@@ -2171,8 +2171,8 @@ mod tests {
                 [9; 32],
             )
             .unwrap();
-            build_names_v2_bundle(
-                NamesV2IronwoodPlan {
+            build_names_v1_bundle(
+                NamesV1IronwoodPlan {
                     designated_fvk: fvk.clone(),
                     designated_spend: designated,
                     successor_note: successor,
@@ -2197,7 +2197,7 @@ mod tests {
             )
             .unwrap()
         };
-        let mismatched = build_names_v2_pczt(NamesV2PcztPlan {
+        let mismatched = build_names_v1_pczt(NamesV1PcztPlan {
             ironwood: rebuilt(reveal_height, 20, 21),
             params: consensus_params.clone(),
             consensus_branch_id: BranchId::Nu6_3,
@@ -2210,7 +2210,7 @@ mod tests {
         );
 
         // The exact operation height builds the complete PCZT.
-        let aligned = build_names_v2_pczt(NamesV2PcztPlan {
+        let aligned = build_names_v1_pczt(NamesV1PcztPlan {
             ironwood: rebuilt(reveal_height, 22, 23),
             params: consensus_params,
             consensus_branch_id: BranchId::Nu6_3,
