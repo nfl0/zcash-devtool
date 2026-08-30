@@ -1379,6 +1379,7 @@ dependencies = [
  "zakura-halo2-proofs",
  "zakura-orchard",
  "zakura-pasta-curves",
+ "zcash_address",
 ]
 
 [[package]]

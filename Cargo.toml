@@ -140,3 +140,12 @@ tui = [
 # The extension is a package-name patch so every direct and transitive edge
 # that asks for `zakura-orchard` resolves to the same Coppice artifact.
 zakura-orchard = { git = "https://github.com/nfl0/orchard-coppice.git", rev = "0e09398970130b9510ce5011129acafc5039e79f" }
+
+[patch."https://github.com/nfl0/coppice.git"]
+# This repository intentionally develops against sibling Core sources. Names
+# pins the same reviewed Core revision for standalone consumers; redirect that
+# Git edge here so the devtool never compiles a second, incompatible Core type
+# family alongside its local checkout.
+coppice = { path = "../coppice/crates/coppice" }
+coppice-core = { path = "../coppice/crates/coppice-core" }
+coppice-librustzcash = { path = "../coppice/crates/coppice-librustzcash" }
