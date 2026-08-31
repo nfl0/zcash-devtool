@@ -17,7 +17,11 @@ use std::{
 use anyhow::{Context, Result, bail, ensure};
 use bip0039::{English, Mnemonic};
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use coppice::{carrier::CoreRendezvous, transport::reconstruct_frames};
+use coppice::{
+    carrier::CoreRendezvous,
+    identity::{CoreRuntimeParameters, ZcashNetwork},
+    transport::reconstruct_frames,
+};
 use coppice_librustzcash::{CanonicalBlockSource, FullTransactionSource};
 use coppice_names::v1::names_application_id;
 use coppice_names::v1::{
@@ -419,6 +423,22 @@ fn names_recipient() -> Result<orchard::Address> {
         .map_err(|error| anyhow::anyhow!("Names rendezvous: {error:?}"))
 }
 
+fn live_core_runtime_id() -> Result<[u8; 32]> {
+    CoreRuntimeParameters {
+        runtime_protocol_id: b"coppice.runtime".to_vec(),
+        runtime_protocol_version: 1,
+        zcash_network_domain: b"coppice-runtime-regtest-v1".to_vec(),
+        zcash_network: ZcashNetwork::Regtest,
+        runtime_activation_height: 2,
+        carrier_protocol_id: b"CPV1".to_vec(),
+        rendezvous_ivk: REGTEST.rendezvous.orchard_ivk,
+        rendezvous_receiver: REGTEST.rendezvous.orchard_receiver,
+    }
+    .validate()
+    .map(|parameters| parameters.core_runtime_id().to_bytes())
+    .map_err(|error| anyhow::anyhow!("derive live Core runtime identity: {error:?}"))
+}
+
 fn names_zcash_address() -> Result<zcash_address::ZcashAddress> {
     let recipient = names_recipient()?;
     UnifiedAddress::from_receivers(Some(recipient), None, None)
@@ -595,7 +615,7 @@ fn build_commit_for(
     let usk = wallet_usk(&params)?;
     let ask = SpendAuthorizingKey::from(usk.orchard());
     let intent = registration_intent(&ask, record, secret)?;
-    let prepared = prepare_commit(&intent)?;
+    let prepared = prepare_commit(&intent, live_core_runtime_id()?)?;
     let commitment = prepared.commitment();
     let operation_bytes = prepared.encoded().len();
     let frame_count = prepared.frames().len();
@@ -1419,7 +1439,7 @@ fn reveal_with_replacement(
         &REGTEST.rendezvous.orchard_receiver,
     )
     .map_err(|error| anyhow::anyhow!("construct Names rendezvous decoder: {error:?}"))?;
-    let app_id = names_application_id().to_bytes();
+    let app_id = live_core_runtime_id()?;
     let usk = wallet_usk(&params)?;
     let names_fvk = FullViewingKey::from(usk.orchard());
     let names_ask = SpendAuthorizingKey::from(usk.orchard());
@@ -1511,7 +1531,8 @@ fn reveal_with_replacement(
         )
         .map_err(|error| anyhow::anyhow!("create Names genesis proof: {error:?}"))?;
     let proof_elapsed = proof_started.elapsed();
-    let finalized_operation = preparation.finalize(genesis_proof.clone())?;
+    let finalized_operation =
+        preparation.finalize(genesis_proof.clone(), live_core_runtime_id()?)?;
 
     let carrier_recipient = names_recipient()?;
     let funding_nf = funding_note.nullifier(&names_fvk).to_bytes();
@@ -1666,7 +1687,7 @@ fn reclaim_context(args: &ReclaimRevealArgs) -> Result<ReclaimContext> {
         &REGTEST.rendezvous.orchard_receiver,
     )
     .map_err(|error| anyhow::anyhow!("construct Names rendezvous decoder: {error:?}"))?;
-    let app_id = names_application_id().to_bytes();
+    let app_id = live_core_runtime_id()?;
     let (_, transition_verifier, _, genesis_verifier) =
         orchard::circuit::state_note_binding::keygen();
     let names_verifier = OrchardV1ProofVerifier::from_parts(transition_verifier, genesis_verifier);
@@ -1773,7 +1794,7 @@ fn verify_reclaim(args: VerifyReclaimArgs) -> Result<()> {
         &REGTEST.rendezvous.orchard_receiver,
     )
     .map_err(|error| anyhow::anyhow!("construct Names rendezvous decoder: {error:?}"))?;
-    let app_id = names_application_id().to_bytes();
+    let app_id = live_core_runtime_id()?;
     let (_, transition_verifier, _, genesis_verifier) =
         orchard::circuit::state_note_binding::keygen();
     let names_verifier = OrchardV1ProofVerifier::from_parts(transition_verifier, genesis_verifier);
@@ -1886,7 +1907,7 @@ fn verify_reclaim_renew(args: VerifyReclaimRenewArgs) -> Result<()> {
         &REGTEST.rendezvous.orchard_receiver,
     )
     .map_err(|error| anyhow::anyhow!("construct Names rendezvous decoder: {error:?}"))?;
-    let app_id = names_application_id().to_bytes();
+    let app_id = live_core_runtime_id()?;
     let (_, transition_verifier, _, genesis_verifier) =
         orchard::circuit::state_note_binding::keygen();
     let names_verifier = OrchardV1ProofVerifier::from_parts(transition_verifier, genesis_verifier);
@@ -1975,7 +1996,7 @@ fn update(args: UpdateArgs) -> Result<()> {
         &REGTEST.rendezvous.orchard_receiver,
     )
     .map_err(|error| anyhow::anyhow!("construct Names rendezvous decoder: {error:?}"))?;
-    let app_id = names_application_id().to_bytes();
+    let app_id = live_core_runtime_id()?;
     let (transition_prover, transition_verifier, genesis_prover, genesis_verifier) =
         orchard::circuit::state_note_binding::keygen();
     let names_prover = OrchardV1ProofProver::from_parts(transition_prover, genesis_prover);
@@ -2121,7 +2142,8 @@ fn update(args: UpdateArgs) -> Result<()> {
         )
         .map_err(|error| anyhow::anyhow!("create Names UPDATE proof: {error:?}"))?;
     let names_proof_elapsed = names_proof_started.elapsed();
-    let finalized_operation = preparation.finalize(transition_proof.clone())?;
+    let finalized_operation =
+        preparation.finalize(transition_proof.clone(), live_core_runtime_id()?)?;
 
     let carrier_recipient = names_recipient()?;
     let anchor_height = db
@@ -2286,7 +2308,7 @@ fn abandon(args: AbandonArgs) -> Result<()> {
         &REGTEST.rendezvous.orchard_receiver,
     )
     .map_err(|error| anyhow::anyhow!("construct Names rendezvous decoder: {error:?}"))?;
-    let app_id = names_application_id().to_bytes();
+    let app_id = live_core_runtime_id()?;
     let (_, transition_verifier, _, genesis_verifier) =
         orchard::circuit::state_note_binding::keygen();
     let names_verifier = OrchardV1ProofVerifier::from_parts(transition_verifier, genesis_verifier);
@@ -2547,7 +2569,7 @@ fn renew(args: RenewArgs) -> Result<()> {
         &REGTEST.rendezvous.orchard_receiver,
     )
     .map_err(|error| anyhow::anyhow!("construct Names rendezvous decoder: {error:?}"))?;
-    let app_id = names_application_id().to_bytes();
+    let app_id = live_core_runtime_id()?;
     let (transition_prover, transition_verifier, genesis_prover, genesis_verifier) =
         orchard::circuit::state_note_binding::keygen();
     let names_prover = OrchardV1ProofProver::from_parts(transition_prover, genesis_prover);
@@ -2737,7 +2759,8 @@ fn renew(args: RenewArgs) -> Result<()> {
         )
         .map_err(|error| anyhow::anyhow!("create Names RENEW proof: {error:?}"))?;
     let names_proof_elapsed = names_proof_started.elapsed();
-    let finalized_operation = preparation.finalize(transition_proof.clone())?;
+    let finalized_operation =
+        preparation.finalize(transition_proof.clone(), live_core_runtime_id()?)?;
 
     let carrier_recipient = names_recipient()?;
     let anchor_height = db
@@ -2885,7 +2908,7 @@ fn release(args: ReleaseArgs) -> Result<()> {
         &REGTEST.rendezvous.orchard_receiver,
     )
     .map_err(|error| anyhow::anyhow!("construct Names rendezvous decoder: {error:?}"))?;
-    let app_id = names_application_id().to_bytes();
+    let app_id = live_core_runtime_id()?;
     let (transition_prover, transition_verifier, genesis_prover, genesis_verifier) =
         orchard::circuit::state_note_binding::keygen();
     let names_prover = OrchardV1ProofProver::from_parts(transition_prover, genesis_prover);
@@ -3057,7 +3080,8 @@ fn release(args: ReleaseArgs) -> Result<()> {
         )
         .map_err(|error| anyhow::anyhow!("create Names RELEASE proof: {error:?}"))?;
     let names_proof_elapsed = names_proof_started.elapsed();
-    let finalized_operation = preparation.finalize(transition_proof.clone())?;
+    let finalized_operation =
+        preparation.finalize(transition_proof.clone(), live_core_runtime_id()?)?;
 
     let carrier_recipient = names_recipient()?;
     let anchor_height = db
@@ -3210,7 +3234,7 @@ fn verify_release(args: VerifyReleaseArgs) -> Result<()> {
         &REGTEST.rendezvous.orchard_receiver,
     )
     .map_err(|error| anyhow::anyhow!("construct Names rendezvous decoder: {error:?}"))?;
-    let app_id = names_application_id().to_bytes();
+    let app_id = live_core_runtime_id()?;
     let mut source = source_for(&args.rpc_url)?;
     let (_, transition_verifier, _, genesis_verifier) =
         orchard::circuit::state_note_binding::keygen();
@@ -3450,7 +3474,7 @@ fn verify_release_boundary(args: VerifyReleaseBoundaryArgs) -> Result<()> {
         &REGTEST.rendezvous.orchard_receiver,
     )
     .map_err(|error| anyhow::anyhow!("construct Names rendezvous decoder: {error:?}"))?;
-    let app_id = names_application_id().to_bytes();
+    let app_id = live_core_runtime_id()?;
     let mut source = source_for(&args.rpc_url)?;
     let (_, transition_verifier, _, genesis_verifier) =
         orchard::circuit::state_note_binding::keygen();
@@ -3721,7 +3745,7 @@ fn verify_update(args: VerifyUpdateArgs) -> Result<()> {
         &REGTEST.rendezvous.orchard_receiver,
     )
     .map_err(|error| anyhow::anyhow!("construct Names rendezvous decoder: {error:?}"))?;
-    let app_id = names_application_id().to_bytes();
+    let app_id = live_core_runtime_id()?;
     let mut source = source_for(&args.rpc_url)?;
     let (_, transition_verifier, _, genesis_verifier) =
         orchard::circuit::state_note_binding::keygen();
@@ -3860,7 +3884,7 @@ fn verify_abandon(args: VerifyAbandonArgs) -> Result<()> {
         &REGTEST.rendezvous.orchard_receiver,
     )
     .map_err(|error| anyhow::anyhow!("construct Names rendezvous decoder: {error:?}"))?;
-    let app_id = names_application_id().to_bytes();
+    let app_id = live_core_runtime_id()?;
     let mut source = source_for(&args.rpc_url)?;
     let (_, transition_verifier, _, genesis_verifier) =
         orchard::circuit::state_note_binding::keygen();
@@ -4072,7 +4096,7 @@ fn verify_renew(args: VerifyRenewArgs) -> Result<()> {
         &REGTEST.rendezvous.orchard_receiver,
     )
     .map_err(|error| anyhow::anyhow!("construct Names rendezvous decoder: {error:?}"))?;
-    let app_id = names_application_id().to_bytes();
+    let app_id = live_core_runtime_id()?;
     let mut source = source_for(&args.rpc_url)?;
     let (_, transition_verifier, _, genesis_verifier) =
         orchard::circuit::state_note_binding::keygen();
@@ -4256,7 +4280,7 @@ fn verify_renew(args: VerifyRenewArgs) -> Result<()> {
 
 fn verify(args: VerifyArgs) -> Result<()> {
     let params = local_consensus();
-    let app_id = names_application_id().to_bytes();
+    let app_id = live_core_runtime_id()?;
     let rendezvous = CoreRendezvous::try_new(
         &REGTEST.rendezvous.orchard_ivk,
         &REGTEST.rendezvous.orchard_receiver,
