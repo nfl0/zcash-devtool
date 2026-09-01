@@ -84,9 +84,15 @@ RUST_LOG=debug cargo run --release -- wallet -w <wallet_dir> <command>
 
 The `names-v1-live` binary and `scripts/live-qualification.sh` exercise the
 disposable local lifecycle `COMMIT -> REVEAL -> UPDATE -> RENEW -> RELEASE`
-against the pinned Zakura/Zaino stack. The harness also checks canonical
-resolution and replay parity. It is development/qualification tooling only;
-it is not a wallet policy layer or a public deployment.
+against the pinned Zakura/Zaino stack. Current Names v1 validity is expressed
+as declaration windows: REVEAL's lease-start/proof height is strictly after
+COMMIT and within the inclusive COMMIT TTL, while inclusion may arrive later;
+RENEW's declared height is inside the renewal window and inclusion must precede
+the predecessor lease expiry. Transaction expiry covers those windows. Exact
+name-derived scheduling is not a validity rule, and FreshResolver uses bounded
+block-window probing. The harness also checks canonical resolution and replay
+parity. It is development/qualification tooling only; it is not a wallet
+policy layer or a public deployment.
 
 Run the infrastructure phase first, followed by the lifecycle phase:
 

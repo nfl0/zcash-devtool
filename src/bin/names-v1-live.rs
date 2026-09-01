@@ -18,6 +18,7 @@ use anyhow::{Context, Result, bail, ensure};
 use bip0039::{English, Mnemonic};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use coppice::{
+    application::{ApplicationEnvelopeV1, ApplicationKey},
     carrier::CoreRendezvous,
     identity::{CoreRuntimeParameters, ZcashNetwork},
     transport::reconstruct_frames,
@@ -26,9 +27,9 @@ use coppice_librustzcash::{CanonicalBlockSource, FullTransactionSource};
 use coppice_names::v1::names_application_id;
 use coppice_names::v1::{
     AppliedOperationKind, AppliedOperationResult, CanonicalBlock, CanonicalTransaction, CommitRef,
-    FreshResolver, IronwoodActionRef, NameState, OrchardV1ProofProver, OrchardV1ProofVerifier,
-    ProducerPosition, RegistrationIntent, ResolutionStatus, StateRef, StateStatus, V1Operation,
-    V1Parameters, V1StateMachine, decode_operation,
+    FreshResolver, IronwoodActionRef, NAMES_APPLICATION_VERSION, NameState, OrchardV1ProofProver,
+    OrchardV1ProofVerifier, ProducerPosition, RegistrationIntent, ResolutionStatus, StateRef,
+    StateStatus, V1Operation, V1Parameters, V1StateMachine, decode_operation,
 };
 use orchard::{
     circuit::state_note_binding::spend_auth_owner_key_bytes,
@@ -102,9 +103,9 @@ struct Cli {
 enum Command {
     /// Build, authorize, and submit the one-frame v1 COMMIT transaction.
     Commit(CommonArgs),
-    /// Print the next legal v1 anchor height for the deterministic name.
+    /// Print the earliest requested v1 operation height and window parameters.
     Target(TargetArgs),
-    /// Build, authorize, and submit the real v1 REVEAL at the current target height.
+    /// Build, authorize, and submit the real v1 REVEAL while its COMMIT is live.
     Reveal(RevealArgs),
     /// Replay the canonical chain and verify the initial active state.
     Verify(VerifyArgs),
@@ -641,13 +642,7 @@ fn build_commit_for(
 
 fn print_target(args: TargetArgs) -> Result<()> {
     let params = v1_parameters();
-    // The name schedule depends only on the canonical name identifier, not on
-    // the owner or hidden COMMIT preimage.
-    let name_id = coppice_names::v1::state::name_id(NAME)
-        .map_err(|error| anyhow::anyhow!("derive Names v1 name id: {error:?}"))?;
-    let target = coppice_names::v1::schedule::next_anchor_height(name_id, args.from_height, params)
-        .context("no future Names v1 anchor height exists")?;
-    println!("TARGET_REVEAL_HEIGHT={target}");
+    println!("TARGET_REVEAL_HEIGHT={}", args.from_height);
     println!("COMMIT_TTL_BLOCKS={}", params.commit_ttl_blocks);
     println!("REFRESH_DEADLINE_BLOCKS={}", params.refresh_deadline_blocks);
     println!("LEASE_DURATION_BLOCKS={}", params.lease_duration_blocks);
@@ -763,8 +758,24 @@ fn canonical_block(
         } else {
             let payload = reconstruct_frames(&frames, app_id)
                 .map_err(|error| anyhow::anyhow!("reconstruct canonical CPV1 frames: {error:?}"))?;
-            let operation = decode_operation(&payload)
-                .map_err(|error| anyhow::anyhow!("decode canonical Names operation: {error:?}"))?;
+            let envelope = ApplicationEnvelopeV1::decode(&payload).map_err(|error| {
+                anyhow::anyhow!(
+                    "decode canonical application envelope at block {height}, tx {}: {error:?}",
+                    hex::encode(txid)
+                )
+            })?;
+            ensure!(
+                envelope.key()
+                    == ApplicationKey::new(names_application_id(), NAMES_APPLICATION_VERSION),
+                "canonical carrier at block {height}, tx {} targets the wrong application",
+                hex::encode(txid)
+            );
+            let operation = decode_operation(envelope.payload()).map_err(|error| {
+                anyhow::anyhow!(
+                    "decode canonical Names operation at block {height}, tx {}: {error:?}",
+                    hex::encode(txid)
+                )
+            })?;
             vec![operation]
         };
         transactions.push(CanonicalTransaction {
@@ -1462,22 +1473,18 @@ fn reveal_with_replacement(
         .height
         .checked_add(1)
         .context("live chain height overflow")?;
-    let name_id = intent
-        .name_id()
-        .map_err(|error| anyhow::anyhow!("derive REVEAL name id: {error:?}"))?;
-    let target_height =
-        coppice_names::v1::schedule::next_anchor_height(name_id, construction_height, v1)
-            .context("no future legal Names v1 reveal height exists")?;
-    ensure!(
-        construction_height == target_height,
-        "REVEAL must be constructed at its scheduled anchor height; current height is {construction_height}, target is {target_height}"
-    );
+    let declared_height = commit_height
+        .checked_add(1)
+        .context("REVEAL declared height overflow")?;
+    let expiry_height = commit_height
+        .checked_add(v1.commit_ttl_blocks)
+        .context("REVEAL COMMIT lifetime overflow")?;
     ensure!(
         construction_height > commit_height,
         "REVEAL cannot be in the COMMIT block"
     );
     ensure!(
-        construction_height - commit_height <= v1.commit_ttl_blocks,
+        construction_height <= expiry_height,
         "canonical COMMIT is outside its v1 lifetime"
     );
 
@@ -1513,7 +1520,7 @@ fn reveal_with_replacement(
             fvk: names_fvk.clone(),
             ask: names_ask.clone(),
             designated_action_index: ACTION_INDEX,
-            operation_height: construction_height,
+            operation_height: declared_height,
             successor_seed: [successor_seed; 32],
         },
         v1,
@@ -1563,7 +1570,7 @@ fn reveal_with_replacement(
         ironwood: built,
         params,
         consensus_branch_id: BranchId::Nu6_3,
-        expiry_height: BlockHeight::from_u32(construction_height),
+        expiry_height: BlockHeight::from_u32(expiry_height),
         fallback_lock_time: 0,
     })?;
     let finalized = finalize_names_v1_pczt_io(complete)?;
@@ -1627,7 +1634,10 @@ fn reveal_with_replacement(
         hex::encode(commit.position.txid)
     );
     println!("COMMIT_REF_OPERATION_INDEX={}", commit.operation_index);
-    println!("TARGET_REVEAL_HEIGHT={target_height}");
+    println!("TARGET_REVEAL_HEIGHT={declared_height}");
+    println!("REVEAL_DECLARED_HEIGHT={declared_height}");
+    println!("REVEAL_VALID_UNTIL_HEIGHT={expiry_height}");
+    println!("RENEWAL_WINDOW_BLOCKS={}", v1.refresh_deadline_blocks);
     println!("REVEAL_CONSTRUCTION_HEIGHT={construction_height}");
     println!("LEASE_EXPIRY={lease_expiry}");
     println!("NAMES_PROOF_BYTES={}", genesis_proof.len());
@@ -1825,8 +1835,7 @@ fn verify_reclaim(args: VerifyReclaimArgs) -> Result<()> {
         replacement.data.sequence == 0
             && replacement.data.record.as_slice() == RECLAIM_RECORD.as_slice()
             && replacement.data.status == StateStatus::Active
-            && replacement.data.terminal_height == 0
-            && replacement.data.lease_expiry == 79,
+            && replacement.data.terminal_height == 0,
         "replacement head does not have the expected sequence-zero active state"
     );
     let transaction = lineage
@@ -1840,6 +1849,12 @@ fn verify_reclaim(args: VerifyReclaimArgs) -> Result<()> {
         .values()
         .find(|block| block.transactions.iter().any(|tx| tx.txid == reveal_txid))
         .context("canonical replacement REVEAL block is absent")?;
+    ensure!(
+        v1_parameters()
+            .anchor_height(replacement.data.lease_expiry)
+            .is_some_and(|declared| declared <= block.height),
+        "replacement REVEAL was included before its declared height"
+    );
     let V1Operation::Reveal {
         replacement_predecessor,
         action_index,
@@ -1934,7 +1949,6 @@ fn verify_reclaim_renew(args: VerifyReclaimRenewArgs) -> Result<()> {
     ensure!(
         renewed.data.sequence == 1
             && renewed.data.record.as_slice() == RECLAIM_RECORD.as_slice()
-            && renewed.data.lease_expiry == 98
             && renewed.data.status == StateStatus::Active
             && renewed.data.terminal_height == 0,
         "renewed replacement state has unexpected lifecycle fields"
@@ -1954,6 +1968,12 @@ fn verify_reclaim_renew(args: VerifyReclaimRenewArgs) -> Result<()> {
         .values()
         .find(|block| block.transactions.iter().any(|tx| tx.txid == renew_txid))
         .context("canonical replacement RENEW block is absent")?;
+    ensure!(
+        v1_parameters()
+            .anchor_height(renewed.data.lease_expiry)
+            .is_some_and(|declared| declared <= renew_block.height),
+        "replacement RENEW was included before its declared height"
+    );
     ensure!(
         renewed.state_ref.position()
             == ProducerPosition::new(renew_block.height, renew_transaction.tx_index, renew_txid),
@@ -2037,12 +2057,12 @@ fn update(args: UpdateArgs) -> Result<()> {
             predecessor.data.record.as_slice() == RECORD.as_slice(),
             "qualified UPDATE fixture has an unexpected predecessor record"
         );
+        let declared_height = v1
+            .anchor_height(predecessor.data.lease_expiry)
+            .context("Names v1 predecessor declared height underflow")?;
         ensure!(
-            predecessor.data.lease_expiry
-                == v1
-                    .lease_expiry(predecessor.state_ref.producer_height)
-                    .context("Names v1 predecessor lease expiry overflow")?,
-            "UPDATE predecessor lease does not match its reveal-height schedule"
+            declared_height <= predecessor.state_ref.producer_height,
+            "UPDATE predecessor was included before its declared REVEAL height"
         );
     }
     ensure!(
@@ -2652,24 +2672,21 @@ fn renew(args: RenewArgs) -> Result<()> {
         .tip_height
         .checked_add(1)
         .context("live RENEW construction height overflow")?;
-    let renew_height =
-        coppice_names::v1::schedule::next_anchor_height(lineage.name_id, construction_height, v1)
-            .context("no future scheduled Names v1 RENEW height exists")?;
+    let declared_height = v1
+        .renewal_opening(predecessor.data.lease_expiry)
+        .context("RENEW opening height underflow")?;
+    let expiry_height = predecessor
+        .data
+        .lease_expiry
+        .checked_sub(1)
+        .context("RENEW validity-window underflow")?;
     ensure!(
-        coppice_names::v1::schedule::is_anchor_height(lineage.name_id, renew_height, v1),
-        "derived RENEW height is not a Names v1 anchor"
+        declared_height > predecessor.state_ref.producer_height,
+        "RENEW declared height must follow the accepted predecessor"
     );
     ensure!(
-        renew_height == construction_height,
-        "RENEW must be constructed at the next scheduled height; current next height is {construction_height}, scheduled height is {renew_height}"
-    );
-    ensure!(
-        renew_height > predecessor.state_ref.producer_height,
-        "RENEW must follow the accepted predecessor anchor"
-    );
-    ensure!(
-        renew_height < predecessor.data.lease_expiry,
-        "next scheduled RENEW height is at or beyond the predecessor lease expiry"
+        construction_height >= declared_height && construction_height <= expiry_height,
+        "RENEW construction height {construction_height} is outside the validity window {declared_height}..={expiry_height}"
     );
 
     let usk = wallet_usk(&params)?;
@@ -2737,7 +2754,7 @@ fn renew(args: RenewArgs) -> Result<()> {
             scope: predecessor_scope,
             fvk: names_fvk.clone(),
             ask: names_ask.clone(),
-            operation_height: construction_height,
+            operation_height: declared_height,
             designated_action_index: RENEW_ACTION_INDEX,
             successor_seed: [if update_txid.is_some() {
                 RENEW_SUCCESSOR_SEED
@@ -2794,7 +2811,7 @@ fn renew(args: RenewArgs) -> Result<()> {
         ironwood: built,
         params,
         consensus_branch_id: BranchId::Nu6_3,
-        expiry_height: BlockHeight::from_u32(construction_height),
+        expiry_height: BlockHeight::from_u32(expiry_height),
         fallback_lock_time: 0,
     })?;
     let finalized = finalize_names_v1_pczt_io(complete)?;
@@ -2854,7 +2871,8 @@ fn renew(args: RenewArgs) -> Result<()> {
 
     println!("RENEW_PREDECESSOR_TXID={}", hex::encode(predecessor_txid));
     println!("RENEW_CURRENT_TIP={}", lineage.tip_height);
-    println!("RENEW_SCHEDULED_HEIGHT={renew_height}");
+    println!("RENEW_DECLARED_HEIGHT={declared_height}");
+    println!("RENEW_VALID_UNTIL_HEIGHT={expiry_height}");
     println!("RENEW_CONSTRUCTION_HEIGHT={construction_height}");
     println!("RENEW_NAMES_PROOF_BYTES={}", transition_proof.len());
     println!(
@@ -2941,13 +2959,13 @@ fn release(args: ReleaseArgs) -> Result<()> {
     let predecessor = lineage.full_head;
     let v1 = v1_parameters();
     {
+        let declared_height = v1
+            .anchor_height(predecessor.data.lease_expiry)
+            .context("Names v1 RENEW declared height underflow")?;
         ensure!(
             predecessor.data.sequence == 2
                 && predecessor.data.record.as_slice() == UPDATE_RECORD.as_slice()
-                && predecessor.data.lease_expiry
-                    == v1
-                        .lease_expiry(predecessor.state_ref.producer_height)
-                        .context("Names v1 predecessor lease expiry overflow")?
+                && declared_height <= predecessor.state_ref.producer_height
                 && predecessor.data.status == StateStatus::Active
                 && predecessor.data.terminal_height == 0,
             "qualified RELEASE fixture does not have the expected active sequence-two predecessor"
@@ -3306,7 +3324,7 @@ fn verify_release(args: VerifyReleaseArgs) -> Result<()> {
     );
     ensure!(
         lineage.fresh_anchor == Some(renew_state_ref),
-        "FreshResolver changed its scheduled anchor to the RELEASE state"
+        "FreshResolver changed its renewal anchor to the RELEASE state"
     );
 
     let release = lineage
@@ -3377,10 +3395,9 @@ fn verify_release(args: VerifyReleaseArgs) -> Result<()> {
             && accepted.data.owner_pk == state.owner_pk
             && accepted.data.sequence == 3
             && accepted.data.record.as_slice() == UPDATE_RECORD.as_slice()
-            && accepted.data.lease_expiry
-                == v1
-                    .lease_expiry(renew_block.height)
-                    .context("canonical RENEW lease expiry overflow")?
+            && v1
+                .anchor_height(accepted.data.lease_expiry)
+                .is_some_and(|declared| declared <= renew_block.height)
             && accepted.data.status == StateStatus::Released
             && accepted.data.terminal_height == release_block.height,
         "accepted RELEASE state values are not the expected terminal successor"
@@ -3602,13 +3619,12 @@ fn verify_release_boundary(args: VerifyReleaseBoundaryArgs) -> Result<()> {
         *state_nullifier,
     );
     ensure!(
-        coppice_names::v1::schedule::is_anchor_height(lineage.name_id, renew_block.height, v1)
-            && renew_state_ref.producer_action_index == 4
+        renew_state_ref.producer_action_index == 4
             && renew_state_ref.producer_operation_index == 0
             && release_block.height == renew_block.height + 1
             && release_state_ref.producer_action_index == 4
             && release_state_ref.producer_operation_index == 0,
-        "canonical RELEASE lineage is not a scheduled-RENEW -> next-block RELEASE chain"
+        "canonical RELEASE lineage is not a RENEW -> next-block RELEASE chain"
     );
     ensure!(
         lineage.fresh_anchor == Some(renew_state_ref),
@@ -3629,10 +3645,9 @@ fn verify_release_boundary(args: VerifyReleaseBoundaryArgs) -> Result<()> {
             && accepted.data.owner_pk == state.owner_pk
             && accepted.data.sequence == 3
             && accepted.data.record.as_slice() == UPDATE_RECORD.as_slice()
-            && accepted.data.lease_expiry
-                == v1
-                    .lease_expiry(renew_block.height)
-                    .context("canonical RENEW lease expiry overflow")?
+            && v1
+                .anchor_height(accepted.data.lease_expiry)
+                .is_some_and(|declared| declared <= renew_block.height)
             && accepted.data.status == StateStatus::Released
             && accepted.data.terminal_height == release_block.height
             && accepted.commitment == *state_commitment
@@ -4138,6 +4153,20 @@ fn verify_renew(args: VerifyRenewArgs) -> Result<()> {
         .values()
         .find(|block| block.transactions.iter().any(|tx| tx.txid == update_txid))
         .context("canonical UPDATE block missing during RENEW verification")?;
+    let update_state = update_block
+        .transactions
+        .iter()
+        .find(|transaction| transaction.txid == update_txid)
+        .and_then(|transaction| {
+            transaction
+                .operations
+                .iter()
+                .find_map(|operation| match operation {
+                    V1Operation::Update { state, .. } => Some(state),
+                    _ => None,
+                })
+        })
+        .context("canonical UPDATE state missing during RENEW verification")?;
     let renew = lineage
         .blocks
         .values()
@@ -4176,26 +4205,21 @@ fn verify_renew(args: VerifyRenewArgs) -> Result<()> {
         renew_action.commitment == *state_commitment,
         "canonical RENEW successor CMX does not match its designated action"
     );
-    let expected_renew_height = coppice_names::v1::schedule::next_anchor_height(
-        lineage.name_id,
-        update_block
-            .height
-            .checked_add(1)
-            .context("RENEW schedule height overflow")?,
-        v1,
-    )
-    .context("no scheduled RENEW height follows the accepted UPDATE")?;
+    let declared_renew_height = v1
+        .anchor_height(state.lease_expiry)
+        .context("canonical RENEW declared height underflow")?;
+    let renewal_opening = v1
+        .renewal_opening(update_state.lease_expiry)
+        .context("canonical RENEW opening height underflow")?;
     ensure!(
-        renew_block.height == expected_renew_height
-            && coppice_names::v1::schedule::is_anchor_height(
-                lineage.name_id,
-                renew_block.height,
-                v1,
-            ),
-        "canonical RENEW was not mined at the next scheduled anchor height"
+        declared_renew_height >= renewal_opening
+            && declared_renew_height < update_state.lease_expiry
+            && declared_renew_height <= renew_block.height
+            && renew_block.height < update_state.lease_expiry,
+        "canonical RENEW is outside its declared/inclusion validity window"
     );
     let expected_lease_expiry = v1
-        .lease_expiry(renew_block.height)
+        .lease_expiry(declared_renew_height)
         .context("canonical RENEW lease expiry overflow")?;
     let expected_position = ProducerPosition::new(renew_block.height, renew.tx_index, renew.txid);
     let accepted = &lineage.full_head;
@@ -4236,7 +4260,7 @@ fn verify_renew(args: VerifyRenewArgs) -> Result<()> {
     println!("NAMES_FULL_REPLAY_STATUS={:?}", lineage.full_status);
     println!("NAMES_FRESH_RESOLVER_STATUS={:?}", lineage.fresh_status);
     println!("NAMES_FULL_FRESH_MATCH=yes");
-    println!("RENEW_SCHEDULED_HEIGHT={expected_renew_height}");
+    println!("RENEW_DECLARED_HEIGHT={declared_renew_height}");
     println!("RENEW_CANONICAL_HEIGHT={}", renew_block.height);
     println!("RENEW_CANONICAL_TX_INDEX={}", renew.tx_index);
     println!("RENEW_OPERATION_INDEX={renew_operation_index}");

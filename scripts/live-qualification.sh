@@ -452,18 +452,13 @@ wait_for_zaino_tip "$COMMIT_HEIGHT_EXPECTED"
 wallet_sync_logged names-v1-commit-sync
 
 status "Names v1 REVEAL"
-run_logged names-v1-target timeout 120 "$NAMES_V1_LIVE_BIN" target \
-    --from-height "$COMMIT_HEIGHT_EXPECTED"
-TARGET_REVEAL_HEIGHT="$(sed -n 's/^TARGET_REVEAL_HEIGHT=//p' \
-    "$LOG_DIR/names-v1-target.log" | tail -1)"
-[[ "$TARGET_REVEAL_HEIGHT" =~ ^[0-9]+$ ]] || die "v1 target height missing"
-CURRENT_TIP="$(zakura_tip_height)"
-PRE_REVEAL_TIP=$((TARGET_REVEAL_HEIGHT - 1))
-(( PRE_REVEAL_TIP >= CURRENT_TIP )) || die "v1 target is behind current tip"
-if (( PRE_REVEAL_TIP > CURRENT_TIP )); then
-    rpc_generate "$((PRE_REVEAL_TIP - CURRENT_TIP))"
-    wait_for_zaino_tip "$PRE_REVEAL_TIP"
-fi
+# Deliberately advance beyond the declared lease-start height before building
+# REVEAL. This qualifies public-network inclusion after the proof height while
+# the COMMIT remains inside its TTL.
+REVEAL_DELAY_BLOCKS=2
+rpc_generate "$REVEAL_DELAY_BLOCKS"
+PRE_REVEAL_TIP=$((COMMIT_HEIGHT_EXPECTED + REVEAL_DELAY_BLOCKS))
+wait_for_zaino_tip "$PRE_REVEAL_TIP"
 wallet_sync_logged names-v1-reveal-sync
 run_logged names-v1-reveal timeout 1800 "$NAMES_V1_LIVE_BIN" reveal \
     --wallet-dir "$WALLET_DIR" --rpc-url "$ZAKURA_RPC_URL" \
@@ -472,6 +467,15 @@ REVEAL_TXID="$(rg -a -o '^REVEAL_TXID=[0-9a-f]{64}$' \
     "$LOG_DIR/names-v1-reveal.log" | tail -1 | cut -d= -f2)"
 [[ -n "$REVEAL_TXID" ]] || die "v1 REVEAL did not emit a transaction id"
 REVEAL_HEIGHT_EXPECTED=$((PRE_REVEAL_TIP + 1))
+REVEAL_DECLARED_HEIGHT="$(sed -n 's/^REVEAL_DECLARED_HEIGHT=//p' \
+    "$LOG_DIR/names-v1-reveal.log" | tail -1)"
+REVEAL_VALID_UNTIL_HEIGHT="$(sed -n 's/^REVEAL_VALID_UNTIL_HEIGHT=//p' \
+    "$LOG_DIR/names-v1-reveal.log" | tail -1)"
+[[ "$REVEAL_DECLARED_HEIGHT" == "$((COMMIT_HEIGHT_EXPECTED + 1))" ]] \
+    || die "REVEAL declared height is not the first post-COMMIT block"
+(( REVEAL_HEIGHT_EXPECTED > REVEAL_DECLARED_HEIGHT \
+    && REVEAL_HEIGHT_EXPECTED <= REVEAL_VALID_UNTIL_HEIGHT )) \
+    || die "REVEAL canonical height is outside its delayed inclusion window"
 rpc_generate 1
 wait_for_zaino_tip "$REVEAL_HEIGHT_EXPECTED"
 wallet_sync_logged names-v1-reveal-mined-sync
@@ -501,12 +505,18 @@ run_logged names-v1-verify-update timeout 1200 "$NAMES_V1_LIVE_BIN" verify-updat
 rg -a -q '^NAMES_FULL_FRESH_MATCH=yes$' "$LOG_DIR/names-v1-verify-update.log" \
     || die "full replay and FreshResolver disagree after UPDATE"
 
-status "Reach the next v1 RENEW anchor"
+status "Reach the v1 RENEW window"
 wallet_sync_logged names-v1-renew-pre-sync
-RENEW_TARGET_HEIGHT="$(timeout 120 "$NAMES_V1_LIVE_BIN" target \
-    --from-height "$(($(zakura_tip_height) + 1))" \
-    | sed -n 's/^TARGET_REVEAL_HEIGHT=//p' | tail -1)"
-[[ "$RENEW_TARGET_HEIGHT" =~ ^[0-9]+$ ]] || die "v1 RENEW target height missing"
+REVEAL_LEASE_EXPIRY="$(sed -n 's/^LEASE_EXPIRY=//p' \
+    "$LOG_DIR/names-v1-reveal.log" | tail -1)"
+[[ "$REVEAL_LEASE_EXPIRY" =~ ^[0-9]+$ ]] || die "v1 REVEAL lease expiry missing"
+RENEWAL_WINDOW_BLOCKS="$(sed -n 's/^RENEWAL_WINDOW_BLOCKS=//p' \
+    "$LOG_DIR/names-v1-reveal.log" | tail -1)"
+[[ "$RENEWAL_WINDOW_BLOCKS" =~ ^[0-9]+$ ]] || die "v1 renewal window missing"
+RENEW_DECLARED_EXPECTED=$((REVEAL_LEASE_EXPIRY - RENEWAL_WINDOW_BLOCKS))
+# Construct two blocks into the renewal window so canonical inclusion is
+# later than the declared RENEW proof height.
+RENEW_TARGET_HEIGHT=$((RENEW_DECLARED_EXPECTED + 2))
 RENEW_BLOCKS=$((RENEW_TARGET_HEIGHT - 1 - $(zakura_tip_height)))
 (( RENEW_BLOCKS >= 0 )) || die "v1 RENEW target is behind current tip"
 if (( RENEW_BLOCKS > 0 )); then
@@ -522,6 +532,15 @@ run_logged names-v1-renew timeout 1800 "$NAMES_V1_LIVE_BIN" renew \
 RENEW_TXID="$(rg -a -o '^RENEW_TXID=[0-9a-f]{64}$' \
     "$LOG_DIR/names-v1-renew.log" | tail -1 | cut -d= -f2)"
 [[ -n "$RENEW_TXID" ]] || die "v1 RENEW did not emit a transaction id"
+RENEW_DECLARED_HEIGHT="$(sed -n 's/^RENEW_DECLARED_HEIGHT=//p' \
+    "$LOG_DIR/names-v1-renew.log" | tail -1)"
+RENEW_VALID_UNTIL_HEIGHT="$(sed -n 's/^RENEW_VALID_UNTIL_HEIGHT=//p' \
+    "$LOG_DIR/names-v1-renew.log" | tail -1)"
+[[ "$RENEW_DECLARED_HEIGHT" == "$RENEW_DECLARED_EXPECTED" ]] \
+    || die "RENEW declared height does not match the renewal opening"
+(( RENEW_TARGET_HEIGHT > RENEW_DECLARED_HEIGHT \
+    && RENEW_TARGET_HEIGHT <= RENEW_VALID_UNTIL_HEIGHT )) \
+    || die "RENEW canonical height is outside its delayed inclusion window"
 rpc_generate 1
 wait_for_zaino_tip "$RENEW_TARGET_HEIGHT"
 wallet_sync_logged names-v1-renew-mined-sync
@@ -532,7 +551,7 @@ rg -a -q '^NAMES_FULL_FRESH_MATCH=yes$' "$LOG_DIR/names-v1-verify-renew.log" \
     || die "full replay and FreshResolver disagree after RENEW"
 
 status "Names v1 RELEASE"
-RELEASE_HEIGHT_EXPECTED=$((RENEW_TARGET_HEIGHT + 1))
+RELEASE_HEIGHT_EXPECTED=$(( $(zakura_tip_height) + 1 ))
 run_logged names-v1-release timeout 1800 "$NAMES_V1_LIVE_BIN" release \
     --wallet-dir "$WALLET_DIR" --rpc-url "$ZAKURA_RPC_URL" \
     --reveal-txid "$REVEAL_TXID" --update-txid "$UPDATE_TXID" \
