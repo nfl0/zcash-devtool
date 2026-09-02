@@ -1366,18 +1366,14 @@ dependencies = [
 [[package]]
 name = "coppice-names"
 version = "0.1.0"
-source = "git+https://github.com/nfl0/coppice-names.git?rev=edee95b8cf7b78469d705f6f49688930728819b2#edee95b8cf7b78469d705f6f49688930728819b2"
+source = "git+https://github.com/nfl0/coppice-names.git?rev=41360af45afd261919c771e7e6f88eb9b55d5a56#41360af45afd261919c771e7e6f88eb9b55d5a56"
 dependencies = [
  "blake2b_simd",
  "coppice",
  "hex",
- "postcard",
  "rand_core 0.10.1",
  "serde",
- "serde_json",
- "sha2 0.10.9",
  "zakura-halo2-gadgets",
- "zakura-halo2-proofs",
  "zakura-orchard",
  "zakura-pasta-curves",
  "zcash_address",
@@ -1386,21 +1382,21 @@ dependencies = [
 [[package]]
 name = "coppice-names-wallet"
 version = "0.1.0"
-source = "git+https://github.com/nfl0/coppice-names.git?rev=edee95b8cf7b78469d705f6f49688930728819b2#edee95b8cf7b78469d705f6f49688930728819b2"
+source = "git+https://github.com/nfl0/coppice-names.git?rev=41360af45afd261919c771e7e6f88eb9b55d5a56#41360af45afd261919c771e7e6f88eb9b55d5a56"
 dependencies = [
  "anyhow",
+ "blake2b_simd",
  "coppice",
  "coppice-names",
  "rand 0.10.2",
  "rand_core 0.10.1",
  "zakura-client-backend",
- "zakura-keys",
  "zakura-orchard",
+ "zakura-pasta-curves",
  "zakura-pczt",
  "zakura-primitives",
- "zcash_address",
  "zcash_protocol",
- "zip321",
+ "zeroize",
 ]
 
 [[package]]
@@ -9535,7 +9531,7 @@ dependencies = [
 [[package]]
 name = "zakura-orchard"
 version = "1.0.0"
-source = "git+https://github.com/nfl0/orchard-coppice.git?rev=0e09398970130b9510ce5011129acafc5039e79f#0e09398970130b9510ce5011129acafc5039e79f"
+source = "git+https://github.com/nfl0/orchard-coppice.git?rev=51c374d9d36ac1728b00d8978456d7d98a232d82#51c374d9d36ac1728b00d8978456d7d98a232d82"
 dependencies = [
  "aes",
  "bitvec",

@@ -3,17 +3,16 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-# Disposable Names v1 live qualification. Phase 1 checks the local
-# Zcash/Zakura/Zaino/devtool plumbing and Ironwood funding. Phase 2 runs the
-# canonical COMMIT -> REVEAL -> UPDATE -> RENEW -> RELEASE lifecycle and checks
-# the exact Released -> Expired boundary. Names v1 replay and FreshResolver
-# checks are performed by names-v1-live itself.
+# Disposable replacement Names live qualification. Phase 1 checks the local
+# Zcash/Zakura/Zaino/devtool plumbing and Ironwood funding. Phase 2 mines a
+# zero-value COMMIT and a real hidden-authority REVEAL, then resolves the name
+# through Core-authenticated exact replay.
 
 usage() {
     cat <<'EOF'
 Usage: live-qualification.sh [--phase N] [--keep-state]
 
-  --phase N       1 for infrastructure, 2 for the full Names v1 lifecycle
+  --phase N       1 for infrastructure, 2 for replacement COMMIT -> REVEAL
                   (default: 2).
   --keep-state    Preserve the disposable run directory after success.
   -h|--help       Show this help.
@@ -55,7 +54,7 @@ BIN_DIR="$ROOT_DIR/bin"
 ZAKURA_BIN="$BIN_DIR/zakurad"
 ZAINO_BIN="$BIN_DIR/zainod"
 DEVTOOL_BIN="$BIN_DIR/zcash-devtool"
-NAMES_V1_LIVE_BIN="$ROOT_DIR/zcash-devtool/target/debug/names-v1-live"
+NAMES_LIVE_BIN="$ROOT_DIR/zcash-devtool/target/debug/names-live"
 
 ZAKURA_RPC_ADDR="127.0.0.1:18232"
 ZAKURA_RPC_URL="http://$ZAKURA_RPC_ADDR"
@@ -66,7 +65,7 @@ ZAINO_GRPC_URL="http://$ZAINO_GRPC_ADDR"
 WALLET_MNEMONIC="abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon art"
 SAPLING_DISCARD_MNEMONIC="abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about"
 
-WORK_DIR="$(mktemp -d /tmp/coppice-names-v1-live.XXXXXX)"
+WORK_DIR="$(mktemp -d /tmp/coppice-names-live.XXXXXX)"
 CONFIG_DIR="$WORK_DIR/config"
 STATE_DIR="$WORK_DIR/state"
 ZAKURA_STATE_DIR="$STATE_DIR/zakura"
@@ -361,7 +360,7 @@ path = "$ZAINO_STATE_DIR/database"
 EOF
 }
 
-status "Check prerequisites for Names v1 phase $TARGET_PHASE"
+status "Check prerequisites for replacement Names phase $TARGET_PHASE"
 for command in curl jq python3 rg timeout cargo; do
     require_command "$command"
 done
@@ -369,13 +368,13 @@ require_executable "$ZAKURA_BIN"
 require_executable "$ZAINO_BIN"
 require_executable "$DEVTOOL_BIN"
 
-status "Build the Names v1 live entry point"
-if ! (cd "$ROOT_DIR/zcash-devtool" && cargo build --offline --bin names-v1-live) \
-    >"$LOG_DIR/names-v1-live-build.log" 2>&1; then
-    tail -100 "$LOG_DIR/names-v1-live-build.log" >&2 || true
-    die "could not build names-v1-live"
+status "Build the replacement Names live entry point"
+if ! (cd "$ROOT_DIR/zcash-devtool" && cargo build --offline --bin names-live) \
+    >"$LOG_DIR/names-live-build.log" 2>&1; then
+    tail -100 "$LOG_DIR/names-live-build.log" >&2 || true
+    die "could not build names-live"
 fi
-require_executable "$NAMES_V1_LIVE_BIN"
+require_executable "$NAMES_LIVE_BIN"
 
 status "Derive disposable Regtest addresses"
 run_logged derive-address "$DEVTOOL_BIN" wallet derive-address \
@@ -407,7 +406,7 @@ status "Initialize and fund the disposable wallet"
 rpc_generate 1
 wait_for_zaino_tip 1
 if printf '%s\n' "$WALLET_MNEMONIC" | timeout 240 "$DEVTOOL_BIN" wallet \
-    --wallet-dir "$WALLET_DIR" init --name names-v1-live \
+    --wallet-dir "$WALLET_DIR" init --name names-live \
     --identity "$IDENTITY_FILE" --network regtest --birthday 1 \
     --activation-heights "$ACTIVATION_FILE" --server "$ZAINO_GRPC_ADDR" \
     --connection direct >"$LOG_DIR/wallet-init.log" 2>&1; then
@@ -435,172 +434,87 @@ printf '[PASS] Ironwood funding=%s zatoshi\n' \
     "$(jq -r '.ironwood_spendable' <<<"$FUNDED_BALANCE")"
 
 if (( TARGET_PHASE == 1 )); then
-    printf '\n[PASS] Names v1 infrastructure qualification complete\n'
+    printf '\n[PASS] replacement Names infrastructure qualification complete\n'
     exit 0
 fi
 
-export NAMES_V1_LIVE_MNEMONIC="$WALLET_MNEMONIC"
-status "Names v1 COMMIT"
-run_logged names-v1-commit timeout 900 "$NAMES_V1_LIVE_BIN" commit \
-    --wallet-dir "$WALLET_DIR" --rpc-url "$ZAKURA_RPC_URL"
+export NAMES_LIVE_MNEMONIC="$WALLET_MNEMONIC"
+
+status "Select the next feasible name-specific REVEAL window"
+CURRENT_TIP="$(zakura_tip_height)"
+run_logged names-target timeout 120 "$NAMES_LIVE_BIN" target \
+    --from-height "$CURRENT_TIP"
+REVEAL_HEIGHT="$(sed -n 's/^TARGET_REVEAL_HEIGHT=//p' \
+    "$LOG_DIR/names-target.log" | tail -1)"
+[[ "$REVEAL_HEIGHT" =~ ^[0-9]+$ ]] || die "target REVEAL height missing"
+COMMIT_MATURITY="$(sed -n 's/^COMMIT_MATURITY_BLOCKS=//p' \
+    "$LOG_DIR/names-target.log" | tail -1)"
+[[ "$COMMIT_MATURITY" =~ ^[0-9]+$ ]] || die "COMMIT maturity missing"
+PRE_COMMIT_TIP=$((REVEAL_HEIGHT - COMMIT_MATURITY - 1))
+ADVANCE_TO_COMMIT=$((PRE_COMMIT_TIP - CURRENT_TIP))
+(( ADVANCE_TO_COMMIT >= 0 )) || die "selected COMMIT height is behind tip"
+if (( ADVANCE_TO_COMMIT > 0 )); then
+    rpc_generate "$ADVANCE_TO_COMMIT"
+    wait_for_zaino_tip "$PRE_COMMIT_TIP"
+    wallet_sync_logged names-pre-commit-sync
+fi
+
+status "Mine a zero-value generic-route COMMIT"
+run_logged names-commit timeout 900 "$NAMES_LIVE_BIN" commit \
+    --wallet-dir "$WALLET_DIR" --rpc-url "$ZAKURA_RPC_URL" \
+    --reveal-height "$REVEAL_HEIGHT"
 COMMIT_TXID="$(rg -a -o '^COMMIT_TXID=[0-9a-f]{64}$' \
-    "$LOG_DIR/names-v1-commit.log" | tail -1 | cut -d= -f2)"
-[[ -n "$COMMIT_TXID" ]] || die "v1 COMMIT did not emit a transaction id"
-COMMIT_HEIGHT_EXPECTED=$(( $(zakura_tip_height) + 1 ))
+    "$LOG_DIR/names-commit.log" | tail -1 | cut -d= -f2)"
+[[ -n "$COMMIT_TXID" ]] || die "COMMIT did not emit a transaction id"
+COMMIT_HEIGHT=$((PRE_COMMIT_TIP + 1))
 rpc_generate 1
-wait_for_zaino_tip "$COMMIT_HEIGHT_EXPECTED"
-wallet_sync_logged names-v1-commit-sync
+wait_for_zaino_tip "$COMMIT_HEIGHT"
+wallet_sync_logged names-commit-sync
+rg -a -q '^COMMIT_CARRIER_VALUE=0$' "$LOG_DIR/names-commit.log" \
+    || die "COMMIT carrier is not zero value"
 
-status "Names v1 REVEAL"
-# Deliberately advance beyond the declared lease-start height before building
-# REVEAL. This qualifies public-network inclusion after the proof height while
-# the COMMIT remains inside its TTL.
-REVEAL_DELAY_BLOCKS=2
-rpc_generate "$REVEAL_DELAY_BLOCKS"
-PRE_REVEAL_TIP=$((COMMIT_HEIGHT_EXPECTED + REVEAL_DELAY_BLOCKS))
-wait_for_zaino_tip "$PRE_REVEAL_TIP"
-wallet_sync_logged names-v1-reveal-sync
-run_logged names-v1-reveal timeout 1800 "$NAMES_V1_LIVE_BIN" reveal \
+status "Create the exact one-ZEC wallet bond note"
+run_devtool_logged prepare-bond wallet --wallet-dir "$WALLET_DIR" send \
+    --identity "$IDENTITY_FILE" --address "$MINER_UA" --value 100000000 \
+    --min-confirmations 1 --server "$ZAINO_GRPC_ADDR" --connection direct
+BOND_HEIGHT=$((COMMIT_HEIGHT + 1))
+rpc_generate 1
+wait_for_zaino_tip "$BOND_HEIGHT"
+wallet_sync_logged names-bond-sync
+
+status "Reach the selected daily REVEAL window"
+PRE_REVEAL_TIP=$((REVEAL_HEIGHT - 1))
+REVEAL_ADVANCE=$((PRE_REVEAL_TIP - BOND_HEIGHT))
+(( REVEAL_ADVANCE >= 0 )) || die "bond preparation passed REVEAL window"
+if (( REVEAL_ADVANCE > 0 )); then
+    rpc_generate "$REVEAL_ADVANCE"
+    wait_for_zaino_tip "$PRE_REVEAL_TIP"
+    wallet_sync_logged names-pre-reveal-sync
+fi
+
+status "Build, prove, sign, and mine replacement REVEAL"
+run_logged names-reveal timeout 1800 "$NAMES_LIVE_BIN" reveal \
     --wallet-dir "$WALLET_DIR" --rpc-url "$ZAKURA_RPC_URL" \
-    --commit-txid "$COMMIT_TXID"
+    --commit-txid "$COMMIT_TXID" --reveal-height "$REVEAL_HEIGHT" \
+    --ua "$MINER_UA"
 REVEAL_TXID="$(rg -a -o '^REVEAL_TXID=[0-9a-f]{64}$' \
-    "$LOG_DIR/names-v1-reveal.log" | tail -1 | cut -d= -f2)"
-[[ -n "$REVEAL_TXID" ]] || die "v1 REVEAL did not emit a transaction id"
-REVEAL_HEIGHT_EXPECTED=$((PRE_REVEAL_TIP + 1))
-REVEAL_DECLARED_HEIGHT="$(sed -n 's/^REVEAL_DECLARED_HEIGHT=//p' \
-    "$LOG_DIR/names-v1-reveal.log" | tail -1)"
-REVEAL_VALID_UNTIL_HEIGHT="$(sed -n 's/^REVEAL_VALID_UNTIL_HEIGHT=//p' \
-    "$LOG_DIR/names-v1-reveal.log" | tail -1)"
-[[ "$REVEAL_DECLARED_HEIGHT" == "$((COMMIT_HEIGHT_EXPECTED + 1))" ]] \
-    || die "REVEAL declared height is not the first post-COMMIT block"
-(( REVEAL_HEIGHT_EXPECTED > REVEAL_DECLARED_HEIGHT \
-    && REVEAL_HEIGHT_EXPECTED <= REVEAL_VALID_UNTIL_HEIGHT )) \
-    || die "REVEAL canonical height is outside its delayed inclusion window"
+    "$LOG_DIR/names-reveal.log" | tail -1 | cut -d= -f2)"
+[[ -n "$REVEAL_TXID" ]] || die "REVEAL did not emit a transaction id"
+rg -a -q '^REVEAL_CARRIER_VALUE=0$' "$LOG_DIR/names-reveal.log" \
+    || die "REVEAL carrier is not zero value"
 rpc_generate 1
-wait_for_zaino_tip "$REVEAL_HEIGHT_EXPECTED"
-wallet_sync_logged names-v1-reveal-mined-sync
-run_logged names-v1-verify timeout 1200 "$NAMES_V1_LIVE_BIN" verify \
-    --rpc-url "$ZAKURA_RPC_URL" --commit-txid "$COMMIT_TXID" \
-    --reveal-txid "$REVEAL_TXID"
-rg -a -q '^NAMES_FULL_REPLAY_STATUS=Active$' "$LOG_DIR/names-v1-verify.log" \
-    || die "full replay did not accept the v1 REVEAL"
-rg -a -q '^NAMES_FRESH_RESOLVER_STATUS=Active$' "$LOG_DIR/names-v1-verify.log" \
-    || die "FreshResolver did not accept the v1 REVEAL"
-rg -a -q '^NAMES_FULL_FRESH_MATCH=yes$' "$LOG_DIR/names-v1-verify.log" \
-    || die "full replay and FreshResolver disagree after REVEAL"
-status "Names v1 UPDATE"
-UPDATE_HEIGHT_EXPECTED=$(( $(zakura_tip_height) + 1 ))
-run_logged names-v1-update timeout 1800 "$NAMES_V1_LIVE_BIN" update \
-    --wallet-dir "$WALLET_DIR" --rpc-url "$ZAKURA_RPC_URL" \
-    --reveal-txid "$REVEAL_TXID"
-UPDATE_TXID="$(rg -a -o '^UPDATE_TXID=[0-9a-f]{64}$' \
-    "$LOG_DIR/names-v1-update.log" | tail -1 | cut -d= -f2)"
-[[ -n "$UPDATE_TXID" ]] || die "v1 UPDATE did not emit a transaction id"
-rpc_generate 1
-wait_for_zaino_tip "$UPDATE_HEIGHT_EXPECTED"
-wallet_sync_logged names-v1-update-sync
-run_logged names-v1-verify-update timeout 1200 "$NAMES_V1_LIVE_BIN" verify-update \
-    --rpc-url "$ZAKURA_RPC_URL" --reveal-txid "$REVEAL_TXID" \
-    --update-txid "$UPDATE_TXID"
-rg -a -q '^NAMES_FULL_FRESH_MATCH=yes$' "$LOG_DIR/names-v1-verify-update.log" \
-    || die "full replay and FreshResolver disagree after UPDATE"
+wait_for_zaino_tip "$REVEAL_HEIGHT"
+wallet_sync_logged names-reveal-sync
 
-status "Reach the v1 RENEW window"
-wallet_sync_logged names-v1-renew-pre-sync
-REVEAL_LEASE_EXPIRY="$(sed -n 's/^LEASE_EXPIRY=//p' \
-    "$LOG_DIR/names-v1-reveal.log" | tail -1)"
-[[ "$REVEAL_LEASE_EXPIRY" =~ ^[0-9]+$ ]] || die "v1 REVEAL lease expiry missing"
-RENEWAL_WINDOW_BLOCKS="$(sed -n 's/^RENEWAL_WINDOW_BLOCKS=//p' \
-    "$LOG_DIR/names-v1-reveal.log" | tail -1)"
-[[ "$RENEWAL_WINDOW_BLOCKS" =~ ^[0-9]+$ ]] || die "v1 renewal window missing"
-RENEW_DECLARED_EXPECTED=$((REVEAL_LEASE_EXPIRY - RENEWAL_WINDOW_BLOCKS))
-# Construct two blocks into the renewal window so canonical inclusion is
-# later than the declared RENEW proof height.
-RENEW_TARGET_HEIGHT=$((RENEW_DECLARED_EXPECTED + 2))
-RENEW_BLOCKS=$((RENEW_TARGET_HEIGHT - 1 - $(zakura_tip_height)))
-(( RENEW_BLOCKS >= 0 )) || die "v1 RENEW target is behind current tip"
-if (( RENEW_BLOCKS > 0 )); then
-    rpc_generate "$RENEW_BLOCKS"
-    wait_for_zaino_tip "$((RENEW_TARGET_HEIGHT - 1))"
-    wallet_sync_logged names-v1-renew-sync
-fi
+status "Resolve the mined name through authenticated exact replay"
+run_logged names-verify timeout 1200 "$NAMES_LIVE_BIN" verify \
+    --rpc-url "$ZAKURA_RPC_URL" --reveal-txid "$REVEAL_TXID" --ua "$MINER_UA"
+rg -a -q '^NAMES_EXACT_STATUS=Active$' "$LOG_DIR/names-verify.log" \
+    || die "exact resolver did not accept the replacement REVEAL"
+rg -a -q "^NAMES_HEAD_TXID=$REVEAL_TXID$" "$LOG_DIR/names-verify.log" \
+    || die "resolved head does not match the mined REVEAL"
 
-status "Names v1 RENEW"
-run_logged names-v1-renew timeout 1800 "$NAMES_V1_LIVE_BIN" renew \
-    --wallet-dir "$WALLET_DIR" --rpc-url "$ZAKURA_RPC_URL" \
-    --reveal-txid "$REVEAL_TXID" --update-txid "$UPDATE_TXID"
-RENEW_TXID="$(rg -a -o '^RENEW_TXID=[0-9a-f]{64}$' \
-    "$LOG_DIR/names-v1-renew.log" | tail -1 | cut -d= -f2)"
-[[ -n "$RENEW_TXID" ]] || die "v1 RENEW did not emit a transaction id"
-RENEW_DECLARED_HEIGHT="$(sed -n 's/^RENEW_DECLARED_HEIGHT=//p' \
-    "$LOG_DIR/names-v1-renew.log" | tail -1)"
-RENEW_VALID_UNTIL_HEIGHT="$(sed -n 's/^RENEW_VALID_UNTIL_HEIGHT=//p' \
-    "$LOG_DIR/names-v1-renew.log" | tail -1)"
-[[ "$RENEW_DECLARED_HEIGHT" == "$RENEW_DECLARED_EXPECTED" ]] \
-    || die "RENEW declared height does not match the renewal opening"
-(( RENEW_TARGET_HEIGHT > RENEW_DECLARED_HEIGHT \
-    && RENEW_TARGET_HEIGHT <= RENEW_VALID_UNTIL_HEIGHT )) \
-    || die "RENEW canonical height is outside its delayed inclusion window"
-rpc_generate 1
-wait_for_zaino_tip "$RENEW_TARGET_HEIGHT"
-wallet_sync_logged names-v1-renew-mined-sync
-run_logged names-v1-verify-renew timeout 1200 "$NAMES_V1_LIVE_BIN" verify-renew \
-    --rpc-url "$ZAKURA_RPC_URL" --reveal-txid "$REVEAL_TXID" \
-    --update-txid "$UPDATE_TXID" --renew-txid "$RENEW_TXID"
-rg -a -q '^NAMES_FULL_FRESH_MATCH=yes$' "$LOG_DIR/names-v1-verify-renew.log" \
-    || die "full replay and FreshResolver disagree after RENEW"
-
-status "Names v1 RELEASE"
-RELEASE_HEIGHT_EXPECTED=$(( $(zakura_tip_height) + 1 ))
-run_logged names-v1-release timeout 1800 "$NAMES_V1_LIVE_BIN" release \
-    --wallet-dir "$WALLET_DIR" --rpc-url "$ZAKURA_RPC_URL" \
-    --reveal-txid "$REVEAL_TXID" --update-txid "$UPDATE_TXID" \
-    --renew-txid "$RENEW_TXID"
-RELEASE_TXID="$(rg -a -o '^RELEASE_TXID=[0-9a-f]{64}$' \
-    "$LOG_DIR/names-v1-release.log" | tail -1 | cut -d= -f2)"
-[[ -n "$RELEASE_TXID" ]] || die "v1 RELEASE did not emit a transaction id"
-rpc_generate 1
-wait_for_zaino_tip "$RELEASE_HEIGHT_EXPECTED"
-wallet_sync_logged names-v1-release-mined-sync
-run_logged names-v1-verify-release timeout 1200 "$NAMES_V1_LIVE_BIN" verify-release \
-    --rpc-url "$ZAKURA_RPC_URL" --reveal-txid "$REVEAL_TXID" \
-    --update-txid "$UPDATE_TXID" --renew-txid "$RENEW_TXID" \
-    --release-txid "$RELEASE_TXID"
-rg -a -q '^NAMES_FULL_FRESH_MATCH=yes$' "$LOG_DIR/names-v1-verify-release.log" \
-    || die "full replay and FreshResolver disagree after RELEASE"
-
-status "Check the exact Released -> Expired boundary"
-CLAIMABLE_HEIGHT="$(rg -a -o '^CLAIMABLE_HEIGHT=[0-9]+$' \
-    "$LOG_DIR/names-v1-verify-release.log" | tail -1 | cut -d= -f2)"
-[[ "$CLAIMABLE_HEIGHT" =~ ^[0-9]+$ ]] || die "claimability height missing"
-LAST_BLOCKED_HEIGHT=$((CLAIMABLE_HEIGHT - 1))
-BOUNDARY_BLOCKS=$((LAST_BLOCKED_HEIGHT - $(zakura_tip_height)))
-(( BOUNDARY_BLOCKS >= 0 )) || die "claimability boundary is behind current tip"
-if (( BOUNDARY_BLOCKS > 0 )); then
-    rpc_generate "$BOUNDARY_BLOCKS"
-    wait_for_zaino_tip "$LAST_BLOCKED_HEIGHT"
-    wallet_sync_logged names-v1-boundary-released-sync
-fi
-run_logged names-v1-boundary-released timeout 1200 "$NAMES_V1_LIVE_BIN" \
-    verify-release-boundary --rpc-url "$ZAKURA_RPC_URL" \
-    --reveal-txid "$REVEAL_TXID" --update-txid "$UPDATE_TXID" \
-    --renew-txid "$RENEW_TXID" --release-txid "$RELEASE_TXID" \
-    --expected-status released
-rg -a -q '^NAMES_FULL_REPLAY_STATUS=Released$' \
-    "$LOG_DIR/names-v1-boundary-released.log" \
-    || die "last blocked height was not Released"
-rpc_generate 1
-wait_for_zaino_tip "$CLAIMABLE_HEIGHT"
-wallet_sync_logged names-v1-boundary-expired-sync
-run_logged names-v1-boundary-expired timeout 1200 "$NAMES_V1_LIVE_BIN" \
-    verify-release-boundary --rpc-url "$ZAKURA_RPC_URL" \
-    --reveal-txid "$REVEAL_TXID" --update-txid "$UPDATE_TXID" \
-    --renew-txid "$RENEW_TXID" --release-txid "$RELEASE_TXID" \
-    --expected-status expired
-rg -a -q '^NAMES_FULL_REPLAY_STATUS=Expired$' \
-    "$LOG_DIR/names-v1-boundary-expired.log" \
-    || die "claimability height was not Expired"
-
-printf '\n[PASS] full Names v1 live qualification complete\n'
-printf '[PASS] COMMIT=%s REVEAL=%s UPDATE=%s RENEW=%s RELEASE=%s\n' \
-    "$COMMIT_TXID" "$REVEAL_TXID" "$UPDATE_TXID" "$RENEW_TXID" "$RELEASE_TXID"
+printf '\n[PASS] replacement Names COMMIT -> REVEAL live qualification complete\n'
+printf 'COMMIT_TXID=%s\nREVEAL_TXID=%s\nREVEAL_HEIGHT=%s\n' \
+    "$COMMIT_TXID" "$REVEAL_TXID" "$REVEAL_HEIGHT"
+exit 0
