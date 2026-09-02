@@ -16,8 +16,8 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(zcash_unstable, values("nu
 anyhow = "1"
 coppice = { path = "../coppice/crates/coppice" }
 coppice-librustzcash = { path = "../coppice/crates/coppice-librustzcash" }
-coppice-names = { git = "https://github.com/nfl0/coppice-names.git", rev = "41360af45afd261919c771e7e6f88eb9b55d5a56" }
-coppice-names-wallet = { git = "https://github.com/nfl0/coppice-names.git", rev = "41360af45afd261919c771e7e6f88eb9b55d5a56" }
+coppice-names = { git = "https://github.com/nfl0/coppice-names.git", rev = "ee252fbd75a4e749c11254ebf601bdd0cd37060e" }
+coppice-names-wallet = { git = "https://github.com/nfl0/coppice-names.git", rev = "ee252fbd75a4e749c11254ebf601bdd0cd37060e" }
 coppice-zcash-rpc = { path = "../coppice/crates/coppice-zcash-rpc" }
 bip0039 = { version = "0.14", features = ["std", "all-languages"] }
 bip32 = { version = "=0.6.0-pre.1", default-features = false, features = ["secp256k1-ffi"] }

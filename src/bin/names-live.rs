@@ -1,6 +1,7 @@
 //! Disposable live qualification for the replacement Coppice Names protocol.
 
 use std::{
+    collections::BTreeMap,
     num::NonZeroU32,
     num::NonZeroUsize,
     path::{Path, PathBuf},
@@ -26,7 +27,7 @@ use coppice_names::{
     publication::PublicationRoute,
     reducer::{Block, Lifecycle},
     resolver::ExactResolver,
-    transport::inspect_exact_name_block,
+    transport::{authenticated_action_position, inspect_exact_name_block},
 };
 use coppice_names_wallet::{
     builder::{
@@ -175,6 +176,11 @@ struct VerifyArgs {
 type LiveSource =
     coppice_zcash_rpc::RpcCanonicalBlockSource<LocalNetwork, coppice_zcash_rpc::HttpTransport>;
 type LiveWallet = WalletDb<rusqlite::Connection, LocalNetwork, SystemClock, ThreadRng>;
+
+struct ExactScan {
+    blocks: Vec<Block>,
+    action_positions: BTreeMap<([u8; 32], u32), incrementalmerkletree::Position>,
+}
 
 fn debug_result<T, E: std::fmt::Debug>(result: std::result::Result<T, E>) -> Result<T> {
     result.map_err(|error| anyhow::anyhow!("{error:?}"))
@@ -498,28 +504,14 @@ fn submit_names_transaction(
 }
 
 fn action_position(
-    blocks: &[Block],
+    scan: &ExactScan,
     txid: [u8; 32],
     action_index: u32,
 ) -> Result<incrementalmerkletree::Position> {
-    ensure!(
-        RUNTIME_ACTIVATION_HEIGHT == 1,
-        "live action-position derivation requires an empty activation frontier"
-    );
-    let mut position = 0u64;
-    for block in blocks {
-        for transaction in &block.transactions {
-            for action in &transaction.actions {
-                if transaction.txid == txid && action.action_index == action_index {
-                    return Ok(incrementalmerkletree::Position::from(position));
-                }
-                position = position
-                    .checked_add(1)
-                    .context("Ironwood action position overflow")?;
-            }
-        }
-    }
-    anyhow::bail!("designated action position was not found")
+    scan.action_positions
+        .get(&(txid, action_index))
+        .copied()
+        .context("Core-authenticated designated action position was not found")
 }
 
 fn parse_txid(value: &str) -> Result<[u8; 32]> {
@@ -529,7 +521,7 @@ fn parse_txid(value: &str) -> Result<[u8; 32]> {
         .map_err(|_| anyhow::anyhow!("transaction id must contain 32 bytes"))
 }
 
-fn scan_exact(rpc_url: &str, deployment: DeploymentParameters, name: &Name) -> Result<Vec<Block>> {
+fn scan_exact(rpc_url: &str, deployment: DeploymentParameters, name: &Name) -> Result<ExactScan> {
     let params = local_consensus();
     let runtime_parameters = runtime_parameters()?;
     ensure!(
@@ -571,6 +563,7 @@ fn scan_exact(rpc_url: &str, deployment: DeploymentParameters, name: &Name) -> R
     ))?;
     let schedule = deployment.schedule(deployment_id);
     let mut blocks = Vec::new();
+    let mut action_positions = BTreeMap::new();
     for height in RUNTIME_ACTIVATION_HEIGHT..=tip.height {
         let compact = if height == RUNTIME_ACTIVATION_HEIGHT {
             first.clone()
@@ -593,6 +586,25 @@ fn scan_exact(rpc_url: &str, deployment: DeploymentParameters, name: &Name) -> R
             additional,
         )
         .map_err(|error| anyhow::anyhow!("apply canonical block {height}: {error:?}"))?;
+        for transaction in applied.core().transactions() {
+            for action_index in 0..transaction.ironwood_effects().commitments().len() {
+                let action_index = u32::try_from(action_index)
+                    .context("Ironwood action index does not fit u32")?;
+                let position = authenticated_action_position(
+                    applied.core(),
+                    transaction.tx_index(),
+                    action_index,
+                )
+                .map_err(|error| {
+                    anyhow::anyhow!("derive authenticated action position: {error:?}")
+                })?;
+                let previous = action_positions.insert(
+                    (transaction.txid(), action_index),
+                    incrementalmerkletree::Position::from(u64::from(position)),
+                );
+                ensure!(previous.is_none(), "duplicate canonical action reference");
+            }
+        }
         blocks.push(
             inspect_exact_name_block(
                 applied.core(),
@@ -604,7 +616,10 @@ fn scan_exact(rpc_url: &str, deployment: DeploymentParameters, name: &Name) -> R
             .map_err(|error| anyhow::anyhow!("decode Names block {height}: {error:?}"))?,
         );
     }
-    Ok(blocks)
+    Ok(ExactScan {
+        blocks,
+        action_positions,
+    })
 }
 
 fn print_target(args: TargetArgs) -> Result<()> {
@@ -688,7 +703,8 @@ fn reveal(args: RevealArgs) -> Result<()> {
     let deployment = deployment(runtime.core_runtime_id(), &verifier);
     let name = debug_result(Name::parse(NAME))?;
     let commit_txid = parse_txid(&args.commit_txid)?;
-    let blocks = scan_exact(&args.common.rpc_url, deployment, &name)?;
+    let scan = scan_exact(&args.common.rpc_url, deployment, &name)?;
+    let blocks = &scan.blocks;
     let (commit_ref, commitment) = blocks
         .iter()
         .flat_map(|block| {
@@ -814,7 +830,8 @@ fn mark_head(args: MarkHeadArgs) -> Result<()> {
     let deployment = deployment(runtime.core_runtime_id(), &verifier);
     let name = debug_result(Name::parse(NAME))?;
     let state_txid = parse_txid(&args.state_txid)?;
-    let blocks = scan_exact(&args.common.rpc_url, deployment, &name)?;
+    let scan = scan_exact(&args.common.rpc_url, deployment, &name)?;
+    let blocks = &scan.blocks;
     let tip = blocks
         .last()
         .map(|block| block.height)
@@ -825,7 +842,7 @@ fn mark_head(args: MarkHeadArgs) -> Result<()> {
         name.clone(),
         verifier,
     ))?;
-    for block in &blocks {
+    for block in blocks {
         debug_result(resolver.apply_block(block))?;
     }
     let accepted = resolver
@@ -859,20 +876,30 @@ fn mark_head(args: MarkHeadArgs) -> Result<()> {
         .actions
         .get(usize::try_from(action_index)?)
         .context("state transaction designated action is unavailable")?;
-    let position = action_position(&blocks, state_txid, action_index)?;
+    let position = action_position(&scan, state_txid, action_index)?;
     let cmx = Option::<ExtractedNoteCommitment>::from(ExtractedNoteCommitment::from_bytes(
         &action.commitment.to_bytes(),
     ))
     .context("state action commitment is not an Orchard commitment")?;
-    let block_start = blocks
+    let block_start = state_block
+        .transactions
         .iter()
-        .take_while(|block| block.height < state_block.height)
-        .flat_map(|block| &block.transactions)
-        .try_fold(0u64, |count, transaction| {
-            count
-                .checked_add(u64::try_from(transaction.actions.len())?)
-                .context("Ironwood block position overflow")
-        })?;
+        .flat_map(|transaction| {
+            transaction
+                .actions
+                .iter()
+                .map(move |action| (transaction.txid, action.action_index))
+        })
+        .map(|reference| {
+            scan.action_positions
+                .get(&reference)
+                .copied()
+                .context("Core-authenticated block action position is unavailable")
+        })
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .min()
+        .context("state block contains no Ironwood actions")?;
     let mut marked_count = 0usize;
     let block_leaves = state_block
         .transactions
@@ -908,10 +935,7 @@ fn mark_head(args: MarkHeadArgs) -> Result<()> {
     let incomplete = db
         .with_ironwood_tree_mut::<_, _, SqliteClientError>(|tree| {
             Ok(tree
-                .batch_insert(
-                    incrementalmerkletree::Position::from(block_start),
-                    block_leaves.iter().cloned(),
-                )?
+                .batch_insert(block_start, block_leaves.iter().cloned())?
                 .map(|(_, incomplete)| incomplete)
                 .unwrap_or_default())
         })?
@@ -958,7 +982,8 @@ fn refresh(args: RefreshArgs) -> Result<()> {
     let deployment = deployment(runtime.core_runtime_id(), &verifier);
     let name = debug_result(Name::parse(NAME))?;
     let reveal_txid = parse_txid(&args.reveal_txid)?;
-    let blocks = scan_exact(&args.common.rpc_url, deployment, &name)?;
+    let scan = scan_exact(&args.common.rpc_url, deployment, &name)?;
+    let blocks = &scan.blocks;
     let tip = blocks
         .last()
         .map(|block| block.height)
@@ -974,7 +999,7 @@ fn refresh(args: RefreshArgs) -> Result<()> {
         name.clone(),
         verifier,
     ))?;
-    for block in &blocks {
+    for block in blocks {
         debug_result(resolver.apply_block(block))?;
     }
     let predecessor = resolver
@@ -1021,7 +1046,7 @@ fn refresh(args: RefreshArgs) -> Result<()> {
             && predecessor_action.action_index == action_index,
         "accepted head does not match its REVEAL action"
     );
-    let predecessor_position = action_position(&blocks, reveal_txid, action_index)?;
+    let predecessor_position = action_position(&scan, reveal_txid, action_index)?;
     let seed = wallet_seed()?;
     let deployment_id = debug_result(deployment.deployment_id())?;
     let name_key = derive_name_spending_key(&seed, deployment_id, &name)
@@ -1128,7 +1153,8 @@ fn verify(args: VerifyArgs) -> Result<()> {
     let refresh_txid = args.refresh_txid.as_deref().map(parse_txid).transpose()?;
     let expected_head_txid = refresh_txid.unwrap_or(reveal_txid);
     let expected_ua = debug_result(CanonicalUa::parse(Network::Regtest, &args.ua))?;
-    let blocks = scan_exact(&args.rpc_url, deployment, &name)?;
+    let scan = scan_exact(&args.rpc_url, deployment, &name)?;
+    let blocks = &scan.blocks;
     let parent_hash = blocks
         .first()
         .map(|block| block.prev_hash)
@@ -1141,7 +1167,7 @@ fn verify(args: VerifyArgs) -> Result<()> {
     ))?;
     let mut found_reveal = false;
     let mut found_refresh = refresh_txid.is_none();
-    for block in &blocks {
+    for block in blocks {
         found_reveal |= block.transactions.iter().any(|transaction| {
             transaction.txid == reveal_txid
                 && matches!(transaction.operation, Some(Operation::Reveal { .. }))
