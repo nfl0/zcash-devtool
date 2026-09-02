@@ -1366,13 +1366,14 @@ dependencies = [
 [[package]]
 name = "coppice-names"
 version = "0.1.0"
-source = "git+https://github.com/nfl0/coppice-names.git?rev=ee252fbd75a4e749c11254ebf601bdd0cd37060e#ee252fbd75a4e749c11254ebf601bdd0cd37060e"
+source = "git+https://github.com/nfl0/coppice-names.git?rev=103ea703a78adb0c102c24f5640d1795e3f6e068#103ea703a78adb0c102c24f5640d1795e3f6e068"
 dependencies = [
  "blake2b_simd",
  "coppice",
  "hex",
  "rand_core 0.10.1",
  "serde",
+ "serde_json",
  "zakura-halo2-gadgets",
  "zakura-orchard",
  "zakura-pasta-curves",
@@ -1382,7 +1383,7 @@ dependencies = [
 [[package]]
 name = "coppice-names-wallet"
 version = "0.1.0"
-source = "git+https://github.com/nfl0/coppice-names.git?rev=ee252fbd75a4e749c11254ebf601bdd0cd37060e#ee252fbd75a4e749c11254ebf601bdd0cd37060e"
+source = "git+https://github.com/nfl0/coppice-names.git?rev=103ea703a78adb0c102c24f5640d1795e3f6e068#103ea703a78adb0c102c24f5640d1795e3f6e068"
 dependencies = [
  "anyhow",
  "blake2b_simd",
@@ -1390,6 +1391,7 @@ dependencies = [
  "coppice-names",
  "rand 0.10.2",
  "rand_core 0.10.1",
+ "subtle",
  "zakura-client-backend",
  "zakura-orchard",
  "zakura-pasta-curves",

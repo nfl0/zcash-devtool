@@ -72,12 +72,6 @@ use zip321::{Payment, TransactionRequest};
 
 const NAME: &str = "footprint";
 const RUNTIME_ACTIVATION_HEIGHT: u32 = 1;
-const EPOCH_BLOCKS: u32 = 1_152;
-const WINDOW_BLOCKS: u32 = 24;
-const COMMIT_MATURITY_BLOCKS: u32 = 24;
-const COMMIT_TTL_BLOCKS: u32 = 192;
-const LEASE_BLOCKS: u32 = 250_000;
-const COOLDOWN_BLOCKS: u32 = 1_152;
 
 #[derive(Parser)]
 #[command(name = "names-live", about = "Replacement Names live qualification")]
@@ -224,17 +218,11 @@ fn deployment(
     core_runtime_id: CoreRuntimeId,
     verifier: &OrchardProofVerifier,
 ) -> DeploymentParameters {
-    DeploymentParameters {
+    DeploymentParameters::regtest(
         core_runtime_id,
-        activation_height: RUNTIME_ACTIVATION_HEIGHT,
-        epoch_blocks: EPOCH_BLOCKS,
-        window_blocks: WINDOW_BLOCKS,
-        commit_maturity_blocks: COMMIT_MATURITY_BLOCKS,
-        commit_ttl_blocks: COMMIT_TTL_BLOCKS,
-        lease_blocks: LEASE_BLOCKS,
-        cooldown_blocks: COOLDOWN_BLOCKS,
-        proof: verifier.identity(),
-    }
+        RUNTIME_ACTIVATION_HEIGHT,
+        verifier.identity(),
+    )
 }
 
 fn wallet_seed() -> Result<[u8; 64]> {
@@ -631,14 +619,14 @@ fn print_target(args: TargetArgs) -> Result<()> {
     let schedule = deployment.schedule(debug_result(deployment.deployment_id())?);
     let earliest = args
         .from_height
-        .checked_add(1 + COMMIT_MATURITY_BLOCKS)
+        .checked_add(1 + schedule.commit_maturity_blocks)
         .context("target height overflow")?;
     let reveal_height = (earliest..)
         .find(|height| schedule.accepts_operation(name_id, *height))
         .context("no representable REVEAL window")?;
     println!("TARGET_REVEAL_HEIGHT={reveal_height}");
-    println!("COMMIT_MATURITY_BLOCKS={COMMIT_MATURITY_BLOCKS}");
-    println!("COMMIT_TTL_BLOCKS={COMMIT_TTL_BLOCKS}");
+    println!("COMMIT_MATURITY_BLOCKS={}", schedule.commit_maturity_blocks);
+    println!("COMMIT_TTL_BLOCKS={}", schedule.commit_ttl_blocks);
     Ok(())
 }
 
