@@ -5,14 +5,15 @@ IFS=$'\n\t'
 
 # Disposable replacement Names live qualification. Phase 1 checks the local
 # Zcash/Zakura/Zaino/devtool plumbing and Ironwood funding. Phase 2 mines a
-# zero-value COMMIT and a real hidden-authority REVEAL, then resolves the name
-# through Core-authenticated exact replay.
+# zero-value COMMIT plus real hidden-authority REVEAL and REFRESH transitions,
+# then resolves the name through Core-authenticated exact replay.
 
 usage() {
     cat <<'EOF'
 Usage: live-qualification.sh [--phase N] [--keep-state]
 
   --phase N       1 for infrastructure, 2 for replacement COMMIT -> REVEAL
+                  -> REFRESH
                   (default: 2).
   --keep-state    Preserve the disposable run directory after success.
   -h|--help       Show this help.
@@ -157,13 +158,17 @@ rpc_call() {
         -H 'content-type: application/json' --data-binary "$request" "$ZAKURA_RPC_URL"
 }
 rpc_generate() {
-    local count=$1
-    local response
-    response="$(rpc_call generate "[$count]")" || die "Zakura generate RPC failed"
-    printf '%s\n' "$response" >>"$LOG_DIR/zakura-rpc.log"
-    jq -e --argjson expected "$count" \
-        '.error == null and (.result | type == "array") and (.result | length == $expected)' \
-        >/dev/null <<<"$response" || die "Zakura generate RPC returned an error"
+    local remaining=$1 chunk response
+    while (( remaining > 0 )); do
+        chunk=$remaining
+        (( chunk <= 20 )) || chunk=20
+        response="$(rpc_call generate "[$chunk]")" || die "Zakura generate RPC failed"
+        printf '%s\n' "$response" >>"$LOG_DIR/zakura-rpc.log"
+        jq -e --argjson expected "$chunk" \
+            '.error == null and (.result | type == "array") and (.result | length == $expected)' \
+            >/dev/null <<<"$response" || die "Zakura generate RPC returned an error"
+        remaining=$((remaining - chunk))
+    done
 }
 zakura_tip_height() {
     local response
@@ -504,7 +509,19 @@ rg -a -q '^REVEAL_CARRIER_VALUE=0$' "$LOG_DIR/names-reveal.log" \
     || die "REVEAL carrier is not zero value"
 rpc_generate 1
 wait_for_zaino_tip "$REVEAL_HEIGHT"
+
+status "Stage the accepted hidden bond mark before wallet block application"
+run_logged names-stage-reveal-mark timeout 1200 "$NAMES_LIVE_BIN" mark-head \
+    --wallet-dir "$WALLET_DIR" --rpc-url "$ZAKURA_RPC_URL" \
+    --state-txid "$REVEAL_TXID"
+rg -a -q '^MANAGED_HEAD_MARKED=yes$' "$LOG_DIR/names-stage-reveal-mark.log" \
+    || die "accepted REVEAL bond mark was not staged"
 wallet_sync_logged names-reveal-sync
+run_logged names-check-reveal-witness timeout 1200 "$NAMES_LIVE_BIN" mark-head \
+    --wallet-dir "$WALLET_DIR" --rpc-url "$ZAKURA_RPC_URL" \
+    --state-txid "$REVEAL_TXID" --require-witness
+rg -a -q '^MANAGED_HEAD_WITNESS=yes$' "$LOG_DIR/names-check-reveal-witness.log" \
+    || die "accepted REVEAL bond was not marked for witness retention"
 
 status "Resolve the mined name through authenticated exact replay"
 run_logged names-verify timeout 1200 "$NAMES_LIVE_BIN" verify \
@@ -514,7 +531,58 @@ rg -a -q '^NAMES_EXACT_STATUS=Active$' "$LOG_DIR/names-verify.log" \
 rg -a -q "^NAMES_HEAD_TXID=$REVEAL_TXID$" "$LOG_DIR/names-verify.log" \
     || die "resolved head does not match the mined REVEAL"
 
-printf '\n[PASS] replacement Names COMMIT -> REVEAL live qualification complete\n'
-printf 'COMMIT_TXID=%s\nREVEAL_TXID=%s\nREVEAL_HEIGHT=%s\n' \
-    "$COMMIT_TXID" "$REVEAL_TXID" "$REVEAL_HEIGHT"
+status "Select the first later-epoch REFRESH window"
+CURRENT_TIP="$(zakura_tip_height)"
+run_logged names-refresh-target timeout 120 "$NAMES_LIVE_BIN" refresh-target \
+    --from-height "$CURRENT_TIP" --predecessor-height "$REVEAL_HEIGHT"
+REFRESH_HEIGHT="$(sed -n 's/^TARGET_REFRESH_HEIGHT=//p' \
+    "$LOG_DIR/names-refresh-target.log" | tail -1)"
+[[ "$REFRESH_HEIGHT" =~ ^[0-9]+$ ]] || die "target REFRESH height missing"
+PRE_REFRESH_TIP=$((REFRESH_HEIGHT - 1))
+REFRESH_ADVANCE=$((PRE_REFRESH_TIP - CURRENT_TIP))
+(( REFRESH_ADVANCE >= 0 )) || die "selected REFRESH height is behind tip"
+if (( REFRESH_ADVANCE > 0 )); then
+    rpc_generate "$REFRESH_ADVANCE"
+    wait_for_zaino_tip "$PRE_REFRESH_TIP"
+    wallet_sync_logged names-pre-refresh-sync
+fi
+
+status "Build, prove, sign, and mine replacement REFRESH"
+run_logged names-refresh timeout 1800 "$NAMES_LIVE_BIN" refresh \
+    --wallet-dir "$WALLET_DIR" --rpc-url "$ZAKURA_RPC_URL" \
+    --reveal-txid "$REVEAL_TXID" --refresh-height "$REFRESH_HEIGHT" \
+    --ua "$MINER_UA"
+REFRESH_TXID="$(rg -a -o '^REFRESH_TXID=[0-9a-f]{64}$' \
+    "$LOG_DIR/names-refresh.log" | tail -1 | cut -d= -f2)"
+[[ -n "$REFRESH_TXID" ]] || die "REFRESH did not emit a transaction id"
+rg -a -q '^REFRESH_CARRIER_VALUE=0$' "$LOG_DIR/names-refresh.log" \
+    || die "REFRESH carrier is not zero value"
+rpc_generate 1
+wait_for_zaino_tip "$REFRESH_HEIGHT"
+
+status "Stage the refreshed hidden bond mark before wallet block application"
+run_logged names-stage-refresh-mark timeout 1200 "$NAMES_LIVE_BIN" mark-head \
+    --wallet-dir "$WALLET_DIR" --rpc-url "$ZAKURA_RPC_URL" \
+    --state-txid "$REFRESH_TXID"
+rg -a -q '^MANAGED_HEAD_MARKED=yes$' "$LOG_DIR/names-stage-refresh-mark.log" \
+    || die "accepted REFRESH bond mark was not staged"
+wallet_sync_logged names-refresh-sync
+run_logged names-check-refresh-witness timeout 1200 "$NAMES_LIVE_BIN" mark-head \
+    --wallet-dir "$WALLET_DIR" --rpc-url "$ZAKURA_RPC_URL" \
+    --state-txid "$REFRESH_TXID" --require-witness
+rg -a -q '^MANAGED_HEAD_WITNESS=yes$' "$LOG_DIR/names-check-refresh-witness.log" \
+    || die "accepted REFRESH bond was not marked for witness retention"
+
+status "Resolve the refreshed head through authenticated exact replay"
+run_logged names-refresh-verify timeout 1200 "$NAMES_LIVE_BIN" verify \
+    --rpc-url "$ZAKURA_RPC_URL" --reveal-txid "$REVEAL_TXID" \
+    --refresh-txid "$REFRESH_TXID" --ua "$MINER_UA"
+rg -a -q '^NAMES_EXACT_STATUS=Active$' "$LOG_DIR/names-refresh-verify.log" \
+    || die "exact resolver did not accept the replacement REFRESH"
+rg -a -q "^NAMES_HEAD_TXID=$REFRESH_TXID$" "$LOG_DIR/names-refresh-verify.log" \
+    || die "resolved head does not match the mined REFRESH"
+
+printf '\n[PASS] replacement Names COMMIT -> REVEAL -> REFRESH live qualification complete\n'
+printf 'COMMIT_TXID=%s\nREVEAL_TXID=%s\nREVEAL_HEIGHT=%s\nREFRESH_TXID=%s\nREFRESH_HEIGHT=%s\n' \
+    "$COMMIT_TXID" "$REVEAL_TXID" "$REVEAL_HEIGHT" "$REFRESH_TXID" "$REFRESH_HEIGHT"
 exit 0

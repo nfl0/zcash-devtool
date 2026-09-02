@@ -12,9 +12,11 @@ Phase 1 checks JSON-RPC/gRPC readiness, Ironwood subtree-root serving, wallet
 initialization, and spendable Ironwood funding. Phase 2 selects the next
 feasible name-specific daily window, mines a zero-value generic-route COMMIT,
 creates an exact one-ZEC wallet bond, builds and mines a real hidden-authority
-REVEAL, and resolves it through Core-authenticated exact replay. Name-route
-full-transaction acquisition is enabled only in scheduled windows; compact
-Ironwood effects remain visible across the complete authenticated range.
+REVEAL, resolves it, advances to the first later-epoch window, reconstructs
+and spends the hidden managed bond in a real REFRESH, and resolves the renewed
+head through Core-authenticated exact replay. Name-route full-transaction
+acquisition is enabled only in scheduled windows; compact Ironwood effects
+remain visible across the complete authenticated range.
 
 All node state, wallet data, and logs are disposable and live below
 `/tmp/coppice-names-live.*`. Successful state is removed unless `--keep-state`
