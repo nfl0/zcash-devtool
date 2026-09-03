@@ -134,7 +134,7 @@ def main() -> None:
 
     local_rows = [
         ("Current generic + exact", local["measured_seconds"]["current_generic_plus_exact"], duration(local["measured_seconds"]["current_generic_plus_exact"])),
-        ("Referenced COMMIT", local["derived_route_policy_seconds"]["referenced_commit_exact_only"], duration(local["derived_route_policy_seconds"]["referenced_commit_exact_only"])),
+        ("Referenced COMMIT", local["measured_seconds"]["referenced_commit_exact_only"], duration(local["measured_seconds"]["referenced_commit_exact_only"])),
         ("No carrier routes", local["derived_route_policy_seconds"]["no_carrier_routes"], duration(local["derived_route_policy_seconds"]["no_carrier_routes"])),
         ("Batch-end roots target", local["derived_design_targets_seconds"]["referenced_plus_batch_end_roots"], duration(local["derived_design_targets_seconds"]["referenced_plus_batch_end_roots"])),
         ("Wallet-owned tree target", local["derived_design_targets_seconds"]["referenced_plus_wallet_owned_tree"], duration(local["derived_design_targets_seconds"]["referenced_plus_wallet_owned_tree"])),
@@ -147,7 +147,7 @@ def main() -> None:
     attack_rows = [
         ("Old generic route, six months", attack["old_continuous_generic_route"]["forced_full_transaction_gigabytes"], f'{attack["old_continuous_generic_route"]["forced_full_transaction_gigabytes"]:.1f} GB'),
         ("Referenced design, unrelated generic", 0, "0 B"),
-        ("Referenced design, one attacked name/day", attack["referenced_commit_design"]["one_daily_window_candidates"] * 56204 / 1e9, bytes_label(attack["referenced_commit_design"]["one_daily_window_candidates"] * 56204)),
+        ("Referenced design, one attacked name/day", attack["referenced_commit_design"]["one_daily_window_candidates"] * attack["referenced_commit_design"]["referenced_pair_serialized_bytes"] / 1e9, bytes_label(attack["referenced_commit_design"]["one_daily_window_candidates"] * attack["referenced_commit_design"]["referenced_pair_serialized_bytes"])),
     ]
 
     findings = "".join(f"<li>{esc(item)}</li>" for item in model["design_findings"])
@@ -169,7 +169,7 @@ footer {{ margin-top:40px; border-top:1px solid var(--line); padding-top:20px }}
 <h1>Coppice Names speed, measured</h1>
 <p class="lead">Six months and 250,000 mainnet blocks, treating Orchard and Ironwood as one Orchard-family workload. Direct measurements, arithmetic derivations, and unimplemented design targets are labeled separately.</p>
 <div class="verdict"><strong>Decision:</strong> keep COMMIT → REVEAL, but let exact REVEAL discovery pull only its referenced historical COMMIT. Then remove Coppice's duplicate per-block commitment-tree root work from the light-wallet path. Do not add transaction grinding.</div>
-{bar_chart("Six-month local replay", local_rows, "Wall-clock seconds; current measured, other values derived from isolated calibrations")}
+{bar_chart("Six-month local replay", local_rows, "Wall-clock seconds; first two measured, remaining values derived")}
 {lookup_chart(lookup)}
 {line_chart(model["adoption"])}
 <div class="columns">

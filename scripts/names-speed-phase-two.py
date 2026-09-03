@@ -74,20 +74,21 @@ def main() -> None:
 
     manifest = load(directory / "manifest.json")
     current = load(directory / "light-wallet-replay-optimized.json")
+    referenced = load(directory / "light-wallet-replay-referenced.json")
     route_history = load(directory / "route-history.json")
     frontier = load(directory / "frontier-calibration-34560.json")
     nullifiers = load(directory / "nullifier-journal.json")
     routed = load(directory / "route-adversarial-calibration-v2.json")
     proofs = load(directory / "adversarial-calibration-v2.json")
-    prior_model = load(directory / "phase-two-model.json")
+    synthetic = load(directory / "synthetic-scenarios-current.json")
 
     source = current["source"]
     blocks = source["blocks"]
     actions = source["orchard_family_actions"]
     compact_bytes = source["compact_payload_bytes"]
-    scheduled = prior_model["simulation"]["scheduled_window_statistics"]
-    network_bps = prior_model["simulation"]["network_bytes_per_second"]
-    request_ms = prior_model["simulation"]["median_request_overhead_milliseconds"]
+    scheduled = synthetic["simulation"]["scheduled_window_statistics"]
+    network_bps = synthetic["simulation"]["network_bytes_per_second"]
+    request_ms = synthetic["simulation"]["median_request_overhead_milliseconds"]
 
     frames = capture_frames(directory / "compact-blocks.cnhs")
     ttl_frames = frames[-192:]
@@ -108,9 +109,10 @@ def main() -> None:
         / calibrated_actions
     )
     current_wall = current["timing_seconds"]["wall"]
+    referenced_wall = referenced["timing_seconds"]["wall"]
     generic_route_seconds = route_history["timing_seconds"]["continuous_generic_route_incremental"]
     exact_route_seconds = route_history["timing_seconds"]["scheduled_exact_route_incremental"]
-    referenced_wall = max(0.0, current_wall - generic_route_seconds)
+    referenced_composed_estimate = max(0.0, current_wall - generic_route_seconds)
     no_routes_wall = max(0.0, referenced_wall - exact_route_seconds)
     batch_root_target = max(0.0, referenced_wall - repeated_root_seconds)
     wallet_tree_target = max(0.0, batch_root_target - append_once_seconds)
@@ -192,6 +194,7 @@ def main() -> None:
             "local_route_plus_invalid_proof_hours_p50": exact_candidates * (reveal_local_ms + invalid_proof_ms) / 3_600_000.0,
             "one_daily_window_candidates": reveals_per_block * 24,
             "one_daily_window_route_plus_invalid_proof_seconds_p50": reveals_per_block * 24 * (reveal_local_ms + invalid_proof_ms) / 1000.0,
+            "referenced_pair_serialized_bytes": referenced_pair_bytes,
             "reachability": "Each proof-costing candidate must hit the exact name route in its window and reference a live canonical generic-route COMMIT.",
         },
     }
@@ -202,7 +205,9 @@ def main() -> None:
             "capture_sha256": hashlib.sha256((directory / "compact-blocks.cnhs").read_bytes()).hexdigest(),
             "measurement_files": [
                 "manifest.json",
+                "synthetic-scenarios-current.json",
                 "light-wallet-replay-optimized.json",
+                "light-wallet-replay-referenced.json",
                 "route-history.json",
                 "frontier-calibration-34560.json",
                 "nullifier-journal.json",
@@ -221,11 +226,16 @@ def main() -> None:
         "local_replay": {
             "measured_seconds": {
                 "current_generic_plus_exact": current_wall,
+                "referenced_commit_exact_only": referenced_wall,
             },
             "derived_route_policy_seconds": {
-                "referenced_commit_exact_only": referenced_wall,
                 "no_carrier_routes": no_routes_wall,
-                "qualification": "Derived by subtracting isolated full-history release-build route scans from the measured full replay.",
+                "qualification": "No-carrier-routes is derived by subtracting the isolated exact-route scan from the measured referenced-COMMIT replay.",
+            },
+            "route_policy_cross_check": {
+                "referenced_commit_composed_estimate_seconds": referenced_composed_estimate,
+                "measured_minus_composed_seconds": referenced_wall - referenced_composed_estimate,
+                "qualification": "Run-to-run cross-check only; the direct referenced-COMMIT replay is authoritative for the measured point.",
             },
             "derived_design_targets_seconds": {
                 "referenced_plus_batch_end_roots": batch_root_target,
