@@ -26,9 +26,10 @@ use coppice::{
     identity::{CoreRuntimeParameters, ValidatedCoreRuntimeParameters, ZcashNetwork},
     replay::{
         CoreCanonicalBlockInput, CoreReplay, CoreReplayActivationCheckpoint,
-        CoreReplayConfiguration, CoreReplayTip, FullTransactionAcquisition, IronwoodFrontier,
+        CoreReplayConfiguration, CoreReplayPositionCheckpoint, CoreReplayTip,
+        FullTransactionAcquisition, IronwoodFrontier,
     },
-    runtime::{CanonicalRuntime, CoreRuntime},
+    runtime::{CanonicalRuntime, CorePositionRuntime, CoreRuntime},
 };
 use coppice_librustzcash::{FullTransactionSource, prepare_canonical_block_with_rendezvous_policy};
 use coppice_names::{
@@ -37,7 +38,10 @@ use coppice_names::{
     protocol::{FieldElement, Name, NameRoute, Network},
     reducer::{Action, Block, Transaction},
     resolver::ExactResolver,
-    transport::{authenticated_action_position, inspect_exact_name_block},
+    transport::{
+        authenticated_action_position, inspect_exact_name_block,
+        inspect_exact_name_positioned_block, positioned_action_position,
+    },
 };
 use incrementalmerkletree::{Marking, Position, Retention};
 use orchard::{note::Nullifier, tree::MerkleHashOrchard};
@@ -665,12 +669,16 @@ fn main() -> Result<()> {
         },
         activation_root,
         0,
-        checkpoints,
+        checkpoints.clone(),
         cli.rewind_blocks,
     );
-    let mut consumer_resolver =
-        ExactResolver::new(schedule, activation_parent_hash, name.clone(), verifier)
-            .map_err(|error| anyhow!("initialize consumer resolver: {error:?}"))?;
+    let mut consumer_resolver = ExactResolver::new(
+        schedule,
+        activation_parent_hash,
+        name.clone(),
+        verifier.clone(),
+    )
+    .map_err(|error| anyhow!("initialize consumer resolver: {error:?}"))?;
     let consumer_started = Instant::now();
     let mut consumer_timings = ConsumerTimings::default();
     let mut consumer_operations = 0u64;
@@ -780,6 +788,125 @@ fn main() -> Result<()> {
         "reapplied Names resolution mismatch"
     );
 
+    // Replay the same capture through the production Core position runtime,
+    // not only the independent confirmation consumer above.
+    let mut production = CorePositionRuntime::new(
+        runtime_parameters.clone(),
+        configuration,
+        CoreReplayPositionCheckpoint {
+            height: activation_height - 1,
+            block_hash: activation_parent_hash,
+            ironwood_tree_size: 0,
+        },
+    )
+    .map_err(|error| anyhow!("initialize production position runtime: {error:?}"))?;
+    let mut production_resolver = ExactResolver::new(
+        schedule,
+        activation_parent_hash,
+        name.clone(),
+        verifier.clone(),
+    )
+    .map_err(|error| anyhow!("initialize production position resolver: {error:?}"))?;
+    let production_started = Instant::now();
+    let mut production_timings = ConsumerTimings::default();
+    let mut production_position_digest = position_digest_state();
+    let mut production_operations = 0u64;
+    let mut source = NoFullTransactions;
+    for (encoded, checkpoint) in raw.iter().zip(checkpoints.iter()) {
+        let started = Instant::now();
+        let compact = decode_normalized(encoded)?;
+        production_timings.decode += started.elapsed();
+        let height = u32::try_from(compact.height).context("block height exceeds u32")?;
+        let additional = if schedule.accepts_operation(name_id, height) {
+            std::slice::from_ref(&exact_rendezvous)
+        } else {
+            &[]
+        };
+        let started = Instant::now();
+        let canonical = prepare_canonical_block_with_rendezvous_policy(
+            &MainNetwork,
+            &production,
+            &compact,
+            &mut source,
+            false,
+            additional,
+        )
+        .map_err(|error| anyhow!("prepare production position block {height}: {error:?}"))?;
+        production_timings.prepare += started.elapsed();
+        let started = Instant::now();
+        let positioned = production
+            .apply_canonical_block(&canonical)
+            .map_err(|error| anyhow!("apply production position block {height}: {error:?}"))?;
+        ensure!(
+            positioned.core().post_ironwood_tree_size() == checkpoint.tree_size,
+            "production position runtime disagrees with wallet tree at {height}"
+        );
+        for transaction in positioned.core().transactions() {
+            for (action_index, (nullifier, commitment)) in transaction
+                .ironwood_effects()
+                .nullifiers()
+                .iter()
+                .zip(transaction.ironwood_effects().commitments())
+                .enumerate()
+            {
+                let action_index = u32::try_from(action_index).context("action index overflow")?;
+                let position = positioned_action_position(
+                    positioned.core(),
+                    transaction.tx_index(),
+                    action_index,
+                )
+                .map_err(|error| anyhow!("derive production position: {error:?}"))?;
+                update_position_digest(
+                    &mut production_position_digest,
+                    height,
+                    transaction.tx_index(),
+                    action_index,
+                    position,
+                    nullifier,
+                    commitment,
+                );
+            }
+        }
+        let names_block = inspect_exact_name_positioned_block(
+            positioned.core(),
+            &runtime_parameters,
+            deployment,
+            Network::Main,
+            &name,
+        )
+        .map_err(|error| anyhow!("inspect production Names block {height}: {error:?}"))?;
+        production_timings.validate_and_apply += started.elapsed();
+        let started = Instant::now();
+        production_operations = production_operations.saturating_add(
+            production_resolver
+                .apply_block(&names_block)
+                .map_err(|error| anyhow!("apply production Names block {height}: {error:?}"))?
+                .len() as u64,
+        );
+        production_timings.reducer += started.elapsed();
+    }
+    let production_wall = production_started.elapsed();
+    ensure!(
+        production.tip() == authority_tip,
+        "production final tip parity failed"
+    );
+    ensure!(
+        production.ironwood_tree_size() == authority_final_checkpoint.tree_size,
+        "production final tree-size parity failed"
+    );
+    ensure!(
+        digest_bytes(&production_position_digest) == authority_position_digest,
+        "production action-position parity failed"
+    );
+    ensure!(
+        production_resolver.resolve(last_height) == authority_resolution,
+        "production Names resolution parity failed"
+    );
+    ensure!(
+        production_operations == authority_operations,
+        "production accepted-operation parity failed"
+    );
+
     ensure!(
         consumer_wall.as_secs_f64() <= cli.maximum_consumer_seconds,
         "tree-free consumer took {:.3}s, above {:.3}s confirmation bound",
@@ -827,6 +954,17 @@ fn main() -> Result<()> {
             "reduction_vs_authority_coppice_components_percent":
                 100.0 * (1.0 - seconds(consumer_wall) / seconds(authority_coppice_components))
         },
+        "production_position_runtime_pass": {
+            "wall_seconds": seconds(production_wall),
+            "timing_seconds": {
+                "decode": seconds(production_timings.decode),
+                "prepare_exact_route": seconds(production_timings.prepare),
+                "validate_effects_positions_and_transport": seconds(production_timings.validate_and_apply),
+                "names_reducer": seconds(production_timings.reducer)
+            },
+            "reduction_vs_authority_coppice_components_percent":
+                100.0 * (1.0 - seconds(production_wall) / seconds(authority_coppice_components))
+        },
         "parity": {
             "sampled_wallet_roots_equal_core_root": true,
             "root_check_interval_blocks": cli.root_check_interval,
@@ -840,6 +978,7 @@ fn main() -> Result<()> {
             "accepted_names_operations_match": true,
             "rollback_and_final_block_reapply_matches": true,
             "wallet_shardtree_rollback_and_reapply_matches": true,
+            "production_position_runtime_matches": true,
             "final_root": hex::encode(authority_final_checkpoint.root),
             "final_tree_size": authority_final_checkpoint.tree_size,
             "position_digest": hex::encode(authority_position_digest),

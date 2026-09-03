@@ -75,7 +75,8 @@ def main() -> None:
     manifest = load(directory / "manifest.json")
     current = load(directory / "light-wallet-replay-optimized.json")
     referenced = load(directory / "light-wallet-replay-referenced.json")
-    wallet_tree = load(directory / "wallet-tree-confirmation.json")
+    wallet_tree_file = directory / "wallet-tree-production-confirmation.json"
+    wallet_tree = load(wallet_tree_file)
     route_history = load(directory / "route-history.json")
     frontier = load(directory / "frontier-calibration-34560.json")
     nullifiers = load(directory / "nullifier-journal.json")
@@ -209,7 +210,7 @@ def main() -> None:
                 "synthetic-scenarios-current.json",
                 "light-wallet-replay-optimized.json",
                 "light-wallet-replay-referenced.json",
-                "wallet-tree-confirmation.json",
+                wallet_tree_file.name,
                 "route-history.json",
                 "frontier-calibration-34560.json",
                 "nullifier-journal.json",
@@ -229,14 +230,14 @@ def main() -> None:
             "measured_seconds": {
                 "current_generic_plus_exact": current_wall,
                 "referenced_commit_exact_only": referenced_wall,
-                "wallet_owned_tree_confirmation": wallet_tree["tree_free_consumer_pass"]["wall_seconds"],
+                "wallet_owned_tree_confirmation": wallet_tree["production_position_runtime_pass"]["wall_seconds"],
             },
             "wallet_owned_tree_confirmation": {
-                "reduction_vs_reference_percent": wallet_tree["tree_free_consumer_pass"]["reduction_vs_authority_coppice_components_percent"],
+                "reduction_vs_reference_percent": wallet_tree["production_position_runtime_pass"]["reduction_vs_authority_coppice_components_percent"],
                 "checked_wallet_roots": wallet_tree["parity"]["checked_wallet_roots"],
                 "all_action_positions_checked": wallet_tree["parity"]["every_action_global_position_matches"],
                 "wallet_rollback_reapply_checked": wallet_tree["parity"]["wallet_shardtree_rollback_and_reapply_matches"],
-                "qualification": "Measured in-memory wallet-shaped ShardTree checkpoint consumer; excludes wallet SQLite and production transaction-boundary overhead.",
+                "qualification": "Measured production CorePositionRuntime against an in-memory wallet-shaped ShardTree; the wallet integration separately enforces the same pre/post tree-size boundary inside its SQL scan transaction.",
             },
             "derived_route_policy_seconds": {
                 "no_carrier_routes": no_routes_wall,
@@ -278,12 +279,12 @@ def main() -> None:
             "Stop continuous generic-rendezvous acquisition in exact resolvers. Fetch only a wallet-authored pending COMMIT or the historical COMMIT referenced by an exact-route REVEAL.",
             "Do not add transaction grinding. Zcash fees and block limits are the publication anti-spam boundary; cheap schedule, shape, reference, and lineage gates must precede Names proof verification.",
             "Eliminate the duplicate Core commitment tree from the light-wallet path. The wallet owns note-tree checkpoints and Names needs authenticated positions plus canonical nullifier currentness, not a second per-block root calculation.",
-            "The 250,000-block wallet-owned-tree confirmation passed root, size, position, resolution, and rollback parity; its tree-free consumer completed in under two seconds without public-infrastructure changes.",
+            "The 250,000-block wallet-owned-tree confirmation passed root, size, position, resolution, and rollback parity; the production CorePositionRuntime completed in under two seconds without public-infrastructure changes.",
             "For fastest arbitrary lookup, retain the six-month compact cache. A 27.1 MB sparse nullifier journal plus scheduled refetch is the lower-storage mode, but median request overhead makes it much slower.",
         ],
         "limits": [
             "The mainnet capture contains no Coppice deployment; Names traffic is synthesized from measured compact and full transaction shapes.",
-            "The batch-root and 2.03-second wallet-tree projection are design targets derived from a shorter real-capture calibration; the separate 1.66-second wallet-checkpoint consumer is directly measured but not a production SQLite integration.",
+            "The batch-root and 2.03-second wallet-tree projection are design targets derived from a shorter real-capture calibration. The production position runtime is directly measured; end-to-end wallet SQLite and network time remain outside this isolated replay benchmark.",
             "The wallet-owned-tree confirmation uses an in-memory wallet-shaped ShardTree and does not include wallet SQLite persistence or production transaction-boundary overhead.",
             "Network figures use a previously measured median throughput and request overhead; endpoint behavior will vary.",
             "The 2 MB adversarial block-fill calculation is a ceiling, not an expected workload or a claim about miner policy.",
