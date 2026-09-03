@@ -137,7 +137,7 @@ def main() -> None:
         ("Referenced COMMIT", local["measured_seconds"]["referenced_commit_exact_only"], duration(local["measured_seconds"]["referenced_commit_exact_only"])),
         ("No carrier routes", local["derived_route_policy_seconds"]["no_carrier_routes"], duration(local["derived_route_policy_seconds"]["no_carrier_routes"])),
         ("Batch-end roots target", local["derived_design_targets_seconds"]["referenced_plus_batch_end_roots"], duration(local["derived_design_targets_seconds"]["referenced_plus_batch_end_roots"])),
-        ("Wallet-owned tree target", local["derived_design_targets_seconds"]["referenced_plus_wallet_owned_tree"], duration(local["derived_design_targets_seconds"]["referenced_plus_wallet_owned_tree"])),
+        ("Wallet-owned consumer confirmation", local["measured_seconds"]["wallet_owned_tree_confirmation"], duration(local["measured_seconds"]["wallet_owned_tree_confirmation"])),
     ]
     storage_rows = [
         ("Six-month compact cache", storage["full_six_month_compact_cache_bytes"], bytes_label(storage["full_six_month_compact_cache_bytes"])),
@@ -169,7 +169,7 @@ footer {{ margin-top:40px; border-top:1px solid var(--line); padding-top:20px }}
 <h1>Coppice Names speed, measured</h1>
 <p class="lead">Six months and 250,000 mainnet blocks, treating Orchard and Ironwood as one Orchard-family workload. Direct measurements, arithmetic derivations, and unimplemented design targets are labeled separately.</p>
 <div class="verdict"><strong>Decision:</strong> keep COMMIT → REVEAL, but let exact REVEAL discovery pull only its referenced historical COMMIT. Then remove Coppice's duplicate per-block commitment-tree root work from the light-wallet path. Do not add transaction grinding.</div>
-{bar_chart("Six-month local replay", local_rows, "Wall-clock seconds; first two measured, remaining values derived")}
+{bar_chart("Six-month local replay", local_rows, "Wall-clock seconds; current and referenced measured end-to-end, wallet consumer measured in-memory, other values derived")}
 {lookup_chart(lookup)}
 {line_chart(model["adoption"])}
 <div class="columns">
