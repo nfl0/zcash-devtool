@@ -74,8 +74,7 @@ def main() -> None:
 
     manifest = load(directory / "manifest.json")
     current = load(directory / "light-wallet-replay-optimized.json")
-    referenced = load(directory / "light-wallet-replay-referenced.json")
-    no_routes = load(directory / "light-wallet-replay-no-routes.json")
+    route_history = load(directory / "route-history.json")
     frontier = load(directory / "frontier-calibration-34560.json")
     nullifiers = load(directory / "nullifier-journal.json")
     routed = load(directory / "route-adversarial-calibration-v2.json")
@@ -108,15 +107,15 @@ def main() -> None:
         * actions
         / calibrated_actions
     )
-    referenced_wall = referenced["timing_seconds"]["wall"]
+    current_wall = current["timing_seconds"]["wall"]
+    generic_route_seconds = route_history["timing_seconds"]["continuous_generic_route_incremental"]
+    exact_route_seconds = route_history["timing_seconds"]["scheduled_exact_route_incremental"]
+    referenced_wall = max(0.0, current_wall - generic_route_seconds)
+    no_routes_wall = max(0.0, referenced_wall - exact_route_seconds)
     batch_root_target = max(0.0, referenced_wall - repeated_root_seconds)
     wallet_tree_target = max(0.0, batch_root_target - append_once_seconds)
 
-    route_only_seconds = max(
-        0.0,
-        referenced["timing_seconds"]["candidate_validation_and_trial_decryption"]
-        - no_routes["timing_seconds"]["candidate_validation_and_trial_decryption"],
-    )
+    route_only_seconds = exact_route_seconds
     scheduled_action_distribution = scheduled["actions_across_all_name_offsets"]
     mean_scheduled_actions = scheduled_action_distribution["mean"]
     route_seconds_per_action = route_only_seconds / mean_scheduled_actions
@@ -164,7 +163,7 @@ def main() -> None:
     commits_per_block = max_block_bytes // commit["serialized_transaction_bytes"]
     reveals_per_block = max_block_bytes // reveal["serialized_transaction_bytes"]
     generic_candidates = blocks * commits_per_block
-    scheduled_blocks = referenced["workload"]["scheduled_route_blocks"]
+    scheduled_blocks = route_history["workload"]["scheduled_blocks"]
     exact_candidates = scheduled_blocks * reveals_per_block
     generic_local_ms = routed["measurements"]["generic_commit_route_hit"]["total_local_ms"]["p50"]
     reveal_local_ms = routed["measurements"]["exact_name_reveal_route_hit"]["total_local_ms"]["p50"]
@@ -204,8 +203,7 @@ def main() -> None:
             "measurement_files": [
                 "manifest.json",
                 "light-wallet-replay-optimized.json",
-                "light-wallet-replay-referenced.json",
-                "light-wallet-replay-no-routes.json",
+                "route-history.json",
                 "frontier-calibration-34560.json",
                 "nullifier-journal.json",
                 "route-adversarial-calibration-v2.json",
@@ -222,9 +220,12 @@ def main() -> None:
         },
         "local_replay": {
             "measured_seconds": {
-                "current_generic_plus_exact": current["timing_seconds"]["wall"],
+                "current_generic_plus_exact": current_wall,
+            },
+            "derived_route_policy_seconds": {
                 "referenced_commit_exact_only": referenced_wall,
-                "no_carrier_routes": no_routes["timing_seconds"]["wall"],
+                "no_carrier_routes": no_routes_wall,
+                "qualification": "Derived by subtracting isolated full-history release-build route scans from the measured full replay.",
             },
             "derived_design_targets_seconds": {
                 "referenced_plus_batch_end_roots": batch_root_target,
