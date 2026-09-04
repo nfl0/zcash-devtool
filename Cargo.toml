@@ -16,8 +16,8 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(zcash_unstable, values("nu
 anyhow = "1"
 coppice = { path = "../coppice/crates/coppice" }
 coppice-librustzcash = { path = "../coppice/crates/coppice-librustzcash" }
-coppice-names = { git = "https://github.com/nfl0/coppice-names.git", rev = "25202272254f29a0aa5658f039ea768373fa2287" }
-coppice-names-wallet = { git = "https://github.com/nfl0/coppice-names.git", rev = "25202272254f29a0aa5658f039ea768373fa2287" }
+coppice-names = { git = "https://github.com/nfl0/coppice-names.git", rev = "a7afa7c12d88d31d9deaafe7fa7fef28d691fcff" }
+coppice-names-wallet = { git = "https://github.com/nfl0/coppice-names.git", rev = "a7afa7c12d88d31d9deaafe7fa7fef28d691fcff" }
 coppice-zcash-rpc = { path = "../coppice/crates/coppice-zcash-rpc" }
 bip0039 = { version = "0.14", features = ["std", "all-languages"] }
 bip32 = { version = "=0.6.0-pre.1", default-features = false, features = ["secp256k1-ffi"] }
@@ -140,7 +140,7 @@ tui = [
 [patch.crates-io]
 # The extension is a package-name patch so every direct and transitive edge
 # that asks for `zakura-orchard` resolves to the same Coppice artifact.
-zakura-orchard = { git = "https://github.com/nfl0/orchard-coppice.git", rev = "51c374d9d36ac1728b00d8978456d7d98a232d82" }
+zakura-orchard = { git = "https://github.com/nfl0/orchard-coppice.git", rev = "e702d0525d5086d41b66ab870ede0a94b05fdcae" }
 
 [patch."https://github.com/nfl0/coppice.git"]
 # This repository intentionally develops against sibling Core sources. Names
