@@ -835,6 +835,7 @@ fn mark_head(args: MarkHeadArgs) -> Result<()> {
     }
     let accepted = resolver
         .resolve(tip)
+        .map_err(|error| anyhow::anyhow!("resolve exact name at {tip}: {error:?}"))?
         .head
         .context("exact resolver has no accepted head")?;
     ensure!(
@@ -992,6 +993,7 @@ fn refresh(args: RefreshArgs) -> Result<()> {
     }
     let predecessor = resolver
         .resolve(tip)
+        .map_err(|error| anyhow::anyhow!("resolve exact name at {tip}: {error:?}"))?
         .head
         .context("exact resolver has no accepted predecessor")?;
     ensure!(
@@ -1174,7 +1176,7 @@ fn verify(args: VerifyArgs) -> Result<()> {
         "canonical replacement REFRESH was not decoded"
     );
     let tip = blocks.last().unwrap().height;
-    let resolution = resolver.resolve(tip);
+    let resolution = debug_result(resolver.resolve(tip))?;
     ensure!(
         resolution.lifecycle == Lifecycle::Active,
         "name is not active"
@@ -1184,6 +1186,7 @@ fn verify(args: VerifyArgs) -> Result<()> {
         "resolved UA mismatch"
     );
     let head = resolution.head.context("active resolution has no head")?;
+    let identity = resolver.protocol_identity();
     ensure!(
         head.producer.txid == expected_head_txid,
         "resolved producer txid mismatch"
@@ -1192,6 +1195,15 @@ fn verify(args: VerifyArgs) -> Result<()> {
     println!("NAMES_RESOLVED_UA={}", expected_ua.as_str());
     println!("NAMES_HEAD_TXID={}", hex::encode(head.producer.txid));
     println!("NAMES_TIP_HEIGHT={tip}");
+    println!(
+        "NAMES_DEPLOYMENT_ID={}",
+        hex::encode(identity.deployment_id)
+    );
+    println!("NAMES_RULESET_REVISION={}", identity.ruleset_revision);
+    println!(
+        "NAMES_RULESET_FINGERPRINT={}",
+        hex::encode(identity.ruleset_fingerprint)
+    );
     Ok(())
 }
 

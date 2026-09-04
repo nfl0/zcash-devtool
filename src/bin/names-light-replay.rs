@@ -34,6 +34,7 @@ use coppice_names::{
     proof::keygen,
     protocol::{Name, NameRoute, Network},
     resolver::ExactResolver,
+    ruleset::{RULESET_REVISION, ruleset_fingerprint},
     transport::inspect_exact_name_block,
 };
 use prost::Message;
@@ -270,12 +271,19 @@ fn main() -> Result<()> {
         last_height = height;
     }
     let wall = wall_started.elapsed();
-    let resolution = resolver.resolve(last_height);
+    let resolution = resolver
+        .resolve(last_height)
+        .map_err(|error| anyhow::anyhow!("resolve exact name at {last_height}: {error:?}"))?;
     let measured =
         timings.decode + timings.prepare + timings.core + timings.transport + timings.reducer;
     let seconds = |duration: Duration| duration.as_secs_f64();
     let report = json!({
         "schema": "coppice-names-light-replay-v1",
+        "protocol_identity": {
+            "deployment_id_hex": hex::encode(deployment_id),
+            "ruleset_revision": RULESET_REVISION,
+            "ruleset_fingerprint_hex": hex::encode(ruleset_fingerprint())
+        },
         "source": {
             "capture": cli.capture,
             "blocks": raw.len(),

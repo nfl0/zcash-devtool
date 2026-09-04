@@ -38,6 +38,7 @@ use coppice_names::{
     protocol::{FieldElement, Name, NameRoute, Network},
     reducer::{Action, Block, Transaction},
     resolver::ExactResolver,
+    ruleset::{RULESET_REVISION, ruleset_fingerprint},
     transport::{
         authenticated_action_position, inspect_exact_name_block,
         inspect_exact_name_positioned_block, positioned_action_position,
@@ -615,7 +616,9 @@ fn main() -> Result<()> {
         last_height = height;
     }
     let authority_wall = authority_started.elapsed();
-    let authority_resolution = authority_resolver.resolve(last_height);
+    let authority_resolution = authority_resolver
+        .resolve(last_height)
+        .map_err(|error| anyhow!("resolve authority name at {last_height}: {error:?}"))?;
     let authority_tip = runtime.tip();
     let authority_final_checkpoint = runtime
         .ironwood_checkpoints()
@@ -718,7 +721,9 @@ fn main() -> Result<()> {
         consumer_timings.reducer += started.elapsed();
     }
     let consumer_wall = consumer_started.elapsed();
-    let consumer_resolution = consumer_resolver.resolve(last_height);
+    let consumer_resolution = consumer_resolver
+        .resolve(last_height)
+        .map_err(|error| anyhow!("resolve consumer name at {last_height}: {error:?}"))?;
 
     ensure!(consumer.tip() == authority_tip, "final tip parity failed");
     ensure!(
@@ -784,7 +789,10 @@ fn main() -> Result<()> {
         "reapplied position digest mismatch"
     );
     ensure!(
-        rewind_resolver.resolve(last_height) == authority_resolution,
+        rewind_resolver
+            .resolve(last_height)
+            .map_err(|error| anyhow!("resolve reapplied name at {last_height}: {error:?}"))?
+            == authority_resolution,
         "reapplied Names resolution mismatch"
     );
 
@@ -899,7 +907,10 @@ fn main() -> Result<()> {
         "production action-position parity failed"
     );
     ensure!(
-        production_resolver.resolve(last_height) == authority_resolution,
+        production_resolver
+            .resolve(last_height)
+            .map_err(|error| anyhow!("resolve production name at {last_height}: {error:?}"))?
+            == authority_resolution,
         "production Names resolution parity failed"
     );
     ensure!(
@@ -922,6 +933,11 @@ fn main() -> Result<()> {
         + authority_timings.reducer;
     let report = json!({
         "schema": "coppice-names-wallet-tree-confirmation-v1",
+        "protocol_identity": {
+            "deployment_id_hex": hex::encode(deployment_id),
+            "ruleset_revision": RULESET_REVISION,
+            "ruleset_fingerprint_hex": hex::encode(ruleset_fingerprint())
+        },
         "source": {
             "capture": cli.capture,
             "blocks": raw.len(),
