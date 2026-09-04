@@ -51,7 +51,7 @@ use zcash_protocol::{
     about = "Benchmark adversarial Coppice rendezvous hits in a light wallet"
 )]
 struct Cli {
-    /// Frozen replacement_protocol.json vector.
+    /// Frozen protocol.json vector.
     #[arg(long)]
     vector: PathBuf,
 

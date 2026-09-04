@@ -24,7 +24,7 @@ use serde_json::{Value, json};
     about = "Benchmark valid and adversarial Coppice Names proof paths"
 )]
 struct Cli {
-    /// Frozen replacement_protocol.json vector.
+    /// Frozen protocol.json vector.
     #[arg(long)]
     vector: PathBuf,
 
@@ -175,7 +175,7 @@ fn main() -> Result<()> {
             "malformed_reveal_wire_decode": timing_json(malformed_decode, cli.decode_iterations)
         },
         "adversarial_reachability": {
-            "malformed_wire": "An attacker can force exact-route trial decryption and full-transaction authentication, but malformed CNV2 is rejected before proof verification.",
+            "malformed_wire": "An attacker can force exact-route trial decryption and full-transaction authentication, but a malformed Names operation is rejected before proof verification.",
             "invalid_reveal_proof": "To reach REVEAL verification, the attacker also needs a live matching COMMIT, the deterministic name window, canonical action selection, and a syntactically valid operation.",
             "invalid_refresh_proof": "To reach REFRESH verification, the attacker needs the exact current predecessor, a later deterministic name window, and an action spending the head future nullifier.",
             "unrelated_name": "ExactResolver removes other-name REVEAL and REFRESH payloads before proof verification, while retaining their public action effects for bond-spend detection.",
