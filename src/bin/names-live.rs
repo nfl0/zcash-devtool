@@ -1,4 +1,4 @@
-//! Disposable live qualification for the replacement Coppice Names protocol.
+//! Disposable live qualification for the Coppice Names protocol.
 
 use std::{
     collections::BTreeMap,
@@ -22,6 +22,7 @@ use coppice_librustzcash::{CanonicalBlockSource, apply_compact_block_with_additi
 use coppice_names::{
     codec::Operation,
     deployment::DeploymentParameters,
+    names_application_id,
     proof::{OrchardProofVerifier, keygen},
     protocol::{BOND_ZATOSHIS, CanonicalUa, CommitRef, Name, NameRoute, Network},
     publication::PublicationRoute,
@@ -201,12 +202,9 @@ fn local_consensus() -> LocalNetwork {
 
 fn runtime_parameters() -> Result<coppice::identity::ValidatedCoreRuntimeParameters> {
     CoreRuntimeParameters {
-        runtime_protocol_id: b"coppice.runtime".to_vec(),
-        runtime_protocol_version: 1,
-        zcash_network_domain: b"coppice-runtime-regtest-v1".to_vec(),
+        zcash_network_domain: b"coppice-runtime-regtest".to_vec(),
         zcash_network: ZcashNetwork::Regtest,
         runtime_activation_height: RUNTIME_ACTIVATION_HEIGHT,
-        carrier_protocol_id: b"CPV1".to_vec(),
         rendezvous_ivk: REGTEST.rendezvous.orchard_ivk,
         rendezvous_receiver: REGTEST.rendezvous.orchard_receiver,
     }
@@ -288,7 +286,7 @@ fn build_commit_request(frames: &[[u8; 512]]) -> Result<TransactionRequest> {
             Payment::new(
                 recipient.clone(),
                 Some(Zatoshis::ZERO),
-                Some(MemoBytes::from_bytes(frame).context("encode CPV1 COMMIT memo")?),
+                Some(MemoBytes::from_bytes(frame).context("encode CPCF COMMIT memo")?),
                 None,
                 None,
                 vec![],
@@ -677,7 +675,7 @@ fn commit(args: CommitArgs) -> Result<()> {
     println!("COMMIT_TXID={}", hex::encode(txid));
     println!("COMMIT_TARGET_EPOCH={}", prepared.target_epoch());
     println!(
-        "COMMIT_CPV1_FRAMES={}",
+        "COMMIT_CPCF_FRAMES={}",
         prepared.publication().frames().len()
     );
     println!("COMMIT_CARRIER_VALUE=0");
@@ -802,7 +800,7 @@ fn reveal(args: RevealArgs) -> Result<()> {
     println!("REVEAL_TXID={}", hex::encode(submitted));
     println!("REVEAL_HEIGHT={}", args.reveal_height);
     println!(
-        "REVEAL_CPV1_FRAMES={}",
+        "REVEAL_CPCF_FRAMES={}",
         prepared.publication().frames().len()
     );
     println!("REVEAL_CARRIER_VALUE=0");
@@ -1120,7 +1118,7 @@ fn refresh(args: RefreshArgs) -> Result<()> {
     println!("REFRESH_TXID={}", hex::encode(submitted));
     println!("REFRESH_HEIGHT={}", args.refresh_height);
     println!(
-        "REFRESH_CPV1_FRAMES={}",
+        "REFRESH_CPCF_FRAMES={}",
         prepared.publication().frames().len()
     );
     println!("REFRESH_CARRIER_VALUE=0");
@@ -1199,7 +1197,10 @@ fn verify(args: VerifyArgs) -> Result<()> {
         "NAMES_DEPLOYMENT_ID={}",
         hex::encode(identity.deployment_id)
     );
-    println!("NAMES_RULESET_REVISION={}", identity.ruleset_revision);
+    println!(
+        "NAMES_APPLICATION_ID={}",
+        hex::encode(names_application_id(identity.deployment_id).to_bytes())
+    );
     println!(
         "NAMES_RULESET_FINGERPRINT={}",
         hex::encode(identity.ruleset_fingerprint)

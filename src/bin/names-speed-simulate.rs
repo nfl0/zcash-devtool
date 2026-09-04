@@ -258,7 +258,7 @@ fn main() -> Result<()> {
         },
         "not_measured": [
             "canonical Core validation of the synthetic transactions",
-            "CPV1 trial decryption and reassembly",
+            "CPCF trial decryption and reassembly",
             "full-transaction RPC latency and bytes",
             "Names proof verification",
             "database persistence and reorg handling"

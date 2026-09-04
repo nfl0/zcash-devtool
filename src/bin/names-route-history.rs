@@ -42,12 +42,9 @@ fn main() -> Result<()> {
     let first = CompactBlock::decode(raw[0].as_slice())?;
     let activation_height = u32::try_from(first.height)?;
     let runtime = CoreRuntimeParameters {
-        runtime_protocol_id: b"coppice.runtime".to_vec(),
-        runtime_protocol_version: 1,
-        zcash_network_domain: b"coppice-names-mainnet-performance-proxy-v1".to_vec(),
+        zcash_network_domain: b"coppice-names-mainnet-performance-proxy".to_vec(),
         zcash_network: ZcashNetwork::Main,
         runtime_activation_height: activation_height,
-        carrier_protocol_id: b"CPV1".to_vec(),
         rendezvous_ivk: REGTEST.rendezvous.orchard_ivk,
         rendezvous_receiver: REGTEST.rendezvous.orchard_receiver,
     }
@@ -161,12 +158,11 @@ fn scan(
                 let action = CompactAction::try_from(encoded_action)
                     .map_err(|_| anyhow::anyhow!("invalid compact action at height {height}"))?;
                 actions += 1;
-                if let Some((rendezvous, exact_only)) = route {
-                    if (!exact_only || scheduled)
-                        && rendezvous.compact_action_is_rendezvous(&action)
-                    {
-                        hits += 1;
-                    }
+                if let Some((rendezvous, exact_only)) = route
+                    && (!exact_only || scheduled)
+                    && rendezvous.compact_action_is_rendezvous(&action)
+                {
+                    hits += 1;
                 }
                 black_box(action);
             }

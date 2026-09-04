@@ -409,12 +409,9 @@ fn runtime(parameters: ValidatedCoreRuntimeParameters) -> Result<CoreRuntime> {
 fn runtime_parameters(document: &Value) -> Result<ValidatedCoreRuntimeParameters> {
     let input = &document["identity"];
     let parameters = CoreRuntimeParameters {
-        runtime_protocol_id: b"coppice.runtime".to_vec(),
-        runtime_protocol_version: 1,
-        zcash_network_domain: b"coppice-runtime-regtest-v1".to_vec(),
+        zcash_network_domain: b"coppice-runtime-regtest".to_vec(),
         zcash_network: ZcashNetwork::Regtest,
         runtime_activation_height: 10,
-        carrier_protocol_id: b"CPV1".to_vec(),
         rendezvous_ivk: hex::decode(
             "65deb2b3ee7ac69020543f40f21122cb6dc1f4201a329fcdf9d5e3bb2dfbbabe29d542352fe36c3c7b24c2989dc9d0000b9e04f444e05dc4538bde395c0e6008",
         )?

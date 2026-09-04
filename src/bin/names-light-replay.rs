@@ -31,10 +31,11 @@ use coppice_librustzcash::{
 };
 use coppice_names::{
     deployment::DeploymentParameters,
+    names_application_id,
     proof::keygen,
     protocol::{Name, NameRoute, Network},
     resolver::ExactResolver,
-    ruleset::{RULESET_REVISION, ruleset_fingerprint},
+    ruleset::ruleset_fingerprint,
     transport::inspect_exact_name_block,
 };
 use prost::Message;
@@ -122,12 +123,9 @@ fn main() -> Result<()> {
         .try_into()
         .context("activation parent hash has wrong length")?;
     let runtime_parameters = CoreRuntimeParameters {
-        runtime_protocol_id: b"coppice.runtime".to_vec(),
-        runtime_protocol_version: 1,
-        zcash_network_domain: b"coppice-names-mainnet-performance-proxy-v1".to_vec(),
+        zcash_network_domain: b"coppice-names-mainnet-performance-proxy".to_vec(),
         zcash_network: ZcashNetwork::Main,
         runtime_activation_height: activation_height,
-        carrier_protocol_id: b"CPV1".to_vec(),
         rendezvous_ivk: REGTEST.rendezvous.orchard_ivk,
         rendezvous_receiver: REGTEST.rendezvous.orchard_receiver,
     }
@@ -281,7 +279,7 @@ fn main() -> Result<()> {
         "schema": "coppice-names-light-replay-v1",
         "protocol_identity": {
             "deployment_id_hex": hex::encode(deployment_id),
-            "ruleset_revision": RULESET_REVISION,
+            "application_id_hex": hex::encode(names_application_id(deployment_id).to_bytes()),
             "ruleset_fingerprint_hex": hex::encode(ruleset_fingerprint())
         },
         "source": {
